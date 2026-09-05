@@ -1,3 +1,6 @@
+/* Source retained from AlphaLoc in FrameNav. */
+/* SPDX-License-Identifier: Apache-2.0 */
+
 #include "ble_config_server.h"
 
 #include <stdio.h>

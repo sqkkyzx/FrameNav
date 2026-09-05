@@ -1,11 +1,50 @@
-# AlphaLoc
+# 帧迹 FrameNav
 
-AlphaLoc is an ESP32 application that allows embedding GPS location data directly into Sony Alpha camera photos via Bluetooth Low Energy (BLE). It acts as a bridge between a standard GPS module and your Sony camera, providing real-time geolocation tagging.
+FrameNav is an ESP32 application that allows embedding GPS location data directly into Sony Alpha camera photos via Bluetooth Low Energy (BLE). It acts as a bridge between a standard GPS module and your Sony camera, providing real-time geolocation tagging.
+
+> **开源来源 / Open-source origin**
+> FrameNav is derived from [finfinack/alphaloc](https://github.com/finfinack/alphaloc).
+> AlphaLoc and the FrameNav modifications are distributed under the
+> [Apache License 2.0](LICENSE). The principal changes are documented in
+> [MODIFICATIONS.md](MODIFICATIONS.md).
+
+FrameNav is an independent community project. It is not affiliated with,
+endorsed by, or sponsored by Sony Group Corporation.
 
 ## Features
 
-- **Automatic Geotagging**: Sends GPS coordinates (Latitude, Longitude, Altitude, Time) to the camera.
+### 当前版本：0.17.0（实验性）
+
+当前实测组合为 **XIAO ESP32-C6 + StarNav M10-K18 + Sony α7C II**。
+使用 PlatformIO Core CLI，无需 VS Code：
+
+```sh
+pio run -e xiao-c6-gnss-power
+pio run -e xiao-c6-gnss-power -t upload
+pio device monitor -b 115200
+```
+
+请显式指定上述环境；默认 `xiao-c6-debug` 是 Fake GPS 测试固件。
+GNSS TX 接 D7/GPIO17，RX 接 D6/GPIO16，GND 共地；供电和串口电平应先按模块实物确认。
+**不要将 VBUS 和 3V3 直接并联。**
+
+XIAO 使用板载单色状态灯（不是下文上游参考硬件的 NeoPixel）：
+未连接相机时闪烁，连接后常亮；常亮不代表相机已接受有效定位。
+Wi-Fi 配置入口由 USB 供电来源检测控制，电池与已识别的热靴供电不启动 Wi-Fi。
+热靴识别依据实测 USB 信号特征，是启发式判断，并非通用热靴协议识别。
+连接热点后可尝试自动弹出的配置页，或访问 **http://10.254.254.1/**。
+默认热点密码为 `framenav1234`，请在配置页修改。
+
+轨迹存储与掉电恢复仍属实验功能，目前尚无 GPX 导出接口。
+下文同时保留上游其他板型的参考说明；LED、配置窗口及默认参数不一定适用于 XIAO 环境。
+
+### 功能概览
+
+- **Automatic Geotagging**: Sends latitude, longitude, and UTC time to the camera. GNSS altitude is parsed for local use but is not currently encoded in the known Sony BLE payload.
 - **BLE Connection**: Emulates a smartphone location provider for Sony cameras.
+- **Local Track Fallback**: Stores a 16-byte binary position record every three
+  seconds in a 1500 KiB circular internal-Flash partition. Each record contains
+  UTC time, latitude, longitude, and altitude.
 - **Dual Configuration**: Configurable via a Web Interface (WiFi) or BLE characteristics.
 - **Status Indicators**: NeoPixel (RGB LED) feedback for Camera connection, GPS fix, Battery, and WiFi status.
 - **Low Power**: Supports disabling external peripherals (like Stemma QT) to save power.
@@ -18,10 +57,11 @@ The project is set up for **PlatformIO** and currently supports:
 |-------|-------------|--------|
 | [**DFRobot Beetle ESP32-C6**](https://wiki.dfrobot.com/SKU_DFR1117_Beetle_ESP32_C6) | `esp32c6` | GPS TX: 5, GPS RX: 4, NeoPixel: 6 |
 | [**Adafruit Feather ESP32-S3**](https://learn.adafruit.com/adafruit-esp32-s3-feather/overview)| `esp32s3` | GPS TX: 38, GPS RX: 39, NeoPixel: 6 |
+| [**Seeed Studio XIAO ESP32-C6**](https://wiki.seeedstudio.com/xiao_esp32c6_getting_started/) | `xiao-c6-gnss-power` | GPS TX: D6/GPIO16, GPS RX: D7/GPIO17 |
 
 You can easily adapt it to other ESP32 boards by modifying `platformio.ini`.
 
-### Parts List
+### Upstream reference build
 
 The following is a parts list of what I ended up with.
 
@@ -37,9 +77,9 @@ The following is a parts list of what I ended up with.
 
 ### Models
 
-- [**Holder**](model/holder.3mf): Holder for the batteries, ESP32, optional wifi antenna, ...
-- [**Cover**](model/cover.3mf): Cover with a press fit for the holder and room for the LED board.
-- [**Cover Large**](model/cover_large.3mf): Same as cover but taller and with room for a larger, external GPS antenna.
+- [**Holder**](models/holder.3mf): Holder for the batteries, ESP32, optional wifi antenna, ...
+- [**Cover**](models/cover.3mf): Cover with a press fit for the holder and room for the LED board.
+- [**Cover Large**](models/cover_large.3mf): Same as cover but taller and with room for a larger, external GPS antenna.
 
 ## Usage
 
@@ -50,7 +90,7 @@ The following is a parts list of what I ended up with.
 2. Flash the firmware using PlatformIO.
 
    ```bash
-   pio run -e esp32c6 -t upload
+   pio run -e xiao-c6-gnss-power -t upload
    ```
 
 3. Power on the device.
@@ -60,7 +100,7 @@ The following is a parts list of what I ended up with.
 1. On your Sony Alpha camera, go to **Network** -> **Bluetooth Settings**.
 2. Enable **Bluetooth Function**.
 3. Select **Pairing**.
-4. The camera should discover "AlphaLoc". Select it to pair.
+4. The camera should discover a device named `FrameNav-XXXXXX`. Select it to pair.
 5. Once paired, go to **Location Info. Link Set.** and enable it.
 6. The camera should now show the GPS icon (solid when receiving data).
 
@@ -97,7 +137,7 @@ The NeoPixel LED provides a visual "heartbeat" every 5 seconds. It flashes multi
 
 > **⚠️ SECURITY WARNING**: The BLE configuration service is **DISABLED by default** for security reasons. When enabled, it allows **UNAUTHENTICATED access** to device settings including WiFi passwords. Only enable it (`ALPHALOC_BLE_CONFIG=1`) in trusted environments or for initial setup, then rebuild with it disabled.
 
-On startup, AlphaLoc enters a **Configuration Window** (default 5 minutes). During this time, you can change settings via WiFi (if `ALPHALOC_WIFI_WEB=1`) or BLE (if `ALPHALOC_BLE_CONFIG=1`).
+On startup, FrameNav enters a **Configuration Window** (default 5 minutes). During this time, you can change settings via WiFi (if `ALPHALOC_WIFI_WEB=1`) or BLE (if `ALPHALOC_BLE_CONFIG=1`).
 
 <img width="300" height="450" alt="web" src="https://github.com/user-attachments/assets/bd50c0e7-f0e7-41f6-8e6a-0d7c2ba5bdf6" />
 
@@ -110,12 +150,12 @@ On startup, AlphaLoc enters a **Configuration Window** (default 5 minutes). Duri
 | **TZ Offset** | Timezone offset in minutes (e.g., `60` for UTC+1). | `60` |
 | **DST Offset** | Daylight Savings Time offset in minutes. | `60` |
 | **WiFi SSID/Pass** | Credentials for connecting to your home WiFi. | `WiFi` / `changeme` |
-| **AP SSID/Pass** | Credentials for the hotspot created by AlphaLoc. | `AlphaLoc` / `alphaloc1234` |
+| **AP SSID/Pass** | Credentials for the hotspot created by FrameNav. | `FrameNav` / `framenav1234` |
 | **Max GPS Age** | How long (seconds) to reuse old coordinates if GPS signal is lost. | `300` |
 
 #### Method A: WiFi Web Interface
 
-AlphaLoc tries to connect to the configured WiFi as a client:
+FrameNav tries to connect to the configured WiFi as a client:
 
 - **Default SSID**: `WiFi`
 - **Default Password**: `changeme`
@@ -123,9 +163,22 @@ AlphaLoc tries to connect to the configured WiFi as a client:
 
 If it can't connect to the WiFi, it starts an access point itself:
 
-- **SSID**: `AlphaLoc`
-- **Password**: `alphaloc1234`
-- **IP**: `192.168.4.1` (direct link to webserver: http://192.168.4.1/)
+- **SSID**: `FrameNav`
+- **Password**: `framenav1234`
+- **Network**: `10.254.254.0/24`
+- **Configuration URL**: http://10.254.254.1/
+
+FrameNav advertises a captive portal through DHCP option 114, answers local DNS queries with
+`10.254.254.1`, and redirects HTTP probe paths to the configuration page. Supported operating systems
+will usually open the page automatically after joining; the direct URL remains the reliable fallback.
+
+The Web interface is Chinese-first. Connection settings are shown first: it displays GNSS/camera status,
+firmware version, current track-storage usage, and the earliest retained record time,
+lists up to three saved camera bonds, can remove an individual local bond, and can open a 90-second
+continuous scan for pairing a new camera. Location and Bluetooth power modes provide preset policies plus
+collapsible advanced fields; preset fields are read-only, while Custom is editable. Runtime power changes
+take effect immediately after saving. The pairing action disconnects the current camera but does not erase
+other saved bonds.
 
 To enable this, set the build flag (`ALPHALOC_WIFI_WEB=1` in `platformio.ini`).
 
@@ -163,8 +216,8 @@ Example `platformio.secrets.ini` with all supported defaults:
 build_flags =
   -DALPHALOC_DEFAULT_WIFI_SSID="\"MyWifi\""
   -DALPHALOC_DEFAULT_WIFI_PASS="\"MyPass\""
-  -DALPHALOC_DEFAULT_AP_SSID="\"AlphaLoc\""
-  -DALPHALOC_DEFAULT_AP_PASS="\"AlphaLocPass\""
+  -DALPHALOC_DEFAULT_AP_SSID="\"FrameNav\""
+  -DALPHALOC_DEFAULT_AP_PASS="\"framenav1234\""
   -DALPHALOC_DEFAULT_CAMERA_NAME_PREFIX="\"SonyA7\""
   -DALPHALOC_DEFAULT_CAMERA_MAC_PREFIX="\"AA:BB:CC\""
 ```
@@ -173,7 +226,7 @@ These values are used as defaults on first boot (or after a factory reset) and c
 
 ## BLE Client Details (Camera Link)
 
-AlphaLoc acts as a BLE client to Sony cameras
+FrameNav acts as a BLE client to Sony cameras
 
 ### Advertisement Filters
 
@@ -183,7 +236,7 @@ AlphaLoc acts as a BLE client to Sony cameras
 
 ### Services and Identifiers
 
-AlphaLoc looks for two Sony services (UUIDs are built from 16-bit IDs using the Sony base UUID):
+FrameNav looks for two Sony services (UUIDs are built from 16-bit IDs using the Sony base UUID):
 
 ```
 Sony base UUID (constructed):
@@ -200,7 +253,7 @@ It accepts either 128-bit UUIDs or 16-bit UUIDs:
 
 ### Characteristic Discovery
 
-Within those services, AlphaLoc searches for:
+Within those services, FrameNav searches for:
 
 **Location Service (DD00)**
 
@@ -288,6 +341,9 @@ The `platformio.ini` file defines several build environments for different purpo
     *   Enables verbose logging (`ALPHALOC_VERBOSE=1`).
     *   **Enables Fake GPS (`ALPHALOC_FAKE_GPS=1`)**: Simulates a stationary location (Munich) for testing without a GPS module or satellite lock.
 *   **`env:esp32s3-debug-gps`**: Debugging environment using *real* GPS data but with verbose logging enabled.
+*   **`env:xiao-c6-debug`**: XIAO ESP32-C6 Fake GPS compatibility target.
+*   **`env:xiao-c6-gnss-debug`**: XIAO ESP32-C6 with a real UART GNSS receiver and verbose diagnostics.
+*   **`env:xiao-c6-gnss-power`**: Current XIAO ESP32-C6 release target with the FrameNav Web UI and GNSS/BLE power policies.
 
 ### Build Flags
 
@@ -322,3 +378,18 @@ There is a bunch of work done by others before me which greatly helped figuring 
 - https://github.com/ekutner/camera-gps-link
 - https://github.com/whc2001/ILCE7M3ExternalGps
 - And many more (search GitHub for one of the unique identifiers such as the service UUIDs).
+
+## License and attribution
+
+FrameNav is open-source software licensed under the
+[Apache License, Version 2.0](LICENSE).
+
+This project is derived from
+[AlphaLoc by finfinack](https://github.com/finfinack/alphaloc), which is also
+licensed under Apache-2.0. FrameNav retains that license and documents its
+changes in [MODIFICATIONS.md](MODIFICATIONS.md). Attribution and distribution
+notices are provided in [NOTICE](NOTICE) and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Unless explicitly stated otherwise, contributions submitted to this repository
+are accepted under Apache-2.0; see [CONTRIBUTING.md](CONTRIBUTING.md).

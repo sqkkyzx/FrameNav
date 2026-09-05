@@ -1,0 +1,13 @@
+FrameNav
+Copyright 2026 FrameNav contributors
+
+FrameNav includes software derived from AlphaLoc by finfinack:
+https://github.com/finfinack/alphaloc
+
+AlphaLoc is licensed under the Apache License, Version 2.0. FrameNav contains
+substantial modifications and additions. See LICENSE for the license text and
+MODIFICATIONS.md for a summary of the changes.
+
+FrameNav is an independent community project. Sony and Alpha are trademarks of
+their respective owners. This project is not affiliated with, endorsed by, or
+sponsored by Sony Group Corporation.

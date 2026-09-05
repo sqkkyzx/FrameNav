@@ -1,3 +1,8 @@
+/*
+ * FrameNav modification of AlphaLoc.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include "config.h"
 
 #include <string.h>
@@ -8,7 +13,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 
-#define NVS_NAMESPACE "alphaloc"
+#define NVS_NAMESPACE "framenav"
 #define GPS_INTERVAL_MIN_MS 1000U
 #define GPS_INTERVAL_MAX_MS 60000U
 #define MAX_GPS_AGE_MAX_S 86400U
@@ -16,6 +21,16 @@
 #define TZ_OFFSET_MIN_MIN -1440
 #define TZ_OFFSET_MAX_MIN 1440
 #define BLE_PASSKEY_MAX 999999U
+#define LOCATION_DURATION_MAX_S 3600U
+#define LOCATION_SLEEP_MIN_S 5U
+#define LOCATION_FAST_SPEED_MIN_X10 19U
+#define LOCATION_FAST_SPEED_MAX_X10 3000U
+#define LOCATION_TIMEOUT_MAX_S 300U
+#define BLE_FAST_SEARCH_MAX_S 300U
+#define BLE_SCAN_PERIOD_MIN_MS 1000U
+#define BLE_SCAN_PERIOD_MAX_MS 10240U
+#define BLE_SCAN_WINDOW_MIN_MS 20U
+#define BLE_SCAN_WINDOW_MAX_MS 1000U
 
 static const char *TAG = "config";
 static SemaphoreHandle_t s_config_mutex = NULL;
@@ -70,6 +85,18 @@ void config_set_defaults(app_config_t *cfg)
   cfg->ble_passkey = 123456;
   cfg->tz_offset_min = 60;
   cfg->dst_offset_min = 60;
+  cfg->location_power_mode = LOCATION_POWER_BALANCED;
+  cfg->bluetooth_power_mode = BLUETOOTH_POWER_NORMAL;
+  cfg->custom_boot_work_s = 45;
+  cfg->custom_disconnect_grace_s = 20;
+  cfg->custom_stationary_sleep_s = 90;
+  cfg->custom_moving_sleep_s = 30;
+  cfg->custom_fast_sleep_s = 15;
+  cfg->custom_fast_speed_kmh_x10 = 288;
+  cfg->custom_fix_timeout_s = 45;
+  cfg->custom_ble_boot_fast_search_s = 30;
+  cfg->custom_ble_scan_period_ms = 3000;
+  cfg->custom_ble_scan_window_ms = 100;
 #ifdef ALPHALOC_DEFAULT_CAMERA_NAME_PREFIX
   config_set_str_default(cfg->camera_name_prefix,
                          sizeof(cfg->camera_name_prefix),
@@ -91,14 +118,14 @@ void config_set_defaults(app_config_t *cfg)
   config_set_str_default(cfg->ap_ssid, sizeof(cfg->ap_ssid),
                          ALPHALOC_DEFAULT_AP_SSID);
 #else
-  config_set_str_default(cfg->ap_ssid, sizeof(cfg->ap_ssid), "AlphaLoc");
+  config_set_str_default(cfg->ap_ssid, sizeof(cfg->ap_ssid), "FrameNav");
 #endif
 
 #ifdef ALPHALOC_DEFAULT_AP_PASS
   config_set_str_default(cfg->ap_pass, sizeof(cfg->ap_pass),
                          ALPHALOC_DEFAULT_AP_PASS);
 #else
-  config_set_str_default(cfg->ap_pass, sizeof(cfg->ap_pass), "alphaloc1234");
+  config_set_str_default(cfg->ap_pass, sizeof(cfg->ap_pass), "framenav1234");
 #endif
 
 #ifdef ALPHALOC_DEFAULT_WIFI_SSID
@@ -153,6 +180,63 @@ void config_validate(app_config_t *cfg)
   {
     cfg->dst_offset_min = defaults.dst_offset_min;
   }
+  if (cfg->location_power_mode > LOCATION_POWER_CUSTOM)
+  {
+    cfg->location_power_mode = defaults.location_power_mode;
+  }
+  if (cfg->bluetooth_power_mode > BLUETOOTH_POWER_CUSTOM)
+  {
+    cfg->bluetooth_power_mode = defaults.bluetooth_power_mode;
+  }
+  if (cfg->custom_boot_work_s > LOCATION_DURATION_MAX_S)
+  {
+    cfg->custom_boot_work_s = defaults.custom_boot_work_s;
+  }
+  if (cfg->custom_disconnect_grace_s > LOCATION_DURATION_MAX_S)
+  {
+    cfg->custom_disconnect_grace_s = defaults.custom_disconnect_grace_s;
+  }
+  if (cfg->custom_stationary_sleep_s < LOCATION_SLEEP_MIN_S ||
+      cfg->custom_stationary_sleep_s > LOCATION_DURATION_MAX_S)
+  {
+    cfg->custom_stationary_sleep_s = defaults.custom_stationary_sleep_s;
+  }
+  if (cfg->custom_moving_sleep_s < LOCATION_SLEEP_MIN_S ||
+      cfg->custom_moving_sleep_s > LOCATION_DURATION_MAX_S)
+  {
+    cfg->custom_moving_sleep_s = defaults.custom_moving_sleep_s;
+  }
+  if (cfg->custom_fast_sleep_s < LOCATION_SLEEP_MIN_S ||
+      cfg->custom_fast_sleep_s > LOCATION_DURATION_MAX_S)
+  {
+    cfg->custom_fast_sleep_s = defaults.custom_fast_sleep_s;
+  }
+  if (cfg->custom_fast_speed_kmh_x10 < LOCATION_FAST_SPEED_MIN_X10 ||
+      cfg->custom_fast_speed_kmh_x10 > LOCATION_FAST_SPEED_MAX_X10)
+  {
+    cfg->custom_fast_speed_kmh_x10 = defaults.custom_fast_speed_kmh_x10;
+  }
+  if (cfg->custom_fix_timeout_s < LOCATION_SLEEP_MIN_S ||
+      cfg->custom_fix_timeout_s > LOCATION_TIMEOUT_MAX_S)
+  {
+    cfg->custom_fix_timeout_s = defaults.custom_fix_timeout_s;
+  }
+  if (cfg->custom_ble_boot_fast_search_s > BLE_FAST_SEARCH_MAX_S)
+  {
+    cfg->custom_ble_boot_fast_search_s =
+        defaults.custom_ble_boot_fast_search_s;
+  }
+  if (cfg->custom_ble_scan_period_ms < BLE_SCAN_PERIOD_MIN_MS ||
+      cfg->custom_ble_scan_period_ms > BLE_SCAN_PERIOD_MAX_MS)
+  {
+    cfg->custom_ble_scan_period_ms = defaults.custom_ble_scan_period_ms;
+  }
+  if (cfg->custom_ble_scan_window_ms < BLE_SCAN_WINDOW_MIN_MS ||
+      cfg->custom_ble_scan_window_ms > BLE_SCAN_WINDOW_MAX_MS ||
+      cfg->custom_ble_scan_window_ms > cfg->custom_ble_scan_period_ms)
+  {
+    cfg->custom_ble_scan_window_ms = defaults.custom_ble_scan_window_ms;
+  }
 
   config_terminate_str(cfg->camera_name_prefix,
                        sizeof(cfg->camera_name_prefix));
@@ -205,6 +289,18 @@ bool config_load(app_config_t *cfg)
   nvs_get_u32(nvs, "max_age_s", &cfg->max_gps_age_s);
   nvs_get_u32(nvs, "cfg_win_s", &cfg->config_window_s);
   nvs_get_u32(nvs, "ble_pass", &cfg->ble_passkey);
+  nvs_get_u8(nvs, "loc_mode", &cfg->location_power_mode);
+  nvs_get_u8(nvs, "ble_mode", &cfg->bluetooth_power_mode);
+  nvs_get_u32(nvs, "loc_boot", &cfg->custom_boot_work_s);
+  nvs_get_u32(nvs, "loc_grace", &cfg->custom_disconnect_grace_s);
+  nvs_get_u32(nvs, "loc_still", &cfg->custom_stationary_sleep_s);
+  nvs_get_u32(nvs, "loc_move", &cfg->custom_moving_sleep_s);
+  nvs_get_u32(nvs, "loc_fast", &cfg->custom_fast_sleep_s);
+  nvs_get_u32(nvs, "loc_spd10", &cfg->custom_fast_speed_kmh_x10);
+  nvs_get_u32(nvs, "loc_timeout", &cfg->custom_fix_timeout_s);
+  nvs_get_u32(nvs, "ble_boot", &cfg->custom_ble_boot_fast_search_s);
+  nvs_get_u32(nvs, "ble_period", &cfg->custom_ble_scan_period_ms);
+  nvs_get_u32(nvs, "ble_window", &cfg->custom_ble_scan_window_ms);
   int16_t tz = cfg->tz_offset_min;
   int16_t dst = cfg->dst_offset_min;
   uint16_t old_tz = 0;
@@ -254,6 +350,18 @@ static bool config_save_unlocked(const app_config_t *cfg)
   if (err == ESP_OK) err = nvs_set_u32(nvs, "max_age_s", cfg->max_gps_age_s);
   if (err == ESP_OK) err = nvs_set_u32(nvs, "cfg_win_s", cfg->config_window_s);
   if (err == ESP_OK) err = nvs_set_u32(nvs, "ble_pass", cfg->ble_passkey);
+  if (err == ESP_OK) err = nvs_set_u8(nvs, "loc_mode", cfg->location_power_mode);
+  if (err == ESP_OK) err = nvs_set_u8(nvs, "ble_mode", cfg->bluetooth_power_mode);
+  if (err == ESP_OK) err = nvs_set_u32(nvs, "loc_boot", cfg->custom_boot_work_s);
+  if (err == ESP_OK) err = nvs_set_u32(nvs, "loc_grace", cfg->custom_disconnect_grace_s);
+  if (err == ESP_OK) err = nvs_set_u32(nvs, "loc_still", cfg->custom_stationary_sleep_s);
+  if (err == ESP_OK) err = nvs_set_u32(nvs, "loc_move", cfg->custom_moving_sleep_s);
+  if (err == ESP_OK) err = nvs_set_u32(nvs, "loc_fast", cfg->custom_fast_sleep_s);
+  if (err == ESP_OK) err = nvs_set_u32(nvs, "loc_spd10", cfg->custom_fast_speed_kmh_x10);
+  if (err == ESP_OK) err = nvs_set_u32(nvs, "loc_timeout", cfg->custom_fix_timeout_s);
+  if (err == ESP_OK) err = nvs_set_u32(nvs, "ble_boot", cfg->custom_ble_boot_fast_search_s);
+  if (err == ESP_OK) err = nvs_set_u32(nvs, "ble_period", cfg->custom_ble_scan_period_ms);
+  if (err == ESP_OK) err = nvs_set_u32(nvs, "ble_window", cfg->custom_ble_scan_window_ms);
   if (err == ESP_OK) err = nvs_set_i16(nvs, "tz_off", cfg->tz_offset_min);
   if (err == ESP_OK) err = nvs_set_i16(nvs, "dst_off", cfg->dst_offset_min);
   if (err == ESP_OK) err = nvs_set_str(nvs, "cam_name", cfg->camera_name_prefix);
@@ -345,4 +453,96 @@ bool config_get_snapshot(const app_config_t *cfg, app_config_t *out)
     xSemaphoreGive(s_config_mutex);
   }
   return true;
+}
+
+void config_resolve_location_power(const app_config_t *cfg,
+                                   location_power_policy_t *out)
+{
+  if (!cfg || !out)
+  {
+    return;
+  }
+  switch ((location_power_mode_t)cfg->location_power_mode)
+  {
+  case LOCATION_POWER_SAVING:
+    *out = (location_power_policy_t){
+        .boot_work_s = 45,
+        .disconnect_grace_s = 10,
+        .stationary_sleep_s = 300,
+        .moving_sleep_s = 120,
+        .fast_sleep_s = 30,
+        .fast_speed_kmh_x10 = 288,
+        .fix_timeout_s = 30,
+    };
+    break;
+  case LOCATION_POWER_TRACK:
+    *out = (location_power_policy_t){
+        .continuous = true,
+        .boot_work_s = 45,
+        .disconnect_grace_s = 20,
+        .stationary_sleep_s = 90,
+        .moving_sleep_s = 30,
+        .fast_sleep_s = 15,
+        .fast_speed_kmh_x10 = 288,
+        .fix_timeout_s = 45,
+    };
+    break;
+  case LOCATION_POWER_CUSTOM:
+    *out = (location_power_policy_t){
+        .boot_work_s = cfg->custom_boot_work_s,
+        .disconnect_grace_s = cfg->custom_disconnect_grace_s,
+        .stationary_sleep_s = cfg->custom_stationary_sleep_s,
+        .moving_sleep_s = cfg->custom_moving_sleep_s,
+        .fast_sleep_s = cfg->custom_fast_sleep_s,
+        .fast_speed_kmh_x10 = cfg->custom_fast_speed_kmh_x10,
+        .fix_timeout_s = cfg->custom_fix_timeout_s,
+    };
+    break;
+  case LOCATION_POWER_BALANCED:
+  default:
+    *out = (location_power_policy_t){
+        .boot_work_s = 45,
+        .disconnect_grace_s = 20,
+        .stationary_sleep_s = 90,
+        .moving_sleep_s = 30,
+        .fast_sleep_s = 15,
+        .fast_speed_kmh_x10 = 288,
+        .fix_timeout_s = 45,
+    };
+    break;
+  }
+}
+
+void config_resolve_bluetooth_power(const app_config_t *cfg,
+                                    bluetooth_power_policy_t *out)
+{
+  if (!cfg || !out)
+  {
+    return;
+  }
+  switch ((bluetooth_power_mode_t)cfg->bluetooth_power_mode)
+  {
+  case BLUETOOTH_POWER_SAVING:
+    *out = (bluetooth_power_policy_t){
+        .boot_fast_search_s = 15,
+        .scan_period_ms = 10000,
+        .scan_window_ms = 100,
+    };
+    break;
+  case BLUETOOTH_POWER_CUSTOM:
+    *out = (bluetooth_power_policy_t){
+        .boot_fast_search_s = cfg->custom_ble_boot_fast_search_s,
+        .scan_period_ms = cfg->custom_ble_scan_period_ms,
+        .scan_window_ms = cfg->custom_ble_scan_window_ms,
+    };
+    break;
+  case BLUETOOTH_POWER_NORMAL:
+  default:
+    *out = (bluetooth_power_policy_t){
+        .boot_fast_search_s = 30,
+        .scan_period_ms = 3000,
+        .scan_window_ms = 100,
+    };
+    break;
+  }
 }

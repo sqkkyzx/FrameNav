@@ -1,3 +1,6 @@
+/* Source retained from AlphaLoc in FrameNav. */
+/* SPDX-License-Identifier: Apache-2.0 */
+
 #ifndef ALPHALOC_BATTERY_H
 #define ALPHALOC_BATTERY_H
 

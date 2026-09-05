@@ -1,3 +1,6 @@
+# Source retained from AlphaLoc and extended by FrameNav.
+# SPDX-License-Identifier: Apache-2.0
+
 # This file was automatically generated for projects
 # without default 'CMakeLists.txt' file.
 

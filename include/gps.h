@@ -1,13 +1,21 @@
+/*
+ * FrameNav modification of AlphaLoc.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #ifndef ALPHALOC_GPS_H
 #define ALPHALOC_GPS_H
 
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "config.h"
+
 typedef struct {
   double lat_deg;
   double lon_deg;
   double altitude_m;
+  bool altitude_valid;
   bool valid;
   bool time_valid;
   uint16_t year;
@@ -43,5 +51,17 @@ typedef struct {
 void gps_init(const gps_config_t *cfg);
 bool gps_get_latest(gps_fix_t *out_fix);
 bool gps_get_status(gps_status_t *out_status);
+#if ALPHALOC_GNSS_STANDBY
+// Notify a successful camera BLE link or its disconnect, not bond/auth status.
+void gps_camera_connection_changed(bool connected);
+// Safe from the HTTP task; the GPS task applies the policy on its next pass.
+void gps_apply_power_policy(const location_power_policy_t *policy);
+#endif
+
+#if ALPHALOC_FAKE_GPS && ALPHALOC_FAKE_GPS_STEPPING
+// Test-only clock. USB-time mode returns false until the host sets this boot's
+// time; legacy stepping mode uses a build-time seed.
+bool gps_fake_apply_clock(gps_fix_t *fix, int64_t uptime_us);
+#endif
 
 #endif

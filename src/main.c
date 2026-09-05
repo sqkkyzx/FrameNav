@@ -1,3 +1,8 @@
+/*
+ * FrameNav modification of AlphaLoc.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include <string.h>
 
 #include "ble_client.h"
@@ -6,7 +11,13 @@
 #endif
 #include "config.h"
 #include "driver/gpio.h"
+#if ALPHALOC_BOARD_XIAO_ESP32C6
+#include "driver/ledc.h"
+#include "driver/usb_serial_jtag.h"
+#include "soc/usb_serial_jtag_struct.h"
+#endif
 #include "driver/uart.h"
+#include "esp_app_desc.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #if CONFIG_PM_ENABLE
@@ -17,6 +28,18 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "gps.h"
+#include "gnss_rate.h"
+#include "power_policy.h"
+#include "track_store.h"
+#if ALPHALOC_POWER_SOURCE_PROBE
+#include "power_source_probe.h"
+#endif
+#if ALPHALOC_WIFI_WEB && ALPHALOC_BOARD_XIAO_ESP32C6
+#include "usb_config_gate.h"
+#endif
+#if ALPHALOC_FAKE_GPS_USB_TIME
+#include "fake_gps_usb_time.h"
+#endif
 #include "nvs_flash.h"
 
 #ifndef ALPHALOC_BATTERY_MONITOR
@@ -39,6 +62,22 @@
 #include "wifi_web.h"
 #endif
 
+#ifndef ALPHALOC_FAKE_GPS
+#define ALPHALOC_FAKE_GPS 0
+#endif
+
+#if ALPHALOC_PHASE2 && (ALPHALOC_FAKE_GPS || ALPHALOC_FAKE_GPS_STEPPING || ALPHALOC_FAKE_GPS_USB_TIME)
+#error "Phase 2 must not contain simulated GPS or USB host time"
+#endif
+
+#if ALPHALOC_POWER_SAVE && (!ALPHALOC_BOARD_XIAO_ESP32C6 || !ALPHALOC_PHASE2 || !CONFIG_PM_ENABLE || !CONFIG_BT_LE_SLEEP_ENABLE)
+#error "Power profile requires XIAO Phase 2, PM enabled and BLE modem sleep"
+#endif
+#if ALPHALOC_POWER_SAVE && ALPHALOC_LIGHT_SLEEP
+#error "Power profile must preserve continuous UART RX and USB; no CPU light sleep"
+#endif
+
+#if !ALPHALOC_FAKE_GPS
 #define GPS_UART_NUM UART_NUM_1
 #ifndef GPS_UART_TX_PIN
 #error "GPS_UART_TX_PIN must be set via build_flags"
@@ -49,13 +88,23 @@
 #ifndef GPS_UART_BAUD
 #define GPS_UART_BAUD 9600
 #endif
-
-#ifndef ALPHALOC_FAKE_GPS
-#define ALPHALOC_FAKE_GPS 0
 #endif
 
 #ifndef ALPHALOC_LIGHT_SLEEP
 #define ALPHALOC_LIGHT_SLEEP 0
+#endif
+
+#ifndef ALPHALOC_USB_HOST_WIFI
+#define ALPHALOC_USB_HOST_WIFI 0
+#endif
+
+#ifndef ALPHALOC_POWER_SOURCE_PROBE
+#define ALPHALOC_POWER_SOURCE_PROBE 0
+#endif
+
+#if ALPHALOC_USB_HOST_WIFI && \
+    (!ALPHALOC_WIFI_WEB || !ALPHALOC_BOARD_XIAO_ESP32C6)
+#error "USB-host-gated WiFi requires XIAO ESP32-C6 and ALPHALOC_WIFI_WEB"
 #endif
 
 #define FAKE_LAT_DEG 48.137154
@@ -69,11 +118,20 @@
 
 static const char *TAG = "main";
 static app_config_t s_cfg;
+#if !ALPHALOC_USB_HOST_WIFI
 static int64_t s_config_window_end_time_us = 0;
+#endif
 
 static bool get_location_for_send(gps_fix_t *out_fix) {
   gps_fix_t fix;
   if (gps_get_latest(&fix) && fix.valid) {
+#if ALPHALOC_PHASE2
+    // A coordinate without valid GNSS UTC must not change the camera clock.
+    if (!fix.time_valid || fix.year < 2000 || fix.year > 2099 ||
+        fix.month < 1 || fix.month > 12 || fix.day < 1 || fix.day > 31) {
+      return false;
+    }
+#endif
     *out_fix = fix;
     return true;
   }
@@ -91,6 +149,12 @@ static bool get_location_for_send(gps_fix_t *out_fix) {
   fix.second = FAKE_SECOND;
   fix.last_fix_time_us = esp_timer_get_time();
   fix.last_update_time_us = fix.last_fix_time_us;
+#if ALPHALOC_FAKE_GPS_STEPPING
+  // Keep the fallback path on the same clock; never fall back to frozen UTC.
+  if (!gps_fake_apply_clock(&fix, fix.last_fix_time_us)) {
+    return false;
+  }
+#endif
   *out_fix = fix;
   return true;
 #else
@@ -137,6 +201,7 @@ static void location_publisher_task(void *arg) {
   }
 }
 
+#if !ALPHALOC_USB_HOST_WIFI
 static void config_window_task(void *arg) {
   app_config_t *cfg = (app_config_t *)arg;
   app_config_t cfg_snapshot;
@@ -148,7 +213,7 @@ static void config_window_task(void *arg) {
   ble_config_server_start();
 #endif
 #if ALPHALOC_WIFI_WEB
-  wifi_web_start(cfg);
+  (void)wifi_web_start(cfg);
 #endif
   s_config_window_end_time_us =
       esp_timer_get_time() + ((int64_t)cfg_snapshot.config_window_s * 1000000LL);
@@ -161,6 +226,59 @@ static void config_window_task(void *arg) {
 #endif
   vTaskDelete(NULL);
 }
+#endif
+
+#if ALPHALOC_USB_HOST_WIFI
+#define USB_CONFIG_POLL_MS 100U
+#define USB_CONFIG_START_RETRY_MS 5000U
+
+static void usb_host_wifi_task(void *arg) {
+  app_config_t *cfg = (app_config_t *)arg;
+  int64_t now_us = esp_timer_get_time();
+  uint32_t phy_test = USB_SERIAL_JTAG.test.val;
+  bool raw_host = usb_serial_jtag_is_connected();
+  bool raw_allowed = usb_config_source_allows_wifi(
+      raw_host, ((phy_test >> 5) & 1U) != 0, ((phy_test >> 6) & 1U) != 0);
+  usb_config_gate_t gate;
+  usb_config_gate_init(&gate, now_us, raw_allowed);
+  int64_t retry_after_us = 0;
+  bool previous_raw_allowed = raw_allowed;
+
+  while (true) {
+    now_us = esp_timer_get_time();
+    raw_host = usb_serial_jtag_is_connected();
+    phy_test = USB_SERIAL_JTAG.test.val;
+    bool dp = ((phy_test >> 5) & 1U) != 0;
+    bool dm = ((phy_test >> 6) & 1U) != 0;
+    raw_allowed = usb_config_source_allows_wifi(raw_host, dp, dm);
+    bool allowed = usb_config_gate_update(&gate, now_us, raw_allowed);
+    bool running = wifi_web_is_started();
+
+    if (raw_allowed != previous_raw_allowed) {
+      ESP_LOGI(TAG, "USB config source candidate: SOF=%s D+/D-=%u%u allowed=%s",
+               raw_host ? "yes" : "no", dp, dm,
+               raw_allowed ? "yes" : "no");
+      previous_raw_allowed = raw_allowed;
+    }
+
+    if (!allowed) {
+      retry_after_us = 0;
+      if (running) {
+        ESP_LOGI(TAG, "Battery/MI-shoe signature stable for 5s: stopping WiFi web");
+        wifi_web_stop();
+      }
+    } else if (!running && now_us >= retry_after_us) {
+      ESP_LOGI(TAG, "Computer/charger signature stable for 2s: starting WiFi web");
+      if (!wifi_web_start(cfg)) {
+        retry_after_us = now_us +
+                         (int64_t)USB_CONFIG_START_RETRY_MS * 1000LL;
+        ESP_LOGW(TAG, "WiFi web start failed; retry in 5s while USB host remains");
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(USB_CONFIG_POLL_MS));
+  }
+}
+#endif
 
 #if ALPHALOC_BATTERY_MONITOR
 static void battery_task(void *arg) {
@@ -236,9 +354,13 @@ static void status_led_task(void *arg) {
 
     // Wi-Fi status: blue if web server/AP active.
 #if ALPHALOC_WIFI_WEB
+#if ALPHALOC_USB_HOST_WIFI
+    bool window_active = wifi_web_is_started();
+#else
     int64_t now = esp_timer_get_time();
     bool window_active =
         (s_config_window_end_time_us == 0 || now < s_config_window_end_time_us);
+#endif
     if (window_active) {
       neopixel_set_rgb(0, 0, 255);
       vTaskDelay(on_ms);
@@ -255,14 +377,87 @@ static void status_led_task(void *arg) {
 }
 #endif
 
-void app_main(void) {
-  ESP_LOGI(TAG, "AlphaLoc starting");
+#if ALPHALOC_BOARD_XIAO_ESP32C6
+static void xiao_status_led_set(bool on, bool usb_host) {
+  // GPIO15 is active LOW. Hardware inversion makes zero duty fully OFF.
+  // 8-bit PWM: 256/256 is full ON; 26/256 is the conservative dim fallback.
+  // USB host detection is NOT VBUS sensing or battery/source identification.
+  // This task exclusively owns the channel. Do not use the thread-safe
+  // ledc_set_duty_and_update API: IDF requires a fade service for that API.
+  const uint32_t duty = on ? (usb_host ? 256U : 26U) : 0U;
+  ESP_ERROR_CHECK(ledc_set_duty(
+      LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty));
+  ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
+}
 
+static void xiao_status_led_cycle(bool connected, bool usb_host) {
+  // Blink = running / no camera link; steady = BLE camera connected.
+  // Neither promises a valid fix or GPS metadata in a photograph.
+  xiao_status_led_set(true, usb_host);
+  if (connected) {
+    // Do not switch off between cycles: keep a steady indication.
+    // Recheck both camera and USB host state each second.
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    return;
+  }
+  vTaskDelay(pdMS_TO_TICKS(100));
+  xiao_status_led_set(false, usb_host);
+  vTaskDelay(pdMS_TO_TICKS(900));
+}
+
+static void xiao_status_led_task(void *arg) {
+  (void)arg;
+  const ledc_timer_config_t timer = {
+      .speed_mode = LEDC_LOW_SPEED_MODE,
+      .duty_resolution = LEDC_TIMER_8_BIT,
+      .timer_num = LEDC_TIMER_0,
+      .freq_hz = 2000,
+#if ALPHALOC_POWER_SAVE
+      .clk_cfg = LEDC_USE_XTAL_CLK, // Stable PWM while CPU/APB frequency changes.
+#else
+      .clk_cfg = LEDC_AUTO_CLK,
+#endif
+  };
+  ESP_ERROR_CHECK(ledc_timer_config(&timer));
+  const ledc_channel_config_t channel = {
+      .gpio_num = GPIO_NUM_15,
+      .speed_mode = LEDC_LOW_SPEED_MODE,
+      .channel = LEDC_CHANNEL_0,
+      .intr_type = LEDC_INTR_DISABLE,
+      .timer_sel = LEDC_TIMER_0,
+      .duty = 0,
+      .hpoint = 0,
+      .flags.output_invert = 1,
+  };
+  ESP_ERROR_CHECK(ledc_channel_config(&channel));
+  ESP_LOGI(TAG, "XIAO user LED: GPIO15 active-low, USB host=full, otherwise=dim; "
+                "no camera=100ms blink every 1s, BLE connected=steady "
+                "(not EXIF confirmation)");
+  unsigned cycles = 0;
+  bool previous_usb_host = false;
+  while (true) {
+    bool connected = ble_client_is_connected();
+    // SOF packets identify an active USB data host, even with no monitor open.
+    // Chargers/power banks and suspended hosts may report false; use dim mode.
+    bool usb_host = usb_serial_jtag_is_connected();
+    if (cycles++ % 30 == 0 || usb_host != previous_usb_host) {
+      ESP_LOGI(TAG, "Heartbeat: uptime=%llds camera=%s usb_host=%s LED=%s",
+               (long long)(esp_timer_get_time() / 1000000LL),
+               connected ? "connected" : "not connected",
+               usb_host ? "present" : "absent", usb_host ? "100%" : "10%");
+    }
+    previous_usb_host = usb_host;
+    xiao_status_led_cycle(connected, usb_host);
+  }
+}
+#endif
+
+static void configure_power_management(void) {
 #if CONFIG_PM_ENABLE
-  // Configure automatic light sleep (Issue 3.4)
+  // DFS is independent of CPU light sleep. Keep UART RX and USB alive in v9.
   esp_pm_config_t pm_config = {
-      .max_freq_mhz = 160,
-      .min_freq_mhz = 40,
+      .max_freq_mhz = ALPHALOC_PM_MAX_FREQ_MHZ,
+      .min_freq_mhz = ALPHALOC_PM_MIN_FREQ_MHZ,
       .light_sleep_enable =
 #if CONFIG_FREERTOS_USE_TICKLESS_IDLE && ALPHALOC_LIGHT_SLEEP
           true,
@@ -272,7 +467,8 @@ void app_main(void) {
   };
   esp_err_t pm_err = esp_pm_configure(&pm_config);
   if (pm_err == ESP_OK) {
-    ESP_LOGI(TAG, "Power management: light sleep %s",
+    ESP_LOGI(TAG, "Power management: CPU min=%d max=%d MHz; light sleep %s",
+             pm_config.min_freq_mhz, pm_config.max_freq_mhz,
              pm_config.light_sleep_enable ? "enabled" : "disabled");
   } else {
     ESP_LOGW(TAG, "Power management configuration failed: %s",
@@ -285,9 +481,32 @@ void app_main(void) {
                 "CONFIG_FREERTOS_USE_TICKLESS_IDLE");
 #endif
 #else
-  ESP_LOGW(TAG, "Power management disabled in sdkconfig - enable "
-                "CONFIG_PM_ENABLE for light sleep");
+  ESP_LOGI(TAG, "Power management disabled in sdkconfig");
 #endif
+}
+
+void app_main(void) {
+  const esp_app_desc_t *app_desc = esp_app_get_description();
+  ESP_LOGI(TAG, "FrameNav %s starting",
+           app_desc ? app_desc->version : "unknown");
+
+#if ALPHALOC_BOARD_XIAO_ESP32C6
+  // Seeed RF switch: GPIO3 LOW enables it, GPIO14 LOW selects ceramic antenna.
+  // These are chip GPIO numbers, not the XIAO D3/D14 pin labels.
+  ESP_ERROR_CHECK(gpio_set_level(GPIO_NUM_3, 0));
+  ESP_ERROR_CHECK(gpio_set_level(GPIO_NUM_14, 0));
+  const gpio_config_t antenna_cfg = {
+      .pin_bit_mask = (1ULL << GPIO_NUM_3) | (1ULL << GPIO_NUM_14),
+      .mode = GPIO_MODE_OUTPUT,
+      .pull_up_en = GPIO_PULLUP_DISABLE,
+      .pull_down_en = GPIO_PULLDOWN_DISABLE,
+      .intr_type = GPIO_INTR_DISABLE,
+  };
+  ESP_ERROR_CHECK(gpio_config(&antenna_cfg));
+  ESP_LOGI(TAG, "XIAO ESP32-C6: onboard ceramic antenna selected");
+#endif
+
+  configure_power_management();
 
 #ifdef ALPHALOC_STEMMA_QT_DISABLE_PIN
   // Disable STEMMA QT power for lower power usage when unused.
@@ -319,22 +538,104 @@ void app_main(void) {
     ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(err));
   }
 
-  config_load(&s_cfg);
+  bool config_loaded = config_load(&s_cfg);
+  (void)config_loaded;
+#if ALPHALOC_PHASE1 || ALPHALOC_PHASE2
+  // First boot uses known-safe XIAO defaults. Once Web config has created the
+  // FrameNav NVS namespace, preserve user filters/time/max-age across reboots.
+  if (!config_loaded) {
+    s_cfg.camera_name_prefix[0] = '\0';
+    s_cfg.camera_mac_prefix[0] = '\0';
+    s_cfg.tz_offset_min = 480;
+    s_cfg.dst_offset_min = 0;
+    s_cfg.max_gps_age_s = 5;
+  }
+  // These are profile invariants, not Web settings.
+  s_cfg.config_window_s = 0;
+#if ALPHALOC_PHASE2
+  s_cfg.gps_interval_ms = ALPHALOC_LOCATION_INTERVAL_MS;
+#if ALPHALOC_POWER_SAVE
+  ESP_LOGW(TAG, "PHASE 2 POWER SAVE: FrameNav Web location/BLE profiles; "
+               "connected camera keeps GNSS real-time; no CPU light sleep; "
+               "no battery protection in firmware");
+#if ALPHALOC_USB_HOST_WIFI
+  ESP_LOGW(TAG, "Source-gated WiFi web: SOF or no-SOF D+/D-=11 starts after "
+                "2s; no-SOF D+/D-=10 stops after 5s (battery/HSA-S)");
+#endif
+#define PHASE2_BUILD_LABEL "v17"
+#else
+#define PHASE2_BUILD_LABEL "v8.1"
+#endif
+  ESP_LOGW(TAG, "PHASE 2 " PHASE2_BUILD_LABEL " REAL GNSS ONLY: UART1 TX=GPIO%d RX=GPIO%d baud=%d; "
+               "publish interval=%ums; no fake fallback, no USB host time, max fix age=5s",
+           GPS_UART_TX_PIN, GPS_UART_RX_PIN, GPS_UART_BAUD,
+           (unsigned)s_cfg.gps_interval_ms);
+#else
+  ESP_LOGW(TAG, "PHASE 1 FAKE GPS ONLY: lat=48.137154 lon=11.576124");
+#if ALPHALOC_FAKE_GPS_USB_TIME
+  ESP_LOGW(TAG, "EXPERIMENT v7.1: WAIT_HOST_TIME until USB host sync after every boot; "
+               "never send build-time or frozen-2024 GPS time");
+#elif ALPHALOC_FAKE_GPS_STEPPING
+  ESP_LOGW(TAG, "EXPERIMENT v5: GPS UTC advances from build-host time + uptime; "
+               "reboot resets the seed, camera clock may be changed");
+#else
+  ESP_LOGW(TAG, "Fake UTC is 2024-01-01 12:00:00; disable camera auto time/area adjustment");
+#endif
+#endif
+#if ALPHALOC_LOCATION_OBSERVER
+  ESP_LOGW(TAG, "EXPERIMENT v6: observe Sony location notifications/readable values; "
+                "GATT ACK and linkage enabled are NOT GPS-valid confirmation");
+#endif
+  ESP_LOGI(TAG, "Camera filters: name=%s MAC=%s; Sony manufacturer filter retained",
+           s_cfg.camera_name_prefix[0] ? "configured" : "disabled",
+           s_cfg.camera_mac_prefix[0] ? "configured" : "disabled");
+#endif
   config_validate(&s_cfg);
 
+#if ALPHALOC_GNSS_STANDBY
+  location_power_policy_t location_policy;
+  config_resolve_location_power(&s_cfg, &location_policy);
+  gps_apply_power_policy(&location_policy);
+#endif
+
   gps_config_t gps_cfg = {
+#if !ALPHALOC_FAKE_GPS
       .uart_num = GPS_UART_NUM,
       .tx_pin = GPS_UART_TX_PIN,
       .rx_pin = GPS_UART_RX_PIN,
       .baud_rate = GPS_UART_BAUD,
+#endif
       .update_interval_ms = s_cfg.gps_interval_ms,
   };
   gps_init(&gps_cfg);
+#if ALPHALOC_TRACK_STORE
+  const bool track_store_ready = track_store_init();
+  if (!track_store_ready) {
+    ESP_LOGE(TAG, "Track storage unavailable; positioning continues");
+  }
+#endif
+#if ALPHALOC_FAKE_GPS_USB_TIME
+  gps_fake_usb_time_start();
+#endif
 
   ble_client_init(&s_cfg);
   ble_client_set_focus_callback(focus_update_cb, &s_cfg);
 
+#if ALPHALOC_POWER_SOURCE_PROBE
+  // Start only after BLE state has been initialized; before ble_client_init(),
+  // its static connection handle is not yet a meaningful diagnostic input.
+  power_source_probe_start();
+#endif
+
   BaseType_t ret;
+#if ALPHALOC_TRACK_STORE
+  if (track_store_ready) {
+    ret = xTaskCreate(track_store_task, "track_store", 4096, NULL, 4, NULL);
+    if (ret != pdPASS) {
+      ESP_LOGE(TAG, "Failed to create track_store_task");
+    }
+  }
+#endif
 #if ALPHALOC_BATTERY_MONITOR
   battery_init();
   ret = xTaskCreate(battery_task, "battery", 3072, NULL, 4, NULL);
@@ -348,6 +649,7 @@ void app_main(void) {
     ESP_LOGE(TAG, "Failed to create location_publisher_task");
   }
 
+#if !ALPHALOC_USB_HOST_WIFI
   if (s_cfg.config_window_s > 0) {
     ret =
         xTaskCreate(config_window_task, "config_window", 4096, &s_cfg, 5, NULL);
@@ -355,11 +657,24 @@ void app_main(void) {
       ESP_LOGE(TAG, "Failed to create config_window_task");
     }
   }
+#endif
+#if ALPHALOC_USB_HOST_WIFI
+  ret = xTaskCreate(usb_host_wifi_task, "usb_wifi", 4096, &s_cfg, 4, NULL);
+  if (ret != pdPASS) {
+    ESP_LOGE(TAG, "Failed to create usb_host_wifi_task");
+  }
+#endif
 #ifdef ALPHALOC_NEOPIXEL_PIN
   ret = xTaskCreate(status_led_task, "status_led", 3072, &s_cfg, 1, NULL);
   if (ret != pdPASS) {
     ESP_LOGE(TAG, "Failed to create status_led_task");
   }
 #endif
-  ESP_LOGI(TAG, "AlphaLoc started");
+#if ALPHALOC_BOARD_XIAO_ESP32C6
+  ret = xTaskCreate(xiao_status_led_task, "xiao_led", 3072, NULL, 1, NULL);
+  if (ret != pdPASS) {
+    ESP_LOGE(TAG, "Failed to create xiao_status_led_task");
+  }
+#endif
+  ESP_LOGI(TAG, "FrameNav started");
 }

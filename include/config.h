@@ -1,3 +1,8 @@
+/*
+ * FrameNav modification of AlphaLoc.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #ifndef ALPHALOC_CONFIG_H
 #define ALPHALOC_CONFIG_H
 
@@ -7,6 +12,40 @@
 #define CONFIG_STR_MAX_32 32
 #define CONFIG_STR_MAX_64 64
 #define CONFIG_STR_MAX_18 18
+
+typedef enum
+{
+  LOCATION_POWER_SAVING = 0,
+  LOCATION_POWER_BALANCED = 1,
+  LOCATION_POWER_TRACK = 2,
+  LOCATION_POWER_CUSTOM = 3,
+} location_power_mode_t;
+
+typedef enum
+{
+  BLUETOOTH_POWER_SAVING = 0,
+  BLUETOOTH_POWER_NORMAL = 1,
+  BLUETOOTH_POWER_CUSTOM = 2,
+} bluetooth_power_mode_t;
+
+typedef struct
+{
+  bool continuous;
+  uint32_t boot_work_s;
+  uint32_t disconnect_grace_s;
+  uint32_t stationary_sleep_s;
+  uint32_t moving_sleep_s;
+  uint32_t fast_sleep_s;
+  uint32_t fast_speed_kmh_x10;
+  uint32_t fix_timeout_s;
+} location_power_policy_t;
+
+typedef struct
+{
+  uint32_t boot_fast_search_s;
+  uint32_t scan_period_ms;
+  uint32_t scan_window_ms;
+} bluetooth_power_policy_t;
 
 typedef struct
 {
@@ -18,6 +57,18 @@ typedef struct
   uint32_t ble_passkey;
   int16_t tz_offset_min;
   int16_t dst_offset_min;
+  uint8_t location_power_mode;
+  uint8_t bluetooth_power_mode;
+  uint32_t custom_boot_work_s;
+  uint32_t custom_disconnect_grace_s;
+  uint32_t custom_stationary_sleep_s;
+  uint32_t custom_moving_sleep_s;
+  uint32_t custom_fast_sleep_s;
+  uint32_t custom_fast_speed_kmh_x10;
+  uint32_t custom_fix_timeout_s;
+  uint32_t custom_ble_boot_fast_search_s;
+  uint32_t custom_ble_scan_period_ms;
+  uint32_t custom_ble_scan_window_ms;
   char wifi_ssid[CONFIG_STR_MAX_32];
   char wifi_pass[CONFIG_STR_MAX_64];
   char ap_ssid[CONFIG_STR_MAX_32];
@@ -30,5 +81,9 @@ bool config_load(app_config_t *cfg);
 bool config_save(const app_config_t *cfg);
 bool config_apply(app_config_t *cfg, const app_config_t *new_cfg);
 bool config_get_snapshot(const app_config_t *cfg, app_config_t *out);
+void config_resolve_location_power(const app_config_t *cfg,
+                                   location_power_policy_t *out);
+void config_resolve_bluetooth_power(const app_config_t *cfg,
+                                    bluetooth_power_policy_t *out);
 
 #endif

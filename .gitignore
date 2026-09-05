@@ -1,3 +1,5 @@
+# FrameNav modification of AlphaLoc.
+# SPDX-License-Identifier: Apache-2.0
 # Created by https://www.toptal.com/developers/gitignore/api/visualstudiocode,macos,platformio
 # Edit at https://www.toptal.com/developers/gitignore?templates=visualstudiocode,macos,platformio
 
@@ -45,6 +47,16 @@ Temporary Items
 .clang_complete
 .gcc-flags.json
 .pio
+sdkconfig.xiao-c6-debug
+sdkconfig.xiao-c6-debug.old
+sdkconfig.xiao-c6-gnss-debug
+sdkconfig.xiao-c6-gnss-debug.old
+sdkconfig.xiao-c6-gnss-power
+sdkconfig.xiao-c6-gnss-power.old
+artifacts/
+include/fake_clock_seed.generated.h
+test/__pycache__/
+scripts/__pycache__/
 
 ### VisualStudioCode ###
 .vscode/*

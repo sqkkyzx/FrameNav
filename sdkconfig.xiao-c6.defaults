@@ -1,0 +1,7 @@
+# Primary console is the XIAO's built-in USB Serial/JTAG, not GNSS UART.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+# No power-management experiment in the USB-powered compatibility test.
+CONFIG_PM_ENABLE=n
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=n

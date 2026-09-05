@@ -1,11 +1,25 @@
+/*
+ * FrameNav modification of AlphaLoc.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include "ble_client.h"
+#include "power_policy.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
+#if ALPHALOC_BLE_CONFIG
 #include "ble_config_server.h"
+#endif
+#include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#if ALPHALOC_LOCATION_OBSERVER
+#include "location_observer.h"
+#endif
 #include "host/ble_att.h"
 #include "host/ble_gap.h"
 #include "host/ble_hs.h"
@@ -15,6 +29,7 @@
 #include "host/ble_store.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
+#include "nvs.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "store/config/ble_store_config.h"
@@ -98,6 +113,7 @@ typedef enum {
 static dsc_target_t s_dsc_target;
 static uint8_t s_dsc_retry_count;
 static esp_timer_handle_t s_dsc_retry_timer;
+static esp_timer_handle_t s_identity_retry_timer;
 static int8_t s_last_chr_interest;
 static bool s_ff02_cccd_deferred;
 static bool s_ff02_cccd_sent;
@@ -107,14 +123,42 @@ static bool s_payload_logged;
 #endif
 static bool s_bonded_camera;
 static bool s_retried_disc_after_enc;
+static bool s_host_synced;
+#if ALPHALOC_POWER_SAVE
+static bool s_scan_restart_requested;
+#endif
+static int64_t s_pairing_mode_until_us;
+static portMUX_TYPE s_control_mux = portMUX_INITIALIZER_UNLOCKED;
+
+#define CAMERA_NAME_NVS_NAMESPACE "fn_camera"
+#define CAMERA_NAME_NVS_KEY_SIZE 16
+
+typedef enum {
+  IDENTITY_WANT_MODEL = 0,
+  IDENTITY_MODEL_PENDING,
+  IDENTITY_WANT_DEVICE_NAME,
+  IDENTITY_DEVICE_NAME_PENDING,
+  IDENTITY_DONE,
+} identity_read_state_t;
+
+static identity_read_state_t s_identity_state = IDENTITY_DONE;
+static bool s_identity_value_found;
+static bool s_camera_identity_valid;
+static ble_addr_t s_camera_identity_addr;
+static char s_adv_camera_name[BLE_CLIENT_CAMERA_NAME_MAX];
 
 static void ble_start_scan(void);
+#if ALPHALOC_POWER_SAVE
+static void ble_scan_complete(int reason);
+#endif
+static void addr_to_str(const ble_addr_t *addr, char *out, size_t len);
 static void schedule_dsc_retry(void);
 static void try_start_ff02_dsc(uint16_t conn_handle);
 static void try_start_pending_dsc(uint16_t conn_handle);
 static void enable_location_updates(uint16_t conn_handle);
 static void retry_camera_setup(void);
 static void reset_camera_setup_state(void);
+static void schedule_identity_retry(uint64_t delay_us);
 static bool enc_failure_needs_rebond(int status);
 static void delete_camera_bond(const struct ble_gap_conn_desc *desc);
 static int cccd_write_cb(uint16_t conn_handle,
@@ -130,6 +174,241 @@ typedef struct {
 } cccd_ctx_t;
 
 static cccd_ctx_t s_cccd_ff02_ctx = {"FF02", 0, 0};
+
+static void camera_name_nvs_key(uint8_t addr_type, const uint8_t addr[6],
+                                char out[CAMERA_NAME_NVS_KEY_SIZE]) {
+  static const char hex[] = "0123456789ABCDEF";
+  out[0] = 'n';
+  out[1] = hex[addr_type & 0x0F];
+  size_t pos = 2;
+  for (int i = 5; i >= 0; --i) {
+    out[pos++] = hex[addr[i] >> 4];
+    out[pos++] = hex[addr[i] & 0x0F];
+  }
+  out[pos] = '\0';
+}
+
+static bool camera_name_copy(char *out, size_t out_len, const uint8_t *src,
+                             size_t src_len) {
+  if (!out || out_len == 0) {
+    return false;
+  }
+  out[0] = '\0';
+  if (!src || src_len == 0) {
+    return false;
+  }
+
+  size_t start = 0;
+  while (start < src_len && src[start] <= 0x20) {
+    start++;
+  }
+  size_t written = 0;
+  for (size_t i = start; i < src_len && src[i] != '\0'; ++i) {
+    uint8_t ch = src[i];
+    if (ch < 0x20 || ch == 0x7F) {
+      continue;
+    }
+    if (written + 1 >= out_len) {
+      break;
+    }
+    out[written++] = (char)ch;
+  }
+  while (written > 0 && (uint8_t)out[written - 1] <= 0x20) {
+    written--;
+  }
+  out[written] = '\0';
+  return written > 0;
+}
+
+static bool camera_name_load(const ble_addr_t *addr, char *out,
+                             size_t out_len) {
+  if (!addr || !out || out_len == 0) {
+    return false;
+  }
+  out[0] = '\0';
+  char key[CAMERA_NAME_NVS_KEY_SIZE];
+  camera_name_nvs_key(addr->type, addr->val, key);
+  nvs_handle_t nvs;
+  esp_err_t err = nvs_open(CAMERA_NAME_NVS_NAMESPACE, NVS_READONLY, &nvs);
+  if (err != ESP_OK) {
+    return false;
+  }
+  size_t len = out_len;
+  err = nvs_get_str(nvs, key, out, &len);
+  nvs_close(nvs);
+  if (err != ESP_OK) {
+    out[0] = '\0';
+    return false;
+  }
+  out[out_len - 1] = '\0';
+  return out[0] != '\0';
+}
+
+static bool camera_name_save(const ble_addr_t *addr, const char *name) {
+  if (!addr || !name || name[0] == '\0') {
+    return false;
+  }
+  char current[BLE_CLIENT_CAMERA_NAME_MAX];
+  if (camera_name_load(addr, current, sizeof(current)) &&
+      strcmp(current, name) == 0) {
+    return true;
+  }
+
+  char key[CAMERA_NAME_NVS_KEY_SIZE];
+  camera_name_nvs_key(addr->type, addr->val, key);
+  nvs_handle_t nvs = 0;
+  esp_err_t err = nvs_open(CAMERA_NAME_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+  if (err == ESP_OK) {
+    err = nvs_set_str(nvs, key, name);
+  }
+  if (err == ESP_OK) {
+    err = nvs_commit(nvs);
+  }
+  if (nvs) {
+    nvs_close(nvs);
+  }
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Camera name save failed: %s", esp_err_to_name(err));
+    return false;
+  }
+  char address[18];
+  addr_to_str(addr, address, sizeof(address));
+  ESP_LOGI(TAG, "Camera identity saved: %s (%s)", name, address);
+  return true;
+}
+
+static void camera_name_delete(const ble_addr_t *addr) {
+  if (!addr) {
+    return;
+  }
+  char key[CAMERA_NAME_NVS_KEY_SIZE];
+  camera_name_nvs_key(addr->type, addr->val, key);
+  nvs_handle_t nvs;
+  esp_err_t err = nvs_open(CAMERA_NAME_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+  if (err != ESP_OK) {
+    return;
+  }
+  err = nvs_erase_key(nvs, key);
+  if (err == ESP_OK) {
+    (void)nvs_commit(nvs);
+  }
+  nvs_close(nvs);
+}
+
+static int camera_identity_read_cb(uint16_t conn_handle,
+                                   const struct ble_gatt_error *error,
+                                   struct ble_gatt_attr *attr, void *arg) {
+  uint16_t uuid = (uint16_t)(uintptr_t)arg;
+  bool reading_model = uuid == 0x2A24;
+  if (conn_handle != s_handles.conn_handle || !s_camera_identity_valid) {
+    return 0;
+  }
+
+  if (error->status == 0 && attr && attr->om) {
+    uint8_t raw[BLE_CLIENT_CAMERA_NAME_MAX] = {0};
+    uint16_t copied = 0;
+    int rc = ble_hs_mbuf_to_flat(attr->om, raw, sizeof(raw) - 1, &copied);
+    if (rc == 0 || rc == BLE_HS_EMSGSIZE) {
+      char name[BLE_CLIENT_CAMERA_NAME_MAX];
+      if (camera_name_copy(name, sizeof(name), raw, copied)) {
+        s_identity_value_found = true;
+        camera_name_save(&s_camera_identity_addr, name);
+      }
+    }
+    return 0;
+  }
+
+  if (reading_model && !s_identity_value_found) {
+    s_identity_state = IDENTITY_WANT_DEVICE_NAME;
+    schedule_identity_retry(250000);
+  } else {
+    s_identity_state = IDENTITY_DONE;
+  }
+  return 0;
+}
+
+static void identity_retry_cb(void *arg) {
+  (void)arg;
+  if (s_handles.conn_handle == BLE_HS_CONN_HANDLE_NONE || !s_encrypted ||
+      !s_camera_identity_valid) {
+    return;
+  }
+
+  uint16_t uuid = 0;
+  identity_read_state_t pending_state = IDENTITY_DONE;
+  if (s_identity_state == IDENTITY_WANT_MODEL) {
+    uuid = 0x2A24; // Device Information: Model Number String.
+    pending_state = IDENTITY_MODEL_PENDING;
+  } else if (s_identity_state == IDENTITY_WANT_DEVICE_NAME) {
+    uuid = 0x2A00; // Generic Access: Device Name.
+    pending_state = IDENTITY_DEVICE_NAME_PENDING;
+  } else {
+    return;
+  }
+
+  s_identity_value_found = false;
+  int rc = ble_gattc_read_by_uuid(
+      s_handles.conn_handle, 1, 0xFFFF, BLE_UUID16_DECLARE(uuid),
+      camera_identity_read_cb, (void *)(uintptr_t)uuid);
+  if (rc == 0) {
+    s_identity_state = pending_state;
+    return;
+  }
+
+  // Sony service discovery and location setup take priority.  Retry the
+  // cosmetic identity read once the ATT channel becomes idle.
+  schedule_identity_retry(1000000);
+}
+
+static void schedule_identity_retry(uint64_t delay_us) {
+  if (!s_identity_retry_timer) {
+    return;
+  }
+  (void)esp_timer_stop(s_identity_retry_timer);
+  (void)esp_timer_start_once(s_identity_retry_timer, delay_us);
+}
+
+static void begin_camera_identity_lookup(const struct ble_gap_conn_desc *desc) {
+  if (!desc) {
+    return;
+  }
+  s_camera_identity_addr = desc->peer_id_addr;
+  s_camera_identity_valid = true;
+  if (s_adv_camera_name[0] != '\0') {
+    camera_name_save(&s_camera_identity_addr, s_adv_camera_name);
+  }
+  s_identity_state = IDENTITY_WANT_MODEL;
+  schedule_identity_retry(1500000);
+}
+
+static void reset_camera_identity_lookup(void) {
+  if (s_identity_retry_timer) {
+    (void)esp_timer_stop(s_identity_retry_timer);
+  }
+  s_identity_state = IDENTITY_DONE;
+  s_identity_value_found = false;
+  s_camera_identity_valid = false;
+  memset(&s_camera_identity_addr, 0, sizeof(s_camera_identity_addr));
+  s_adv_camera_name[0] = '\0';
+}
+
+static int64_t pairing_deadline_get(void) {
+  portENTER_CRITICAL(&s_control_mux);
+  int64_t deadline = s_pairing_mode_until_us;
+  portEXIT_CRITICAL(&s_control_mux);
+  return deadline;
+}
+
+static void pairing_deadline_set(int64_t deadline_us) {
+  portENTER_CRITICAL(&s_control_mux);
+  s_pairing_mode_until_us = deadline_us;
+  portEXIT_CRITICAL(&s_control_mux);
+}
+
+static bool pairing_mode_active(void) {
+  return pairing_deadline_get() > esp_timer_get_time();
+}
+
 static bool peer_is_bonded(const ble_addr_t *addr) {
   if (!addr) {
     return false;
@@ -162,6 +441,7 @@ static void delete_peer_bond(const ble_addr_t *addr) {
   if (rc != 0) {
     ESP_LOGW(TAG, "Bond delete failed: %d", rc);
   }
+  camera_name_delete(addr);
 }
 
 static void delete_camera_bond(const struct ble_gap_conn_desc *desc) {
@@ -210,6 +490,9 @@ static bool enc_failure_needs_rebond(int status) {
 
 static void reset_camera_setup_state(void) {
   uint16_t conn_handle = s_handles.conn_handle;
+#if ALPHALOC_LOCATION_OBSERVER
+  location_observer_reset(conn_handle);
+#endif
   memset(&s_handles, 0, sizeof(s_handles));
   s_handles.conn_handle = conn_handle;
   s_disc_state = DISC_NONE;
@@ -279,6 +562,7 @@ static void log_mfg_data(const uint8_t *data, uint8_t len) {
 
 static void make_sony_uuid(uint16_t first, uint16_t second,
                            ble_uuid128_t *out) {
+  out->u.type = BLE_UUID_TYPE_128;
   uint8_t bytes[16] = {0xFF,
                        0xFF,
                        0xFF,
@@ -312,10 +596,14 @@ static bool is_sony_camera_adv(const struct ble_gap_disc_desc *desc,
       (uint16_t)fields->mfg_data[1] << 8 | fields->mfg_data[0];
   uint16_t product_id =
       (uint16_t)fields->mfg_data[3] << 8 | fields->mfg_data[2];
-  if (company_id != 0x012D || product_id != 0x0003) {
+  if (company_id != 0x012D) {
     return false;
   }
   log_mfg_data(fields->mfg_data, fields->mfg_data_len);
+  if (product_id != 0x0003) {
+    VLOGI("Sony ADV ignored: product ID=0x%04X", product_id);
+    return false;
+  }
 
   char addr_str[18];
   addr_to_str(&desc->addr, addr_str, sizeof(addr_str));
@@ -555,6 +843,21 @@ static void schedule_dsc_retry(void) {
   esp_timer_start_once(s_dsc_retry_timer, 500000);
 }
 
+static int location_enable_write_cb(uint16_t conn_handle,
+                                     const struct ble_gatt_error *error,
+                                     struct ble_gatt_attr *attr, void *arg) {
+  (void)attr;
+  const char *label = arg ? (const char *)arg : "unknown";
+  // Observation only. Preserve setup/retry behavior for the clock A/B test.
+  if (error->status == 0) {
+    VLOGI("%s enable write acknowledged: conn=%u", label, conn_handle);
+  } else {
+    ESP_LOGW(TAG, "%s enable write rejected/failed: conn=%u status=%d (0x%X)",
+             label, conn_handle, error->status, (unsigned)error->status);
+  }
+  return 0;
+}
+
 static void enable_location_updates(uint16_t conn_handle) {
   if (s_handles.chr_dd21 != 0) {
     if (!s_encrypted) {
@@ -579,7 +882,7 @@ static void enable_location_updates(uint16_t conn_handle) {
     uint8_t on = 0x01;
     ESP_LOGI(TAG, "Unlocking location");
     int rc = ble_gattc_write_flat(conn_handle, s_handles.chr_dd30, &on,
-                                  sizeof(on), NULL, NULL);
+                                  sizeof(on), location_enable_write_cb, "DD30");
     if (rc != 0) {
       ESP_LOGW(TAG, "DD30 write start failed: %d", rc);
     } else {
@@ -590,7 +893,7 @@ static void enable_location_updates(uint16_t conn_handle) {
     uint8_t on = 0x01;
     ESP_LOGI(TAG, "Enabling location updates");
     int rc = ble_gattc_write_flat(conn_handle, s_handles.chr_dd31, &on,
-                                  sizeof(on), NULL, NULL);
+                                  sizeof(on), location_enable_write_cb, "DD31");
     if (rc != 0) {
       ESP_LOGW(TAG, "DD31 write start failed: %d", rc);
     } else {
@@ -600,7 +903,7 @@ static void enable_location_updates(uint16_t conn_handle) {
   s_location_enabled = dd30_started && dd31_started;
   if (s_location_enabled) {
     s_service_changed_reconnect_attempted = false;
-    ESP_LOGI(TAG, "Location updates enabled");
+    ESP_LOGI(TAG, "Location enable requests queued (not camera confirmation)");
   }
 }
 
@@ -801,6 +1104,14 @@ static int gatt_disc_chrs_cb(uint16_t conn_handle,
                              const struct ble_gatt_error *error,
                              const struct ble_gatt_chr *chr, void *arg) {
   if (error->status == 0 && chr != NULL) {
+#if ALPHALOC_LOCATION_OBSERVER
+    if ((s_disc_state == DISC_LOC_CHR || s_disc_state == DISC_ALL_CHR) &&
+        s_handles.loc_svc_start != 0 &&
+        chr->val_handle >= s_handles.loc_svc_start &&
+        chr->val_handle <= s_handles.loc_svc_end) {
+      location_observer_discovered(conn_handle, chr, s_handles.loc_svc_end);
+    }
+#endif
     if (s_last_chr_interest == 1 && s_handles.end_ff02 == 0 &&
         chr->def_handle > 0) {
       s_handles.end_ff02 = (uint16_t)(chr->def_handle - 1);
@@ -988,6 +1299,23 @@ static bool build_location_payload(const gps_fix_t *fix, bool require_tz_dst,
   return true;
 }
 
+static int location_write_cb(uint16_t conn_handle,
+                             const struct ble_gatt_error *error,
+                             struct ble_gatt_attr *attr, void *arg) {
+  (void)attr;
+  (void)arg;
+  if (error->status == 0) {
+    VLOGI("DD11 location write acknowledged by camera: conn=%u", conn_handle);
+  } else {
+    ESP_LOGW(TAG, "DD11 location write rejected/failed: conn=%u status=%d (0x%X)",
+             conn_handle, error->status, (unsigned)error->status);
+  }
+#if ALPHALOC_LOCATION_OBSERVER
+  location_observer_after_write(conn_handle, error->status);
+#endif
+  return 0;
+}
+
 bool ble_client_send_location(const gps_fix_t *fix) {
   if (s_handles.conn_handle == BLE_HS_CONN_HANDLE_NONE) {
     VLOGW("Skip location send: no connection");
@@ -1021,6 +1349,11 @@ bool ble_client_send_location(const gps_fix_t *fix) {
     return false;
   }
   uint16_t mtu = ble_att_mtu(s_handles.conn_handle);
+  VLOGI("DD11 sample: conn=%u UTC=%04u-%02u-%02uT%02u:%02u:%02uZ "
+        "lat=%.7f lon=%.7f encrypted=%d mtu=%u",
+        s_handles.conn_handle, fix->year, fix->month, fix->day,
+        fix->hour, fix->minute, fix->second, fix->lat_deg, fix->lon_deg,
+        s_encrypted, mtu);
   uint16_t max_payload = mtu > 3 ? (uint16_t)(mtu - 3) : 0;
   int rc = 0;
   if (payload_len > max_payload) {
@@ -1030,10 +1363,10 @@ bool ble_client_send_location(const gps_fix_t *fix) {
       return false;
     }
     rc = ble_gattc_write_long(s_handles.conn_handle, s_handles.chr_dd11, 0, om,
-                              NULL, NULL);
+                              location_write_cb, NULL);
   } else {
     rc = ble_gattc_write_flat(s_handles.conn_handle, s_handles.chr_dd11,
-                              payload, payload_len, NULL, NULL);
+                              payload, payload_len, location_write_cb, NULL);
   }
 #if ALPHALOC_VERBOSE
   if (!s_payload_logged) {
@@ -1042,8 +1375,8 @@ bool ble_client_send_location(const gps_fix_t *fix) {
     ESP_LOG_BUFFER_HEX(TAG, payload, payload_len);
   }
 #endif
-  VLOGI("Location write %s (%u bytes)", rc == 0 ? "ok" : "failed",
-        (unsigned)payload_len);
+  VLOGI("Location write %s (%u bytes), rc=%d", rc == 0 ? "queued" : "failed",
+        (unsigned)payload_len, rc);
   if (rc == 0 && s_ff02_cccd_deferred && !s_ff02_cccd_sent && s_encrypted &&
       s_handles.cccd_ff02 != 0) {
     s_ff02_cccd_sent = true;
@@ -1059,9 +1392,149 @@ bool ble_client_is_connected(void) {
 
 bool ble_client_is_bonded(void) { return s_bonded_camera; }
 
+int ble_client_get_bonds(ble_client_bond_t *out, size_t capacity) {
+  if (!out || capacity == 0 || !s_host_synced) {
+    return 0;
+  }
+  ble_addr_t peers[BLE_CLIENT_MAX_BONDS];
+  int count = 0;
+  int rc = ble_store_util_bonded_peers(peers, &count,
+                                       BLE_CLIENT_MAX_BONDS);
+  if (rc != 0) {
+    ESP_LOGW(TAG, "Bond list read failed: %d", rc);
+    return -1;
+  }
+  struct ble_gap_conn_desc current = {0};
+  bool have_current = ble_client_is_connected() &&
+                      ble_gap_conn_find(s_handles.conn_handle, &current) == 0;
+  size_t copied = (size_t)count < capacity ? (size_t)count : capacity;
+  for (size_t i = 0; i < copied; ++i) {
+    memcpy(out[i].addr, peers[i].val, sizeof(out[i].addr));
+    out[i].addr_type = peers[i].type;
+    out[i].name[0] = '\0';
+    (void)camera_name_load(&peers[i], out[i].name, sizeof(out[i].name));
+    out[i].connected =
+        have_current &&
+        (addr_equal(&peers[i], &current.peer_id_addr) ||
+         addr_equal(&peers[i], &current.peer_ota_addr));
+  }
+  return (int)copied;
+}
+
+bool ble_client_delete_bond(const ble_client_bond_t *bond) {
+  if (!bond || !s_host_synced) {
+    return false;
+  }
+  ble_addr_t target = {.type = bond->addr_type};
+  memcpy(target.val, bond->addr, sizeof(target.val));
+
+  // Only accept an address currently present in the bond store.  This keeps
+  // the HTTP endpoint from becoming an arbitrary NimBLE store mutation API.
+  ble_addr_t peers[BLE_CLIENT_MAX_BONDS];
+  int count = 0;
+  int rc = ble_store_util_bonded_peers(peers, &count,
+                                       BLE_CLIENT_MAX_BONDS);
+  if (rc != 0) {
+    ESP_LOGW(TAG, "Bond list read before delete failed: %d", rc);
+    return false;
+  }
+  bool found = false;
+  for (int i = 0; i < count; ++i) {
+    if (addr_equal(&target, &peers[i])) {
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    return false;
+  }
+
+  bool disconnect_current = false;
+  uint16_t conn_handle = BLE_HS_CONN_HANDLE_NONE;
+  if (ble_client_is_connected()) {
+    struct ble_gap_conn_desc current;
+    conn_handle = s_handles.conn_handle;
+    if (ble_gap_conn_find(conn_handle, &current) == 0) {
+      disconnect_current = addr_equal(&target, &current.peer_id_addr) ||
+                           addr_equal(&target, &current.peer_ota_addr);
+    }
+  }
+
+  rc = ble_store_util_delete_peer(&target);
+  if (rc != 0) {
+    ESP_LOGW(TAG, "Bond delete failed: %d", rc);
+    return false;
+  }
+  camera_name_delete(&target);
+  char addr[18];
+  addr_to_str(&target, addr, sizeof(addr));
+  ESP_LOGI(TAG, "Deleted bond %s type=%u", addr, (unsigned)target.type);
+
+  if (disconnect_current) {
+    rc = ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    if (rc != 0) {
+      ESP_LOGW(TAG, "Disconnect after bond delete failed: %d", rc);
+    }
+  } else if (!s_connecting_camera) {
+    if (ble_gap_disc_active()) {
+      (void)ble_gap_disc_cancel();
+    }
+    ble_start_scan();
+  }
+  return true;
+}
+
+uint32_t ble_client_pairing_seconds_remaining(void) {
+  int64_t remaining_us = pairing_deadline_get() - esp_timer_get_time();
+  if (remaining_us <= 0) {
+    return 0;
+  }
+  return (uint32_t)((remaining_us + 999999LL) / 1000000LL);
+}
+
+bool ble_client_start_pairing(uint32_t duration_s) {
+  if (!s_host_synced || duration_s < 10 || duration_s > 300) {
+    return false;
+  }
+  pairing_deadline_set(esp_timer_get_time() +
+                       (int64_t)duration_s * 1000000LL);
+  ESP_LOGI(TAG, "New-camera pairing mode enabled for %us",
+           (unsigned)duration_s);
+
+  if (ble_client_is_connected()) {
+    int rc = ble_gap_terminate(s_handles.conn_handle,
+                               BLE_ERR_REM_USER_CONN_TERM);
+    if (rc != 0) {
+      pairing_deadline_set(0);
+      return false;
+    }
+    return true;
+  }
+  if (s_connecting_camera) {
+    int rc = ble_gap_conn_cancel();
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+      pairing_deadline_set(0);
+      return false;
+    }
+    return true;
+  }
+  if (ble_gap_disc_active()) {
+    int rc = ble_gap_disc_cancel();
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+      pairing_deadline_set(0);
+      return false;
+    }
+  }
+  ble_start_scan();
+  return true;
+}
+
 int ble_client_gap_event_cb(struct ble_gap_event *event, void *arg) {
   switch (event->type) {
   case BLE_GAP_EVENT_DISC: {
+    if (s_connecting_camera || ble_client_is_connected()) {
+      return 0;
+    }
     struct ble_hs_adv_fields fields;
     if (ble_hs_adv_parse_fields(&fields, event->disc.data,
                                 event->disc.length_data) != 0) {
@@ -1070,11 +1543,17 @@ int ble_client_gap_event_cb(struct ble_gap_event *event, void *arg) {
     if (!is_sony_camera_adv(&event->disc, &fields)) {
       return 0;
     }
+    if (pairing_mode_active() && peer_is_bonded(&event->disc.addr)) {
+      VLOGI("Pairing mode ignored an already bonded camera");
+      return 0;
+    }
+    (void)camera_name_copy(s_adv_camera_name, sizeof(s_adv_camera_name),
+                           fields.name, fields.name_len);
+    s_connecting_camera = true;
     int rc = ble_gap_disc_cancel();
     if (rc != 0) {
       VLOGW("Scan cancel failed: %d", rc);
     }
-    s_connecting_camera = true;
     rc = ble_gap_connect(s_own_addr_type, &event->disc.addr, 30000, NULL,
                          ble_client_gap_event_cb, NULL);
     if (rc != 0) {
@@ -1090,6 +1569,12 @@ int ble_client_gap_event_cb(struct ble_gap_event *event, void *arg) {
     if (event->connect.status == 0) {
       if (s_connecting_camera) {
         s_handles.conn_handle = event->connect.conn_handle;
+#if ALPHALOC_GNSS_STANDBY
+        gps_camera_connection_changed(true);
+#endif
+#if ALPHALOC_LOCATION_OBSERVER
+        location_observer_reset(s_handles.conn_handle);
+#endif
         ESP_LOGI(TAG, "Connected to camera");
         struct ble_gap_conn_desc desc;
         if (ble_gap_conn_find(s_handles.conn_handle, &desc) == 0 &&
@@ -1109,15 +1594,23 @@ int ble_client_gap_event_cb(struct ble_gap_event *event, void *arg) {
     } else {
       ESP_LOGW(TAG, "Connect failed: %d", event->connect.status);
       s_connecting_camera = false;
+      s_adv_camera_name[0] = '\0';
       ble_start_scan();
     }
     return 0;
   }
   case BLE_GAP_EVENT_DISCONNECT: {
     if (event->disconnect.conn.conn_handle == s_handles.conn_handle) {
-      ESP_LOGI(TAG, "Camera disconnected");
+      ESP_LOGI(TAG, "Camera disconnected: reason=%d (0x%X)",
+               event->disconnect.reason, (unsigned)event->disconnect.reason);
       memset(&s_handles, 0, sizeof(s_handles));
       s_handles.conn_handle = BLE_HS_CONN_HANDLE_NONE;
+#if ALPHALOC_GNSS_STANDBY
+      gps_camera_connection_changed(false);
+#endif
+#if ALPHALOC_LOCATION_OBSERVER
+      location_observer_reset(BLE_HS_CONN_HANDLE_NONE);
+#endif
       s_connecting_camera = false;
       s_location_enabled = false;
       s_dd21_retry = 0;
@@ -1137,13 +1630,32 @@ int ble_client_gap_event_cb(struct ble_gap_event *event, void *arg) {
       s_ff02_cccd_sent = false;
       s_bonded_camera = false;
       s_retried_disc_after_enc = false;
+      reset_camera_identity_lookup();
+      // Use saved bonds and MCU uptime; disconnects never renew the boot window.
       ble_start_scan();
     } else {
       ESP_LOGI(TAG, "Config client disconnected");
     }
     return 0;
   }
+#if ALPHALOC_POWER_SAVE
+  case BLE_GAP_EVENT_DISC_COMPLETE:
+    // The finite bonded boot scan expired. Cancellation/preemption must not launch a
+    // competing scan while a connection is being established.
+    if (s_scan_restart_requested) {
+      s_scan_restart_requested = false;
+      ble_start_scan();
+      return 0;
+    }
+    ble_scan_complete(event->disc_complete.reason);
+    return 0;
+#endif
   case BLE_GAP_EVENT_NOTIFY_RX: {
+#if ALPHALOC_LOCATION_OBSERVER
+    location_observer_notify(event->notify_rx.conn_handle,
+                              event->notify_rx.attr_handle, event->notify_rx.om,
+                              event->notify_rx.indication);
+#endif
 #if ALPHALOC_VERBOSE
     ESP_LOGI(TAG, "Notify rx handle=%u len=%u", event->notify_rx.attr_handle,
              (unsigned)event->notify_rx.om->om_len);
@@ -1205,6 +1717,10 @@ int ble_client_gap_event_cb(struct ble_gap_event *event, void *arg) {
     return BLE_GAP_REPEAT_PAIRING_RETRY;
   }
   case BLE_GAP_EVENT_ENC_CHANGE:
+    if (event->enc_change.conn_handle != s_handles.conn_handle) {
+      ESP_LOGI(TAG, "Config client encryption changed");
+      return 0;
+    }
     s_encrypted = (event->enc_change.status == 0);
     if (!s_encrypted) {
       ESP_LOGW(TAG, "Encryption failed: %d", event->enc_change.status);
@@ -1226,6 +1742,11 @@ int ble_client_gap_event_cb(struct ble_gap_event *event, void *arg) {
       struct ble_gap_conn_desc desc;
       if (ble_gap_conn_find(event->enc_change.conn_handle, &desc) == 0) {
         s_bonded_camera = desc.sec_state.bonded;
+        if (s_bonded_camera && pairing_mode_active()) {
+          pairing_deadline_set(0);
+          ESP_LOGI(TAG, "New-camera pairing completed");
+        }
+        begin_camera_identity_lookup(&desc);
       } else {
         s_bonded_camera = false;
       }
@@ -1259,22 +1780,125 @@ int ble_client_gap_event_cb(struct ble_gap_event *event, void *arg) {
   }
 }
 
+#if ALPHALOC_POWER_SAVE
+static bool scan_has_saved_bonds(void) {
+  // s_bonded_camera describes the CURRENT connection and is cleared on disconnect.
+  // Read NimBLE's restored bond store instead, including after a first pairing.
+  ble_addr_t peers[MYNEWT_VAL(BLE_STORE_MAX_BONDS)];
+  int num = 0;
+  int rc = ble_store_util_bonded_peers(peers, &num,
+                                      MYNEWT_VAL(BLE_STORE_MAX_BONDS));
+  if (rc != 0) {
+    // Unknown is not unpaired: do not fall back to continuous scanning on errors.
+    ESP_LOGW(TAG, "Scan bond lookup failed: %d; keeping duty-cycled scanning", rc);
+    return true;
+  }
+  ESP_LOGI(TAG, "Scan policy: saved_bonds=%d; %s", num,
+           num > 0 ? "duty-cycled" : "continuous pairing discovery");
+  return num > 0;
+}
+
+static int scan_ms_to_units(uint32_t milliseconds) {
+  uint32_t units = (milliseconds * 8U + 4U) / 5U;
+  if (units < 4U) units = 4U;
+  if (units > 0x4000U) units = 0x4000U;
+  return (int)units;
+}
+#endif
+
+static void configure_scan_params(struct ble_gap_disc_params *params,
+                                  int32_t *duration_ms) {
+  memset(params, 0, sizeof(*params));
+  params->passive = 0; // Preserve active scanning and scan-response handling.
+  params->filter_duplicates = 1;
+  params->itvl = ALPHALOC_SCAN_PAIRING_INTERVAL;
+  params->window = ALPHALOC_SCAN_PAIRING_WINDOW;
+  *duration_ms = BLE_HS_FOREVER;
+  int64_t pairing_remaining_us =
+      pairing_deadline_get() - esp_timer_get_time();
+  if (pairing_remaining_us > 0) {
+    *duration_ms = (int32_t)((pairing_remaining_us + 999) / 1000);
+    return;
+  }
+#if ALPHALOC_POWER_SAVE
+  if (!scan_has_saved_bonds()) {
+    return;
+  }
+  app_config_t cfg;
+  if (!config_get_snapshot(s_cfg, &cfg)) {
+    config_set_defaults(&cfg);
+  }
+  bluetooth_power_policy_t policy;
+  config_resolve_bluetooth_power(&cfg, &policy);
+  // esp_timer_get_time is monotonic time since MCU startup. Neither a host
+  // resync nor a connection retry/disconnect may restart this boot period.
+  int64_t remaining_us =
+      (int64_t)policy.boot_fast_search_s * 1000000LL - esp_timer_get_time();
+  if (remaining_us > 0) {
+    params->itvl = ALPHALOC_SCAN_BONDED_BOOT_INTERVAL;
+    params->window = ALPHALOC_SCAN_BONDED_BOOT_WINDOW;
+    // Round up to avoid a zero-duration scan at the boot boundary.
+    *duration_ms = (int32_t)((remaining_us + 999) / 1000);
+  } else {
+    params->itvl = scan_ms_to_units(policy.scan_period_ms);
+    params->window = scan_ms_to_units(policy.scan_window_ms);
+  }
+#endif
+}
+
 static void ble_start_scan(void) {
-  struct ble_gap_disc_params params = {0};
-  params.passive = 0;
-  // Sony cameras may advertise infrequently and without a local name. Scan
-  // continuously until the camera is found to keep pairing/linking reliable.
-  params.itvl = 0x0010;   // 10ms scan interval
-  params.window = 0x0010; // 10ms scan window
-  params.filter_duplicates = 1;
-  int rc = ble_gap_disc(s_own_addr_type, BLE_HS_FOREVER, &params,
+  if (s_connecting_camera || ble_client_is_connected() || ble_gap_disc_active()) {
+    return;
+  }
+  struct ble_gap_disc_params params;
+  int32_t duration_ms;
+  configure_scan_params(&params, &duration_ms);
+  int rc = ble_gap_disc(s_own_addr_type, duration_ms, &params,
                         ble_client_gap_event_cb, NULL);
   if (rc != 0) {
     ESP_LOGW(TAG, "BLE scan start failed: %d", rc);
     return;
   }
-  ESP_LOGI(TAG, "BLE scanning");
+  ESP_LOGI(TAG, "BLE scanning: interval=%u window=%u (0.625ms units), duration_ms=%ld; "
+               "interval_ms=%u window_ms=%u uptime_ms=%lld",
+           (unsigned)params.itvl, (unsigned)params.window, (long)duration_ms,
+           (unsigned)params.itvl * 5U / 8U, (unsigned)params.window * 5U / 8U,
+           (long long)(esp_timer_get_time() / 1000));
 }
+
+#if ALPHALOC_POWER_SAVE
+static void ble_scan_complete(int reason) {
+  if (reason == 0) {
+    ble_start_scan();
+  }
+}
+#endif
+
+void ble_client_config_changed(void) {
+#if ALPHALOC_POWER_SAVE
+  if (!s_host_synced || s_connecting_camera || ble_client_is_connected()) {
+    return;
+  }
+  if (ble_gap_disc_active()) {
+    s_scan_restart_requested = true;
+    int rc = ble_gap_disc_cancel();
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+      s_scan_restart_requested = false;
+      ESP_LOGW(TAG, "BLE scan restart after config failed: %d", rc);
+    }
+  } else {
+    ble_start_scan();
+  }
+#endif
+}
+
+#if ALPHALOC_BOARD_XIAO_ESP32C6
+static void format_device_name(const uint8_t addr[6], char *out, size_t size) {
+  // NimBLE stores address bytes least-significant first. Use the BLE identity,
+  // not the distinct USB/base MAC, and preserve leading zeros in the suffix.
+  snprintf(out, size, "FrameNav-%02X%02X%02X", addr[2], addr[1], addr[0]);
+}
+#endif
 
 static void ble_on_sync(void) {
   int rc = ble_hs_id_infer_auto(0, &s_own_addr_type);
@@ -1282,8 +1906,33 @@ static void ble_on_sync(void) {
     ESP_LOGW(TAG, "Address type infer failed: %d", rc);
     return;
   }
+  uint8_t own_addr[6];
+  rc = ble_hs_id_copy_addr(s_own_addr_type, own_addr, NULL);
+  if (rc != 0) {
+    ESP_LOGE(TAG, "BLE identity address read failed: %d", rc);
+    return;
+  }
+#if ALPHALOC_BOARD_XIAO_ESP32C6
+  char device_name[sizeof("FrameNav-FFFFFF")];
+  format_device_name(own_addr, device_name, sizeof(device_name));
+  rc = ble_svc_gap_device_name_set(device_name);
+  if (rc != 0) {
+    ESP_LOGE(TAG, "BLE device name set failed: %d", rc);
+    return;
+  }
+#endif
+  s_host_synced = true;
+  ESP_LOGI(TAG, "BLE identity: name=%s MAC=%02X:%02X:%02X:%02X:%02X:%02X",
+           ble_svc_gap_device_name(), own_addr[5], own_addr[4], own_addr[3],
+           own_addr[2], own_addr[1], own_addr[0]);
+#if !ALPHALOC_BLE_CONFIG
+  ESP_LOGI(TAG, "Camera central only: configuration advertising is OFF; "
+                "not discoverable in phone/computer Bluetooth lists");
+#endif
   ble_start_scan();
+#if ALPHALOC_BLE_CONFIG
   ble_config_server_on_sync();
+#endif
 }
 
 static void ble_host_task(void *param) {
@@ -1321,17 +1970,25 @@ void ble_client_init(const app_config_t *cfg) {
   s_ff02_cccd_sent = false;
   s_service_changed_reconnect_attempted = false;
   s_retried_disc_after_enc = false;
+  s_host_synced = false;
+#if ALPHALOC_POWER_SAVE
+  s_scan_restart_requested = false;
+#endif
+  reset_camera_identity_lookup();
+  pairing_deadline_set(0);
 #if ALPHALOC_VERBOSE
   s_payload_logged = false;
 #endif
 
-  nimble_port_init();
+  ESP_ERROR_CHECK(nimble_port_init());
   ble_svc_gap_init();
   ble_svc_gatt_init();
   ble_store_config_init();
+#if ALPHALOC_BLE_CONFIG
   ble_config_server_register((app_config_t *)cfg);
+#endif
 
-  ble_svc_gap_device_name_set("AlphaLoc");
+  ble_svc_gap_device_name_set("FrameNav");
 
   ble_hs_cfg.sync_cb = ble_on_sync;
   ble_hs_cfg.reset_cb = NULL;
@@ -1357,6 +2014,19 @@ void ble_client_init(const app_config_t *cfg) {
     s_dsc_retry_timer = NULL;
   }
 
+  const esp_timer_create_args_t identity_timer_args = {
+      .callback = identity_retry_cb,
+      .arg = NULL,
+      .dispatch_method = ESP_TIMER_TASK,
+      .name = "camera_identity",
+      .skip_unhandled_events = true,
+  };
+  rc = esp_timer_create(&identity_timer_args, &s_identity_retry_timer);
+  if (rc != ESP_OK) {
+    ESP_LOGW(TAG, "Camera identity timer create failed: %d", rc);
+    s_identity_retry_timer = NULL;
+  }
+
   nimble_port_freertos_init(ble_host_task);
 }
 
@@ -1371,5 +2041,10 @@ void ble_client_deinit(void) {
     esp_timer_stop(s_dsc_retry_timer);
     esp_timer_delete(s_dsc_retry_timer);
     s_dsc_retry_timer = NULL;
+  }
+  if (s_identity_retry_timer) {
+    esp_timer_stop(s_identity_retry_timer);
+    esp_timer_delete(s_identity_retry_timer);
+    s_identity_retry_timer = NULL;
   }
 }
