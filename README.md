@@ -13,9 +13,10 @@ endorsed by, or sponsored by Sony Group Corporation.
 
 ## Features
 
-### 当前版本：0.17.0（实验性）
+### 当前版本：0.18.0-test4（实验性）
 
-当前实测组合为 **XIAO ESP32-C6 + StarNav M10-K18 + Sony α7C II**。
+当前实测组合为 **XIAO ESP32-C6 + StarNav M10-K18 + 18350 电池 + BMI160 + Sony α7C II**。
+`minimal-implementation` 分支保留引入加速度传感器前的 0.17.0 最小实现；`main` 是当前开发版本。
 使用 PlatformIO Core CLI，无需 VS Code：
 
 ```sh
@@ -25,15 +26,27 @@ pio device monitor -b 115200
 ```
 
 请显式指定上述环境；默认 `xiao-c6-debug` 是 Fake GPS 测试固件。
-GNSS TX 接 D7/GPIO17，RX 接 D6/GPIO16，GND 共地；供电和串口电平应先按模块实物确认。
+GNSS TX 接 D7/GPIO17，RX 接 D8/GPIO19，GND 共地；供电和串口电平应先按模块实物确认。
+BMI160 SDA 接 D9/GPIO20，SCL 接 D10/GPIO18，INT1 接 D0/GPIO0。
+传感器由 3.3V 电源供电且须在深睡期间保持供电；模块 VIN/3V3 接法应以实际稳压电路为准。
+电池接入板载 BAT 正负端，不能接到 3V3；电芯保护、极性及 GNSS 电池供电路径需自行确认。
+电池供电时不能假设 VBUS 有 5V 输出。
 **不要将 VBUS 和 3V3 直接并联。**
 
 XIAO 使用板载单色状态灯（不是下文上游参考硬件的 NeoPixel）：
 未连接相机时闪烁，连接后常亮；常亮不代表相机已接受有效定位。
-Wi-Fi 配置入口由 USB 供电来源检测控制，电池与已识别的热靴供电不启动 Wi-Fi。
+Wi-Fi 配置入口由 USB 供电来源检测控制，电池与已识别的热靴供电不自动启动 Wi-Fi，但可通过画圈手势开启。
 热靴识别依据实测 USB 信号特征，是启发式判断，并非通用热靴协议识别。
 连接热点后可尝试自动弹出的配置页，或访问 **http://10.254.254.1/**。
 默认热点密码为 `framenav1234`，请在配置页修改。
+
+未连接相机、无 Wi-Fi 客户端及近期配置页访问时，持续无动作约 5 分钟可进入深睡；运动中断唤醒。
+连接电脑 USB 数据主机时不深睡。画圈开启的热点在 30 秒无 Web 页面活动后关闭，手势冷却 60 秒。
+已在测试固件验证电池画圈、纯电池冷启动画圈、深睡和运动唤醒；深睡唤醒后画圈与步行误触率仍待验证。
+详见 [运动与深睡说明](MOTION-V18.md)。
+
+持久化诊断仅在 `pio run -e xiao-c6-motion-debug` 测试目标启用，使用独立分区；
+普通 `xiao-c6-gnss-power` 不包含该日志写入功能，详见 [测试诊断说明](MOTION-DEBUG.md)。
 
 轨迹存储与掉电恢复仍属实验功能，目前尚无 GPX 导出接口。
 下文同时保留上游其他板型的参考说明；LED、配置窗口及默认参数不一定适用于 XIAO 环境。
@@ -57,7 +70,7 @@ The project is set up for **PlatformIO** and currently supports:
 |-------|-------------|--------|
 | [**DFRobot Beetle ESP32-C6**](https://wiki.dfrobot.com/SKU_DFR1117_Beetle_ESP32_C6) | `esp32c6` | GPS TX: 5, GPS RX: 4, NeoPixel: 6 |
 | [**Adafruit Feather ESP32-S3**](https://learn.adafruit.com/adafruit-esp32-s3-feather/overview)| `esp32s3` | GPS TX: 38, GPS RX: 39, NeoPixel: 6 |
-| [**Seeed Studio XIAO ESP32-C6**](https://wiki.seeedstudio.com/xiao_esp32c6_getting_started/) | `xiao-c6-gnss-power` | GPS TX: D6/GPIO16, GPS RX: D7/GPIO17 |
+| [**Seeed Studio XIAO ESP32-C6**](https://wiki.seeedstudio.com/xiao_esp32c6_getting_started/) | `xiao-c6-gnss-power` | MCU TX: D8/GPIO19 → GNSS RX; MCU RX: D7/GPIO17 ← GNSS TX |
 
 You can easily adapt it to other ESP32 boards by modifying `platformio.ini`.
 

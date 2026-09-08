@@ -56,6 +56,8 @@ bool gps_get_status(gps_status_t *out_status);
 void gps_camera_connection_changed(bool connected);
 // Safe from the HTTP task; the GPS task applies the policy on its next pass.
 void gps_apply_power_policy(const location_power_policy_t *policy);
+void gps_request_system_sleep(bool requested);
+bool gps_system_sleep_ready(void);
 #endif
 
 #if ALPHALOC_FAKE_GPS && ALPHALOC_FAKE_GPS_STEPPING

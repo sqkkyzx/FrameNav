@@ -31,6 +31,11 @@
 #include "gnss_rate.h"
 #include "power_policy.h"
 #include "track_store.h"
+#include "bmi160_probe.h"
+#include "motion_service.h"
+#include "test_debug.h"
+#include "motion_policy.h"
+#include "esp_system.h"
 #if ALPHALOC_POWER_SOURCE_PROBE
 #include "power_source_probe.h"
 #endif
@@ -231,6 +236,51 @@ static void config_window_task(void *arg) {
 #if ALPHALOC_USB_HOST_WIFI
 #define USB_CONFIG_POLL_MS 100U
 #define USB_CONFIG_START_RETRY_MS 5000U
+static TaskHandle_t s_led_task;
+static bool system_sleep_allowed(void) {
+  int64_t last = 0, now = esp_timer_get_time();
+  bool sensor = motion_service_status(&last);
+  int64_t web = wifi_web_last_activity_us();
+  return !usb_serial_jtag_is_connected() &&
+      motion_sleep_due(now, last, ble_client_is_connected(),
+                       wifi_web_has_clients(),
+                       wifi_web_is_started() && web > 0 && now-web < 30000000LL,
+                       sensor);
+}
+static void try_system_sleep(void) {
+  if (!ble_client_pause_for_sleep(true)) {
+    ble_client_pause_for_sleep(false); return;
+  }
+  ESP_LOGI(TAG, "Preparing deep sleep: waiting for GNSS standby confirmation");
+  test_debug_event(DBG_SLEEP_PREP,0,0,0,0);
+  gps_request_system_sleep(true);
+  int64_t deadline = esp_timer_get_time()+10000000LL;
+  while (!gps_system_sleep_ready() && esp_timer_get_time()<deadline) {
+    if (!system_sleep_allowed()) break;
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+  if (!gps_system_sleep_ready() || !system_sleep_allowed() ||
+      !motion_service_arm_sleep()) goto cancel;
+  if (!track_store_quiesce(true)) goto cancel;
+  // Last check before stopping network services; after this point abort by
+  // restarting, so a partially stopped BLE host cannot strand the device.
+  if (!system_sleep_allowed() || gpio_get_level(GPIO_NUM_0)) goto cancel;
+  wifi_web_stop();
+  if (!ble_client_stop_for_sleep() || usb_serial_jtag_is_connected() ||
+      gpio_get_level(GPIO_NUM_0) || ble_client_is_connected()) {
+    ESP_LOGW(TAG, "Sleep interrupted during radio shutdown; restarting safely");
+    esp_restart();
+  }
+  if (s_led_task) vTaskSuspend(s_led_task);
+  motion_service_enter_sleep();
+cancel:
+  test_debug_event(DBG_SLEEP_ABORT,0,0,0,0);
+  track_store_quiesce(false);
+  motion_service_cancel_sleep();
+  gps_request_system_sleep(false);
+  ble_client_pause_for_sleep(false);
+  ESP_LOGI(TAG, "Deep sleep cancelled; normal operation resumed");
+}
 
 static void usb_host_wifi_task(void *arg) {
   app_config_t *cfg = (app_config_t *)arg;
@@ -243,6 +293,7 @@ static void usb_host_wifi_task(void *arg) {
   usb_config_gate_init(&gate, now_us, raw_allowed);
   int64_t retry_after_us = 0;
   bool previous_raw_allowed = raw_allowed;
+  int64_t gesture_opened = 0;
 
   while (true) {
     now_us = esp_timer_get_time();
@@ -253,28 +304,56 @@ static void usb_host_wifi_task(void *arg) {
     raw_allowed = usb_config_source_allows_wifi(raw_host, dp, dm);
     bool allowed = usb_config_gate_update(&gate, now_us, raw_allowed);
     bool running = wifi_web_is_started();
+    if (motion_service_take_circle()) {
+      test_debug_event(DBG_CIRCLE,allowed,running,0,0);
+      if (allowed) {
+        ESP_LOGI(TAG, "Circle recognized; USB source already manages WiFi");
+      } else if (wifi_web_start_gesture(cfg)) {
+        test_debug_event(DBG_AP_RESULT,1,1,0,0);
+        gesture_opened = esp_timer_get_time();
+        running = true;
+        ESP_LOGI(TAG, "Circle: configuration AP open, Web idle timeout=30s");
+      } else {
+        test_debug_event(DBG_AP_RESULT,0,1,0,0);
+        ESP_LOGW(TAG, "Circle recognized but configuration AP start failed");
+      }
+    }
+    if (allowed) gesture_opened = 0;
+    if (gesture_opened) {
+      int64_t last = wifi_web_last_activity_us();
+      if (last < gesture_opened) last = gesture_opened;
+      if (now_us-last >= 30000000LL) {
+        ESP_LOGI(TAG, "Gesture WiFi: no Web activity for 30s, closing");
+        test_debug_event(DBG_WIFI_STOP,1,0,0,0);
+        wifi_web_stop(); gesture_opened = 0; running = false;
+      }
+    }
 
     if (raw_allowed != previous_raw_allowed) {
+      test_debug_event(DBG_SOURCE,raw_allowed,allowed,running,0);
       ESP_LOGI(TAG, "USB config source candidate: SOF=%s D+/D-=%u%u allowed=%s",
                raw_host ? "yes" : "no", dp, dm,
                raw_allowed ? "yes" : "no");
       previous_raw_allowed = raw_allowed;
     }
 
-    if (!allowed) {
+    if (!allowed && !gesture_opened) {
       retry_after_us = 0;
       if (running) {
         ESP_LOGI(TAG, "Battery/MI-shoe signature stable for 5s: stopping WiFi web");
+        test_debug_event(DBG_WIFI_STOP,2,0,0,0);
         wifi_web_stop();
       }
-    } else if (!running && now_us >= retry_after_us) {
+    } else if (allowed && !running && now_us >= retry_after_us) {
       ESP_LOGI(TAG, "Computer/charger signature stable for 2s: starting WiFi web");
+      test_debug_event(DBG_AP_START,0,0,0,0);
       if (!wifi_web_start(cfg)) {
         retry_after_us = now_us +
                          (int64_t)USB_CONFIG_START_RETRY_MS * 1000LL;
         ESP_LOGW(TAG, "WiFi web start failed; retry in 5s while USB host remains");
       }
     }
+    if (system_sleep_allowed()) try_system_sleep();
     vTaskDelay(pdMS_TO_TICKS(USB_CONFIG_POLL_MS));
   }
 }
@@ -538,6 +617,8 @@ void app_main(void) {
     ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(err));
   }
 
+  test_debug_start();
+  motion_service_boot();
   bool config_loaded = config_load(&s_cfg);
   (void)config_loaded;
 #if ALPHALOC_PHASE1 || ALPHALOC_PHASE2
@@ -619,6 +700,8 @@ void app_main(void) {
 #endif
 
   ble_client_init(&s_cfg);
+  bmi160_probe_start();
+  motion_service_start();
   ble_client_set_focus_callback(focus_update_cb, &s_cfg);
 
 #if ALPHALOC_POWER_SOURCE_PROBE
@@ -671,7 +754,13 @@ void app_main(void) {
   }
 #endif
 #if ALPHALOC_BOARD_XIAO_ESP32C6
-  ret = xTaskCreate(xiao_status_led_task, "xiao_led", 3072, NULL, 1, NULL);
+  ret = xTaskCreate(xiao_status_led_task, "xiao_led", 3072, NULL, 1,
+#if ALPHALOC_USB_HOST_WIFI
+                   &s_led_task
+#else
+                   NULL
+#endif
+  );
   if (ret != pdPASS) {
     ESP_LOGE(TAG, "Failed to create xiao_status_led_task");
   }

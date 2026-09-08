@@ -95,7 +95,7 @@ class WifiWebChecks(unittest.TestCase):
         self.assertIn("最早记录：%s", page)
         self.assertIn("track_store_get_status", page)
         self.assertIn("esp_app_get_description", page)
-        self.assertIn('set(PROJECT_VER "0.17.0")', cmake)
+        self.assertIn('set(PROJECT_VER "0.18.0-test4")', cmake)
 
     def test_bond_form_token_parser_round_trips_display_order(self):
         run_c(

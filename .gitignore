@@ -53,6 +53,10 @@ sdkconfig.xiao-c6-gnss-debug
 sdkconfig.xiao-c6-gnss-debug.old
 sdkconfig.xiao-c6-gnss-power
 sdkconfig.xiao-c6-gnss-power.old
+sdkconfig.xiao-c6-motion-debug
+sdkconfig.xiao-c6-motion-debug.old
+sdkconfig.xiao-c6-power-source-test
+sdkconfig.xiao-c6-power-source-test.old
 artifacts/
 include/fake_clock_seed.generated.h
 test/__pycache__/

@@ -47,6 +47,14 @@ size_t gnss_pm_build_request(uint8_t *out, size_t cap, uint32_t sleep_ms) {
 
 /* Each MON-VER slot includes its own terminator. Reject binary and unterminated
  * text instead of turning a malformed/truncated identity into a supported one.
+ */
+size_t gnss_pm_build_indefinite(uint8_t *out, size_t cap) {
+  size_t n=gnss_pm_build_request(out,cap,1);
+  if(n){memset(out+10,0,4);finish_checksum(out,n);}return n;
+}
+
+/* Each MON-VER slot includes its own terminator. Reject binary and unterminated
+ * text instead of turning a malformed/truncated identity into a supported one.
  * Bytes after the terminator are padding and are deliberately not interpreted.
  */
 static bool copy_ascii_slot(char *out, const uint8_t *slot, size_t width) {

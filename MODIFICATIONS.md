@@ -8,6 +8,9 @@ The initial FrameNav work in this repository is based on AlphaLoc commit
 
 ## Principal changes
 
+- Added BMI160 motion sensing, idle deep sleep with interrupt wake, circle-gesture
+  Wi-Fi activation and Web-activity timeout. Added an isolated persistent-debug
+  test target without changing the normal track partition or logging policy.
 - Added build targets and board integration for Seeed Studio XIAO ESP32-C6.
 - Added StarNav M10-K18 UART/NMEA integration, GNSS rate control, standby
   protocol handling, and connection-aware GNSS duty cycling.

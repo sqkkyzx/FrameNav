@@ -45,6 +45,7 @@ static int s_fix_mutex=1;
 static int64_t s_last_no_fix_log_us;
 static int s_camera_lock;
 static bool s_camera_connected;
+static bool s_system_sleep_requested, s_system_sleep_ready;
 static uint32_t s_camera_generation, s_camera_seen_generation;
 static int64_t s_camera_changed_us;
 static location_power_policy_t s_pending_power_policy;

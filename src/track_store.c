@@ -39,6 +39,12 @@ static const esp_partition_t *s_partition;
 static SemaphoreHandle_t s_mutex;
 static uint8_t *s_sector_buffer;
 static track_store_status_t s_status;
+static bool s_paused;
+bool track_store_quiesce(bool pause) {
+  if(!s_mutex)return true;
+  if(xSemaphoreTake(s_mutex,pdMS_TO_TICKS(1000))!=pdTRUE)return false;
+  s_paused=pause;xSemaphoreGive(s_mutex);return true;
+}
 static uint32_t s_next_sector;
 static uint16_t s_next_record;
 static uint32_t s_next_sequence = 1;
@@ -256,6 +262,7 @@ bool track_store_append_fix(const gps_fix_t *fix) {
       xSemaphoreTake(s_mutex, pdMS_TO_TICKS(250)) != pdTRUE) {
     return false;
   }
+  if(s_paused){xSemaphoreGive(s_mutex);return false;}
   if (s_status.latest_timestamp_utc != 0 &&
       (record.timestamp_utc <= s_status.latest_timestamp_utc ||
        record.timestamp_utc - s_status.latest_timestamp_utc <

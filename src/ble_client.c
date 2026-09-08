@@ -93,6 +93,7 @@ static bool s_require_tz_dst;
 static int16_t s_tz_off_min;
 static int16_t s_dst_off_min;
 static bool s_connecting_camera;
+static _Atomic bool s_system_sleep;
 static uint8_t s_dd21_retry;
 static bool s_location_enabled;
 static bool s_dd21_ready;
@@ -1532,7 +1533,7 @@ bool ble_client_start_pairing(uint32_t duration_s) {
 int ble_client_gap_event_cb(struct ble_gap_event *event, void *arg) {
   switch (event->type) {
   case BLE_GAP_EVENT_DISC: {
-    if (s_connecting_camera || ble_client_is_connected()) {
+    if (s_system_sleep || s_connecting_camera || ble_client_is_connected()) {
       return 0;
     }
     struct ble_hs_adv_fields fields;
@@ -1847,6 +1848,7 @@ static void configure_scan_params(struct ble_gap_disc_params *params,
 }
 
 static void ble_start_scan(void) {
+  if (s_system_sleep) return;
   if (s_connecting_camera || ble_client_is_connected() || ble_gap_disc_active()) {
     return;
   }
@@ -2047,4 +2049,18 @@ void ble_client_deinit(void) {
     esp_timer_delete(s_identity_retry_timer);
     s_identity_retry_timer = NULL;
   }
+}
+
+bool ble_client_pause_for_sleep(bool pause) {
+  s_system_sleep = pause;
+  if (!pause) { ble_start_scan(); return true; }
+  if (ble_gap_disc_active()) (void)ble_gap_disc_cancel();
+  return !s_connecting_camera && !ble_client_is_connected();
+}
+bool ble_client_stop_for_sleep(void) {
+  if (!s_system_sleep || s_connecting_camera || ble_client_is_connected()) return false;
+  if (nimble_port_stop() != 0) return false;
+  s_host_synced = false;
+  ble_client_deinit();
+  return nimble_port_deinit() == ESP_OK;
 }

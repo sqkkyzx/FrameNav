@@ -2,6 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 cmake_minimum_required(VERSION 3.16.0)
-set(PROJECT_VER "0.17.0")
+set(PROJECT_VER "0.18.0-test4")
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(framenav)

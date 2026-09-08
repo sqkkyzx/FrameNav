@@ -30,6 +30,8 @@ typedef struct {
 void ble_client_init(const app_config_t *cfg);
 void ble_client_set_focus_callback(ble_focus_cb_t cb, void *ctx);
 bool ble_client_is_connected(void);
+bool ble_client_pause_for_sleep(bool pause);
+bool ble_client_stop_for_sleep(void);
 bool ble_client_is_bonded(void);
 int ble_client_get_bonds(ble_client_bond_t *out, size_t capacity);
 bool ble_client_delete_bond(const ble_client_bond_t *bond);

@@ -54,5 +54,6 @@ bool track_store_init(void);
 bool track_store_append_fix(const gps_fix_t *fix);
 bool track_store_get_status(track_store_status_t *out_status);
 void track_store_task(void *arg);
+bool track_store_quiesce(bool pause);
 
 #endif

@@ -4,6 +4,7 @@
  */
 
 #include "wifi_web.h"
+#include "test_debug.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -38,6 +39,25 @@
 static const char *TAG = "wifi_web";
 
 static httpd_handle_t s_server;
+static portMUX_TYPE s_activity_lock = portMUX_INITIALIZER_UNLOCKED;
+static int64_t s_activity_us;
+static bool s_force_ap;
+static void web_activity(void) {
+  portENTER_CRITICAL(&s_activity_lock);
+  s_activity_us = esp_timer_get_time();
+  portEXIT_CRITICAL(&s_activity_lock);
+}
+int64_t wifi_web_last_activity_us(void) {
+  portENTER_CRITICAL(&s_activity_lock);
+  int64_t value = s_activity_us;
+  portEXIT_CRITICAL(&s_activity_lock);
+  return value;
+}
+static esp_err_t handle_activity(httpd_req_t *req) {
+  web_activity();
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_sendstr(req, "OK");
+}
 static app_config_t *s_cfg;
 static esp_netif_t *s_netif = NULL;
 static esp_netif_t *s_netif_sta = NULL;
@@ -516,6 +536,7 @@ static bool format_track_time(uint32_t timestamp_utc, int16_t tz_offset_min,
 }
 
 static esp_err_t handle_root(httpd_req_t *req) {
+  web_activity();
   app_config_t cfg;
   if (!config_get_snapshot(s_cfg, &cfg)) {
     cfg = *s_cfg;
@@ -815,6 +836,8 @@ static esp_err_t handle_root(httpd_req_t *req) {
       "<br>FrameNav 是基于 <a href=\"https://github.com/finfinack/alphaloc\">AlphaLoc</a> "
       "开发的开源项目，采用 <a href=\"https://www.apache.org/licenses/LICENSE-2.0\">Apache-2.0</a> 许可证。</footer>"
       "<script>(()=>{const q=(s)=>document.querySelector(s),qa=(s)=>[...document.querySelectorAll(s)];"
+      "function pulse(){if(!document.hidden)fetch('/activity',{cache:'no-store'}).catch(()=>{})}"
+      "setInterval(pulse,10000);document.addEventListener('visibilitychange',pulse);pulse();"
       "const li=qa('.loc-custom'),bi=qa('.ble-custom'),ln=q('#track-note'),ls=q('#loc-state'),bs=q('#ble-state');"
       "const lp={0:[45,10,300,120,30,28.8,30],1:[45,20,90,30,15,28.8,45]};"
       "const bp={0:[15,10,100],1:[30,3,100]};"
@@ -843,6 +866,7 @@ static esp_err_t handle_root(httpd_req_t *req) {
 }
 
 static esp_err_t handle_save(httpd_req_t *req) {
+  web_activity();
   char body[1536];
   if (req->content_len >= sizeof(body)) {
     return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Request too large");
@@ -994,6 +1018,7 @@ static esp_err_t handle_save(httpd_req_t *req) {
 }
 
 static esp_err_t handle_pair_start(httpd_req_t *req) {
+  web_activity();
   if (!ble_client_start_pairing(FRAMENAV_PAIRING_WINDOW_S)) {
     httpd_resp_set_status(req, "503 Service Unavailable");
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
@@ -1003,6 +1028,7 @@ static esp_err_t handle_pair_start(httpd_req_t *req) {
 }
 
 static esp_err_t handle_bond_delete(httpd_req_t *req) {
+  web_activity();
   char body[128];
   if (req->content_len == 0 || req->content_len >= sizeof(body)) {
     return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid request");
@@ -1149,6 +1175,10 @@ bool wifi_web_start(app_config_t *cfg) {
     }
   }
 
+  if (s_force_ap && !start_softap()) {
+    wifi_cleanup_resources();
+    return false;
+  }
   // Mark the lifecycle active before starting the radio so early connect/IP
   // events cannot be lost. Any later error goes through cleanup and clears it.
   s_started = true;
@@ -1198,6 +1228,9 @@ bool wifi_web_start(app_config_t *cfg) {
                              .handler = handle_bond_delete,
                              .user_ctx = NULL};
   err = httpd_register_uri_handler(s_server, &root);
+  httpd_uri_t activity = {.uri = "/activity", .method = HTTP_GET,
+                         .handler = handle_activity};
+  if (err == ESP_OK) err = httpd_register_uri_handler(s_server, &activity);
   if (err == ESP_OK) {
     err = httpd_register_uri_handler(s_server, &save);
   }
@@ -1235,3 +1268,17 @@ void wifi_web_stop(void) {
 }
 
 bool wifi_web_is_started(void) { return s_started; }
+bool wifi_web_start_gesture(app_config_t *cfg) {
+  test_debug_event(DBG_AP_START,1,s_started,0,0);
+  s_force_ap = true;
+  bool ok = wifi_web_start(cfg);
+  s_force_ap = false;
+  return ok;
+}
+bool wifi_web_has_clients(void) {
+  if (!s_started) return false;
+  if (s_sta_has_ip) return true;
+  if (!s_ap_active) return false;
+  wifi_sta_list_t clients = {0};
+  return esp_wifi_ap_get_sta_list(&clients) != ESP_OK || clients.num > 0;
+}

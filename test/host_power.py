@@ -22,7 +22,7 @@ def scan_code(enabled=True):
 #define ESP_LOGW(...) ((void)0)
 #define ESP_LOGI(...) ((void)0)
 struct ble_gap_disc_params { uint8_t passive, filter_duplicates; uint16_t itvl, window; };
-static bool s_connecting_camera, connected, scan_active;
+static bool s_connecting_camera, connected, scan_active, s_system_sleep;
 static uint8_t s_own_addr_type;
 static int64_t now_us, pairing_until_us;
 static app_config_t config_storage;
@@ -346,7 +346,7 @@ int main(void) {
                      "ALPHALOC_VERBOSE=0", "ALPHALOC_LIGHT_SLEEP=0",
                      "ALPHALOC_WIFI_WEB=1", "ALPHALOC_USB_HOST_WIFI=1",
                      "ALPHALOC_LOCATION_OBSERVER=1",
-                     "GPS_UART_TX_PIN=16", "GPS_UART_RX_PIN=17", "GPS_UART_BAUD=115200"):
+                     "GPS_UART_TX_PIN=19", "GPS_UART_RX_PIN=17", "GPS_UART_BAUD=115200"):
             self.assertIn(flag, flags)
         self.assertEqual(env["build_type"], "release")
         self.assertIn("sdkconfig.xiao-c6.defaults;sdkconfig.xiao-c6-power.defaults",
