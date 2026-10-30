@@ -1,0 +1,13 @@
+services:
+  framenav-public:
+    image: ghcr.io/sqkkyzx/framenav-public:latest
+    pull_policy: always
+    restart: unless-stopped
+    ports:
+      # The CDN should proxy HTTPS at the edge to this plain HTTP origin.
+      - "${FRAMENAV_ORIGIN_PORT:-80}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1/healthz | grep -qx ok"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

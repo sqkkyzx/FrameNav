@@ -94,7 +94,6 @@ void gnss_power_frame(gnss_power_t *p, uint8_t cls, uint8_t id,
 }
 
 static void power_wake(gnss_power_t *p, int64_t now_us, bool retry) {
-  p->deep_committed = false;
   // An edge on receiver RX is the configured wake source. This byte is not a
   // configuration command: wait for fresh NMEA before restoring RAM settings.
   static const uint8_t wake_byte = 0xff;
@@ -154,15 +153,6 @@ void gnss_power_poll(gnss_power_t *p, int64_t now_us) {
   }
 
   gnss_duty_action_t action = gnss_duty_poll(&p->duty, now_us);
-  const bool deep = p->deep_requested && !p->duty.camera_connected;
-  if (p->deep_committed && !deep) {
-    power_wake(p, now_us, false);return;
-  }
-  if (deep && !p->deep_committed && p->phase == GNSS_POWER_SLEEP) {
-    // A finite standby request must first be replaced while receiver is awake.
-    power_wake(p, now_us, false);return;
-  }
-  if (deep) action = p->deep_committed ? GNSS_DUTY_NONE : GNSS_DUTY_SLEEP;
   if (p->phase == GNSS_POWER_SLEEP_SETTLE || p->phase == GNSS_POWER_SLEEP) {
     if (p->rejected) {
       p->rejected = false;
@@ -181,9 +171,8 @@ void gnss_power_poll(gnss_power_t *p, int64_t now_us) {
   if (action == GNSS_DUTY_SLEEP) {
     if (p->sleep_allowed && !p->sleep_allowed(p->arg)) return;
     uint8_t packet[GNSS_PM_REQUEST_PACKET_SIZE];
-    size_t len = deep ? gnss_pm_build_indefinite(packet,sizeof(packet)) :
-                       gnss_pm_build_request(packet, sizeof(packet),
-                                             p->duty.next_sleep_s * 1000U);
+    size_t len = gnss_pm_build_request(packet, sizeof(packet),
+                                       p->duty.next_sleep_s * 1000U);
     p->actions |= GNSS_POWER_INVALIDATE_FIX;
     if (!len || !p->send || !p->send(packet, len, p->arg)) {
       if (p->sleep_allowed && !p->sleep_allowed(p->arg)) {
@@ -199,7 +188,6 @@ void gnss_power_poll(gnss_power_t *p, int64_t now_us) {
     gnss_duty_sleep_committed(&p->duty, now_us);
     p->sleep_started_us = now_us;
     p->phase = GNSS_POWER_SLEEP_SETTLE;
-    p->deep_committed = deep;
     power_report(p, GNSS_POWER_SLEEP_SENT);
   }
 }

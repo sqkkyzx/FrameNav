@@ -116,24 +116,23 @@ int main(void) {{
 }}
 """)
 
-    def test_no_fake_fallback_and_invalid_gga_stops_publication(self):
-        run_c(BASE + STATE + source("split_csv", "parse_int_range", "update_status_gga") +
-              function_source("src/main.c", "get_location_for_send") + """
+    def test_invalid_gga_and_missing_utc_invalidate_the_raw_fix(self):
+        run_c(BASE + STATE + source("split_csv", "parse_int_range", "update_status_gga") + """
 int main(void) {
   gps_fix_t out={0}, input={.valid=true,.time_valid=true,.lat_deg=22.5,.lon_deg=113.5,
     .year=2026,.month=9,.day=3,.hour=12,.last_fix_time_us=now_us};
   gps_status_t status;
-  assert(!get_location_for_send(&out)); // boot with no GNSS
-  update_fix(&input,true); assert(get_location_for_send(&out));
+  assert(gps_get_latest(&out) && !out.valid); // boot with no GNSS
+  update_fix(&input,true); assert(gps_get_latest(&out) && out.valid && out.time_valid);
   assert(out.lat_deg==22.5 && out.year==2026);
   input.time_valid=false; s_latest_fix.time_valid=false;
-  assert(!get_location_for_send(&out));
+  assert(gps_get_latest(&out) && !out.time_valid);
   input.time_valid=true; update_fix(&input,true);
   update_status_gga("$GNGGA,120000.00,2234.0000,N,11345.0000,E,0,00,99.99,0.0,M,0.0,M,,");
-  assert(!get_location_for_send(&out));
+  assert(gps_get_latest(&out) && !out.valid);
   assert(gps_get_status(&status)); assert(!status.has_lock && status.satellites==0);
-  update_fix(&input,true); assert(get_location_for_send(&out));
-  update_fix(&input,false); assert(!get_location_for_send(&out));
+  update_fix(&input,true); assert(gps_get_latest(&out) && out.valid && out.time_valid);
+  update_fix(&input,false); assert(gps_get_latest(&out) && !out.valid);
   assert(!s_latest_fix.time_valid);
   return 0;
 }
@@ -157,79 +156,6 @@ int main(void) {
   update_status_gga("$GNGGA,120001.00,2234.0000,N,11345.0000,E,0,00,99.9,0.0,M,0.0,M,,");
   assert(gps_get_latest(&out));
   assert(!out.valid && !out.altitude_valid);
-  return 0;
-}
-""")
-
-    def test_stale_fix_is_not_refreshed_or_sent_by_focus_callback(self):
-        run_c(BASE + STATE + '\n#include "config.h"\n' + """
-static int sent;
-bool config_get_snapshot(const app_config_t *p,app_config_t *out) { *out=*p; return true; }
-void config_validate(app_config_t *cfg) { (void)cfg; }
-static bool ble_client_send_location(const gps_fix_t *fix) { assert(fix->valid); sent++; return true; }
-""" + function_source("src/main.c", "get_location_for_send") +
-              function_source("src/main.c", "focus_update_cb") + """
-int main(void) {
-  app_config_t cfg={.max_gps_age_s=5};
-  gps_fix_t input={.valid=true,.time_valid=true,.lat_deg=22.5,.lon_deg=113.5,
-    .year=2026,.month=9,.day=3,.hour=12,.last_fix_time_us=now_us};
-  update_fix(&input,true); focus_update_cb(&cfg); assert(sent==1);
-  now_us+=5000001; focus_update_cb(&cfg); assert(sent==1);
-  gps_fix_t out; gps_status_t status;
-  assert(gps_get_latest(&out)); assert(out.last_fix_time_us==6000000);
-  assert(gps_get_status(&status));
-  return 0;
-}
-""")
-
-    def test_two_second_power_and_three_second_debug_publishers_keep_stale_guard(self):
-        boot = function_source("src/main.c", "app_main")
-        phase2 = boot.split("#if ALPHALOC_PHASE2\n", 1)[1].split("#else", 1)[0]
-        assignments = re.findall(
-            r"s_cfg\.gps_interval_ms\s*=\s*[^;]+;", phase2)
-        self.assertEqual(len(assignments), 1)
-        for power_save, interval_ms, expected_sends in ((1, 2000, 3), (0, 3000, 2)):
-            with self.subTest(power_save=power_save, interval_ms=interval_ms):
-                self.check_publisher_interval(assignments, power_save, interval_ms, expected_sends)
-
-    def check_publisher_interval(self, assignments, power_save, interval_ms, expected_sends):
-        run_c(BASE + STATE + f'\n#define ALPHALOC_POWER_SAVE {power_save}\n' +
-              '#include "power_policy.h"\n' +
-              f'#define EXPECTED_INTERVAL_MS {interval_ms}\n#define EXPECTED_SENDS {expected_sends}\n' +
-              '\n#include "config.h"\n#include <setjmp.h>\n' + """
-static app_config_t s_cfg;
-static jmp_buf stop;
-static int sent, waits;
-static int64_t send_times[3];
-bool config_get_snapshot(const app_config_t *p, app_config_t *out) { *out=*p; return true; }
-void config_validate(app_config_t *cfg) { (void)cfg; }
-static bool ble_client_send_location(const gps_fix_t *fix) {
-  assert(fix->valid && sent<3); send_times[sent++]=now_us; return true;
-}
-static void vTaskDelay(uint32_t ms) {
-  assert(ms==EXPECTED_INTERVAL_MS);
-  if (++waits==4) longjmp(stop,1);
-  now_us+=(int64_t)ms*1000;
-}
-""" + function_source("src/main.c", "get_location_for_send") +
-              function_source("src/main.c", "location_publisher_task") + """
-int main(void) {
-  s_cfg.max_gps_age_s=5;
-""" + "\n".join(assignments) + """
-  assert(s_cfg.gps_interval_ms==EXPECTED_INTERVAL_MS && s_cfg.max_gps_age_s==5);
-  gps_fix_t input={.valid=true,.time_valid=true,.lat_deg=22.5,.lon_deg=113.5,
-    .year=2026,.month=9,.day=3,.hour=12,.last_fix_time_us=now_us};
-  update_fix(&input,true);
-  if (setjmp(stop)==0) location_publisher_task(&s_cfg);
-  assert(sent==EXPECTED_SENDS && waits==4);
-  for (int i=0; i<sent; i++) {
-    assert(send_times[i]==6000000+(int64_t)i*EXPECTED_INTERVAL_MS*1000);
-    assert(send_times[i]-6000000<=5000000);
-  } // Samples at 6 seconds old or later are never sent in either profile.
-  sent=waits=0;
-  update_fix(&input,false);
-  if (setjmp(stop)==0) location_publisher_task(&s_cfg);
-  assert(sent==0 && waits==4); // No fake fallback while waiting for a fix.
   return 0;
 }
 """)

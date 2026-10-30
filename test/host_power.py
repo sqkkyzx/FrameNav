@@ -22,7 +22,7 @@ def scan_code(enabled=True):
 #define ESP_LOGW(...) ((void)0)
 #define ESP_LOGI(...) ((void)0)
 struct ble_gap_disc_params { uint8_t passive, filter_duplicates; uint16_t itvl, window; };
-static bool s_connecting_camera, connected, scan_active, s_system_sleep;
+static bool s_connecting_camera, connected, scan_active;
 static uint8_t s_own_addr_type;
 static int64_t now_us, pairing_until_us;
 static app_config_t config_storage;

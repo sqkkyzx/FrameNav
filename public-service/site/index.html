@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#14231d">
+  <title>FrameNav 公网定位</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="FrameNav 公网定位">FrameNav <span>公网定位</span></a>
+    <span id="secure-state" class="status status-neutral">检测中</span>
+  </header>
+
+  <main>
+    <section class="intro">
+      <p class="eyebrow">手机位置写入</p>
+      <h1>把手机当前位置交给 FrameNav</h1>
+      <p class="intro-copy">公网页面只负责取得手机定位，位置通过蓝牙写入附近设备。</p>
+    </section>
+
+    <section class="panel" aria-labelledby="device-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">设备连接</p>
+          <h2 id="device-title">FrameNav</h2>
+        </div>
+        <span id="device-state" class="status status-neutral">未连接</span>
+      </div>
+      <div class="device-row">
+        <div>
+          <strong id="device-name">等待连接</strong>
+          <p id="device-detail" class="muted">设备需要处于 USB 唤醒的蓝牙窗口内。</p>
+        </div>
+        <button id="connect" class="button button-dark" type="button">连接设备</button>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="location-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">手机定位</p>
+          <h2 id="location-title">当前位置</h2>
+        </div>
+        <span id="location-state" class="status status-neutral">尚未获取</span>
+      </div>
+      <div class="location-readout" aria-live="polite">
+        <div><span class="readout-label">纬度</span><strong id="latitude">—</strong></div>
+        <div><span class="readout-label">经度</span><strong id="longitude">—</strong></div>
+        <div><span class="readout-label">精度</span><strong id="accuracy">—</strong></div>
+      </div>
+      <div class="actions">
+        <button id="get-location" class="button button-primary" type="button">获取手机定位</button>
+        <button id="write-location" class="button button-primary" type="button" disabled>写入设备</button>
+        <button id="clear-location" class="button button-quiet" type="button" disabled>清除设备位置</button>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="manual-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">室内备用</p>
+          <h2 id="manual-title">手动位置</h2>
+        </div>
+      </div>
+      <div class="form-grid">
+        <label>纬度
+          <input id="manual-latitude" inputmode="decimal" autocomplete="off" placeholder="例如 31.2304">
+        </label>
+        <label>经度
+          <input id="manual-longitude" inputmode="decimal" autocomplete="off" placeholder="例如 121.4737">
+        </label>
+      </div>
+      <button id="write-manual" class="button button-secondary" type="button" disabled>写入手动位置</button>
+    </section>
+
+    <p id="message" class="message" role="status" aria-live="polite">请先连接设备。</p>
+    <footer>FrameNav · 公网页面由 CDN 提供 HTTPS，设备不需要公网证书。</footer>
+  </main>
+
+  <script src="/app.js" type="module"></script>
+</body>
+</html>

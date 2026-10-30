@@ -23,19 +23,22 @@ static uint16_t be16(const uint8_t *p) {
   return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
 }
 
-static size_t make_query(uint8_t *q, uint16_t type) {
-  memset(q, 0, 128);
+static size_t make_named_query(uint8_t *q, const char *name, uint16_t type) {
+  memset(q, 0, 512);
   q[0] = 0x12;
   q[1] = 0x34;
   q[2] = 0x01;
   q[5] = 0x01;
   size_t p = 12;
-  const char *labels[] = {"connectivitycheck", "gstatic", "com"};
-  for (size_t i = 0; i < 3; ++i) {
-    size_t n = strlen(labels[i]);
+  while (*name) {
+    const char *dot = strchr(name, '.');
+    size_t n = dot ? (size_t)(dot - name) : strlen(name);
+    assert(n > 0 && n <= 63 && p + n + 6 <= 512);
     q[p++] = (uint8_t)n;
-    memcpy(q + p, labels[i], n);
+    memcpy(q + p, name, n);
     p += n;
+    if (!dot) break;
+    name = dot + 1;
   }
   q[p++] = 0;
   q[p++] = (uint8_t)(type >> 8);
@@ -45,9 +48,13 @@ static size_t make_query(uint8_t *q, uint16_t type) {
   return p;
 }
 
+static size_t make_query(uint8_t *q, uint16_t type) {
+  return make_named_query(q, "connectivitycheck.gstatic.com", type);
+}
+
 int main(void) {
-  uint8_t query[128];
-  uint8_t reply[256];
+  uint8_t query[512];
+  uint8_t reply[600];
   const uint8_t ip_bytes[4] = {10, 254, 254, 1};
   uint32_t ip;
   memcpy(&ip, ip_bytes, sizeof(ip));
@@ -67,6 +74,41 @@ int main(void) {
                                        sizeof(reply));
   assert(reply_len == query_len);
   assert(be16(reply + 6) == 0);
+
+  const char *local_names[] = {
+    "framenav.device.igp.wiki", "FrAmEnAv.DeViCe.IGP.WIKI",
+    "captive.apple.com", "www.msftconnecttest.com", "connect.rom.miui.com"
+  };
+  for (size_t i = 0; i < sizeof(local_names) / sizeof(local_names[0]); ++i) {
+    query_len = make_named_query(query, local_names[i], 1);
+    reply_len = captive_dns_build_reply(query, query_len, ip, reply, sizeof(reply));
+    assert(reply_len == query_len + 16 && be16(reply + 6) == 1);
+    assert(be16(reply + 2) == 0x8180);
+    assert(memcmp(reply + reply_len - 4, ip_bytes, 4) == 0);
+  }
+  const char *internet_names[] = {
+    "www.googleapis.com", "play.googleapis.com", "api.amap.com",
+    "location.services.mozilla.com", "framenav.igp.wiki",
+    "framenav.device.igp.wiki.example.com", "evilframenav.device.igp.wiki",
+    "connectivitycheck.gstatic.com.example.com"
+  };
+  for (size_t i = 0; i < sizeof(internet_names) / sizeof(internet_names[0]); ++i) {
+    for (int type = 1; type <= 28; type += 27) {
+      query_len = make_named_query(query, internet_names[i], type);
+      reply_len = captive_dns_build_reply(query, query_len, ip, reply, sizeof(reply));
+      assert(reply_len == query_len + (type == 1 ? 16 : 0));
+      assert(be16(reply + 6) == (type == 1 ? 1 : 0));
+      assert(be16(reply + 2) == 0x8180); // Preserve phone captive-portal behavior.
+      if (type == 1) assert(memcmp(reply + reply_len - 4, ip_bytes, 4) == 0);
+    }
+  }
+  query_len = make_named_query(query, "framenav.device.igp.wiki", 1);
+  query[2] = 0;
+  reply_len = captive_dns_build_reply(query, query_len, ip, reply, sizeof(reply));
+  assert(reply_len == query_len + 16 && be16(reply + 2) == 0x8180);
+  query[query_len - 1] = 3; // Non-IN classes produce no answers.
+  reply_len = captive_dns_build_reply(query, query_len, ip, reply, sizeof(reply));
+  assert(reply_len == query_len && be16(reply + 2) == 0x8180);
 
   query_len = make_query(query, 1);
   query[5] = 2;
@@ -91,6 +133,18 @@ int main(void) {
   query_len = make_query(query, 1);
   assert(captive_dns_build_reply(query, query_len, ip, reply,
                                  query_len + 15) == 0);
+  for (size_t n = 0; n < query_len; ++n) {
+    assert(captive_dns_build_reply(query, n, ip, reply, sizeof(reply)) == 0);
+  }
+  query_len = make_named_query(query, "framenav.device.igp.wiki", 1);
+  query[13] = '.'; // A dot within a wire label must not spoof joined labels.
+  assert(captive_dns_build_reply(query, query_len, ip, reply, sizeof(reply)) == 0);
+  char long_name[256];
+  memset(long_name, 'a', 255);
+  long_name[63] = long_name[127] = long_name[191] = '.';
+  long_name[255] = 0;
+  query_len = make_named_query(query, long_name, 1);
+  assert(captive_dns_build_reply(query, query_len, ip, reply, sizeof(reply)) == 0);
   return 0;
 }
 """

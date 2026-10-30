@@ -18,15 +18,16 @@
 #endif
 
 typedef struct {
-  bool candidate_host;
+  bool candidate_cable;
   bool wifi_allowed;
   int64_t candidate_since_us;
 } usb_config_gate_t;
 
-// Source fingerprint measured on the XIAO USB pins:
-// - any active USB data host (SOF) allows configuration;
-// - without SOF, D+/D- == 1/1 allows the tested charger/power source;
-// - without SOF, D+/D- == 1/0 keeps WiFi off for battery and Godox HSA-S.
+// Cable-presence classification on the XIAO USB PHY. An active USB data host
+// or the measured non-host charger signature (both D+/D- lines asserted) is
+// treated as a connected cable. The plain 1/0 idle signature is deliberately
+// excluded: it is also what the board reports while running from its battery.
+// The caller debounces this signal before controlling Wi-Fi.
 bool usb_config_source_allows_wifi(bool usb_data_host, bool dp, bool dm);
 
 // The caller supplies the classified source state. An allowed source must

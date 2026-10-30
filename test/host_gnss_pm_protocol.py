@@ -67,7 +67,7 @@ assert(memcmp(frame+1,expected,sizeof(expected))==0);
 assert(frame[0]==0xa5 && frame[25]==0xa5);
 """)
 
-    def test_builders_reject_small_capacity_null_and_indefinite_without_writes(self):
+    def test_builders_reject_small_capacity_null_and_invalid_duration_without_writes(self):
         check("""
 uint8_t frame[32], original[32]; memset(frame,0xa5,sizeof(frame));
 memcpy(original,frame,sizeof(frame));

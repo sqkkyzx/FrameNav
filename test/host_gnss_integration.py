@@ -45,7 +45,6 @@ static int s_fix_mutex=1;
 static int64_t s_last_no_fix_log_us;
 static int s_camera_lock;
 static bool s_camera_connected;
-static bool s_system_sleep_requested, s_system_sleep_ready;
 static uint32_t s_camera_generation, s_camera_seen_generation;
 static int64_t s_camera_changed_us;
 static location_power_policy_t s_pending_power_policy;
@@ -117,7 +116,7 @@ static void power_log(gnss_power_event_t event, void *arg) { (void)event; (void)
     "rate_uart_send", "power_policy_to_duty", "power_sleep_allowed",
     "power_uart_send", "power_frame",
     "power_step", "update_fix", "gps_get_latest", "gps_get_status"
-) + function_source("src/main.c", "get_location_for_send") + """
+) + """
 static void init(void) {
   now_us=0; line_length=0;
   s_camera_connected=false;
@@ -152,7 +151,7 @@ static void step(int64_t at_us) { now_us=at_us; power_step(&line_length); }
 
 def check(body):
     run_c(HARNESS + "int main(void) {\n" +
-          "(void)sample; (void)step; (void)update_fix; (void)get_location_for_send;\n" +
+          "(void)sample; (void)step; (void)update_fix;\n" +
           body + "\nassert(!held_mutexes && !critical_depth); return 0; }\n")
 
 
@@ -238,14 +237,14 @@ assert(s_power.phase==GNSS_POWER_WORK && pm_requests==1 && wake_bytes==1);
 init();
 now_us=SEC; gps_fix_t original=sample(1,0); update_fix(&original,true);
 s_status.has_lock=true; s_status.satellites=12;
-gps_fix_t out; assert(get_location_for_send(&out));
+gps_fix_t out; assert(gps_get_latest(&out) && out.valid && out.time_valid);
 s_rate.stage=GNSS_RATE_VERIFIED;
 s_rate.rx_state=2; s_rate.payload_len=200; s_rate.rx_pos=20;
 s_rate.ck_a=123; s_rate.ck_b=42;
 s_rmc_count=88; s_rmc_sample_count=77; line_length=19;
 step(45*SEC);
 assert(pm_requests==1 && s_power.phase==GNSS_POWER_SLEEP_SETTLE);
-assert(!get_location_for_send(&out));
+assert(gps_get_latest(&out) && !out.valid && !out.time_valid);
 assert(!s_latest_fix.valid && !s_latest_fix.time_valid);
 assert(!s_status.has_lock && !s_status.satellites);
 assert(!flushes); // no wake/reset has yet occurred
@@ -255,7 +254,8 @@ assert(s_power.duty.sleep_deadline_us==135*SEC+tx_duration_us);
 s_latest_fix=original; s_status.has_lock=true; s_status.satellites=12;
 step(s_power.duty.sleep_deadline_us);
 assert(s_power.phase==GNSS_POWER_WAKING && wake_bytes==1 && flushes==1);
-assert(!get_location_for_send(&out) && !s_status.has_lock && !s_status.satellites);
+assert(gps_get_latest(&out) && !out.valid && !out.time_valid);
+assert(!s_status.has_lock && !s_status.satellites);
 assert(line_length==0 && s_rate.rx_state==0 && s_rate.rx_pos==0);
 assert(s_rate.payload_len==0 && s_rate.ck_a==0 && s_rate.ck_b==0);
 assert(s_rate.stage==GNSS_RATE_WAIT_DATA && !s_rate.nmea_seen);
@@ -285,7 +285,7 @@ for(unsigned i=0;i<4;i++) {
   assert(gnss_power_note_fix(&s_power,&fix,now_us));
   update_fix(&fix,true); power_step(&line_length);
   gps_fix_t out;
-  assert(get_location_for_send(&out) && out.lon_deg==longitude[i]);
+  assert(gps_get_latest(&out) && out.valid && out.time_valid && out.lon_deg==longitude[i]);
   assert(out.last_fix_time_us==now_us && s_power.duty.next_sleep_s==interval[i]);
   assert(s_power.phase==GNSS_POWER_WORK && !pm_requests && !wake_bytes);
 }

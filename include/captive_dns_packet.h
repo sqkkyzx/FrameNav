@@ -14,6 +14,7 @@ extern "C" {
 
 // Builds one DNS response. IPv4 is supplied in network byte order. Returns
 // zero for malformed/unsupported requests or insufficient reply capacity.
+// Captive-portal IN/A queries resolve to the AP; other types have no answers.
 size_t captive_dns_build_reply(const uint8_t *request, size_t request_len,
                                uint32_t ipv4_network_order, uint8_t *reply,
                                size_t reply_capacity);

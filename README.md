@@ -13,10 +13,23 @@ endorsed by, or sponsored by Sony Group Corporation.
 
 ## Features
 
-### 当前版本：0.18.0-test4（实验性）
+### 当前版本：0.19.9
 
-当前实测组合为 **XIAO ESP32-C6 + StarNav M10-K18 + 18350 电池 + BMI160 + Sony α7C II**。
-`minimal-implementation` 分支保留引入加速度传感器前的 0.17.0 最小实现；`main` 是当前开发版本。
+修复正式证书链超出 TLS 发送缓冲导致 HTTPS 连接关闭的问题，并为 HTTP/HTTPS 设置
+连接上限及空闲连接回收，避免手机联网探测占满连接后网页超时。TLS 动态释放缓冲和握手
+凭据，配置页分块发送，避免并发 HTTPS 访问时出现 `No memory`。
+
+Web 运行状态下方显示当前定位、来源、定位时间和观测距今，每 3 秒刷新。
+
+GPS 连续搜星并始终优先使用有效卫星定位。室内无 GPS 时，可用手机连接设备 Wi-Fi，
+在 HTTPS 网页点击“从手机获取一次定位”，允许定位后将位置保存在设备上作为兜底。
+手机位置默认 **6 小时**过期，网页可设置 **1–720 小时**；到期且无 GPS 时停止发送位置。
+也可以使用独立公网定位页 `https://framenav.igp.wiki/`，由 Android Chrome 获取手机位置并通过
+BLE 写入设备；此方式不依赖设备本地 HTTPS 证书更新。公网容器部署说明见
+[`public-service/README.md`](public-service/README.md)。
+
+当前实测组合为 **XIAO ESP32-C6 + StarNav M10-K18 + 18350 电池 + Sony α7C II**。
+`minimal-implementation` 分支保留 0.17.0 最小实现；`main` 是当前开发版本。
 使用 PlatformIO Core CLI，无需 VS Code：
 
 ```sh
@@ -27,27 +40,37 @@ pio device monitor -b 115200
 
 请显式指定上述环境；默认 `xiao-c6-debug` 是 Fake GPS 测试固件。
 GNSS TX 接 D7/GPIO17，RX 接 D8/GPIO19，GND 共地；供电和串口电平应先按模块实物确认。
-BMI160 SDA 接 D9/GPIO20，SCL 接 D10/GPIO18，INT1 接 D0/GPIO0。
-传感器由 3.3V 电源供电且须在深睡期间保持供电；模块 VIN/3V3 接法应以实际稳压电路为准。
 电池接入板载 BAT 正负端，不能接到 3V3；电芯保护、极性及 GNSS 电池供电路径需自行确认。
 电池供电时不能假设 VBUS 有 5V 输出。
 **不要将 VBUS 和 3V3 直接并联。**
 
 XIAO 使用板载单色状态灯（不是下文上游参考硬件的 NeoPixel）：
 未连接相机时闪烁，连接后常亮；常亮不代表相机已接受有效定位。
-Wi-Fi 配置入口由 USB 供电来源检测控制，电池与已识别的热靴供电不自动启动 Wi-Fi，但可通过画圈手势开启。
-热靴识别依据实测 USB 信号特征，是启发式判断，并非通用热靴协议识别。
-连接热点后可尝试自动弹出的配置页，或访问 **http://10.254.254.1/**。
+Wi-Fi 配置入口完全由 USB 线缆状态控制，USB 供电线和数据线都可以启动 Wi-Fi；拔出 USB 后关闭。当前 XIAO 没有接入 ESP32-C6 的 VBUS 检测 GPIO，供电线依赖已验证的 USB PHY 线状态；要覆盖所有不驱动 D+/D- 的线缆，需要补充 VBUS 硬件检测。
+正式访问地址是 **https://framenav.device.igp.wiki/**。设备热点的本地 DNS 会把这个域名解析到
+`10.254.254.1`，因此手机连设备热点时也可以使用同一个地址；若手机不接受 captive portal，仍可访问
+**http://10.254.254.1/**。
+手机使用 VPN 或代理时，应将 `framenav.device.igp.wiki` 和 `10.254.254.0/24` 设置为
+通过设备 Wi-Fi 直连，避免本地网页请求被转发到外网。
+设备接入外部 Wi‑Fi 后，域名解析由该 Wi‑Fi 的 DNS 或 hosts 规则负责，需把域名指向设备的 STA 地址；
+否则公共 DNS 指向的服务器不会自动代理到设备。
 默认热点密码为 `framenav1234`，请在配置页修改。
 
-未连接相机、无 Wi-Fi 客户端及近期配置页访问时，持续无动作约 5 分钟可进入深睡；运动中断唤醒。
-连接电脑 USB 数据主机时不深睡。画圈开启的热点在 30 秒无 Web 页面活动后关闭，手势冷却 60 秒。
-已在测试固件验证电池画圈、纯电池冷启动画圈、深睡和运动唤醒；深睡唤醒后画圈与步行误触率仍待验证。
-详见 [运动与深睡说明](MOTION-V18.md)。
+USB 开启配置网络后立即提供设备热点，同时连接网页中保存的外部 Wi-Fi；连接失败时降低
+后台重试频率，避免持续扫频干扰手机访问热点。没有配置外部 Wi-Fi 时不主动扫描。
+USB 插入后如果没有设备关联或近期网页活动，Wi-Fi 按网页设置在 5 或 15 分钟后关闭；关闭后拔出并重新插入 USB 才会再次开启。
+正式构建把 `framenav.device.igp.wiki` 的默认证书和对应私钥内置到固件中。网页的“下载并更新证书和私钥”按钮从 `https://framenav.igp.wiki/download/certs.zip` 下载整套凭据，校验域名及证书与私钥匹配后成对保存；重新插拔 USB 后加载。
+BLE 保留控制器 modem sleep 和搜索省电策略；GNSS 连续工作。电池物理断电再上电会重新启动设备。
 
-持久化诊断仅在 `pio run -e xiao-c6-motion-debug` 测试目标启用，使用独立分区；
-普通 `xiao-c6-gnss-power` 不包含该日志写入功能，详见 [测试诊断说明](MOTION-DEBUG.md)。
-
+手机定位由手机操作系统提供，通过浏览器 Geolocation API 返回 WGS-84 经纬度与估算精度；
+网页不会自动请求定位，只在用户点击时请求。使用手机系统浏览器打开受信任的 HTTPS 地址，
+并允许定位权限。设备本身不需要联网即可接收手机位置；手机定位服务是否需要网络由手机决定。
+浏览器最多等待 60 秒，允许使用手机最近 30 秒的位置；如果手机地图能定位但浏览器一直超时，
+请尝试手机自带浏览器，并保持手机移动数据可用。
+定位获取时间保持不变，设备用手机提供的 UTC 和单调运行时间推进相机时间，不会把相机时钟
+停留在获取定位的那一刻。有效期从手机实际获取位置的时间开始计算；关闭 Wi-Fi 或拔插 USB
+不会延长或清除位置。有效期设置保存在 NVS，位置只保存在本次开机内存中，整机断电后需重新获取。
+GPS 恢复后立即优先使用 GPS，GPS 再次丢失时仍可使用未过期的手机位置。
 轨迹存储与掉电恢复仍属实验功能，目前尚无 GPX 导出接口。
 下文同时保留上游其他板型的参考说明；LED、配置窗口及默认参数不一定适用于 XIAO 环境。
 
@@ -121,7 +144,7 @@ The following is a parts list of what I ended up with.
 
 The NeoPixel LED provides a visual "heartbeat" every 5 seconds. It flashes multiple colors in sequence to report the status of different subsystems:
 
-**Sequence:** [Camera Status] -> [GPS Status] -> [Battery Status] -> [WiFi Status] -> [Sleep]
+**Sequence:** [Camera Status] -> [GPS Status] -> [Battery Status] -> [WiFi Status]
 
 1.  **First Flash: Camera Connection**
     *   🟢 **Green**: Connected to camera and bonded.
@@ -162,34 +185,55 @@ On startup, FrameNav enters a **Configuration Window** (default 5 minutes). Duri
 | **Camera MAC Prefix** | Connect only to a specific MAC address prefix. Empty matches any. | (Empty) |
 | **TZ Offset** | Timezone offset in minutes (e.g., `60` for UTC+1). | `60` |
 | **DST Offset** | Daylight Savings Time offset in minutes. | `60` |
-| **WiFi SSID/Pass** | Credentials for connecting to your home WiFi. | `WiFi` / `changeme` |
+| **WiFi SSID/Pass** | Credentials for connecting to your home WiFi. | Empty (not configured) |
 | **AP SSID/Pass** | Credentials for the hotspot created by FrameNav. | `FrameNav` / `framenav1234` |
+| **WiFi Idle Timeout** | Turn WiFi off after no associated client or recent page activity. | `5 minutes` |
 | **Max GPS Age** | How long (seconds) to reuse old coordinates if GPS signal is lost. | `300` |
 
 #### Method A: WiFi Web Interface
 
-FrameNav tries to connect to the configured WiFi as a client:
+FrameNav starts its hotspot immediately and also tries a saved WiFi network. The canonical page is
+**https://framenav.device.igp.wiki/** and uses the embedded public certificate:
 
-- **Default SSID**: `WiFi`
-- **Default Password**: `changeme`
+- **Default SSID/password**: empty; configure a 2.4 GHz network in the Web interface
 - **IP**: assigned via DHCP
 
-If it can't connect to the WiFi, it starts an access point itself:
+The hotspot remains available while the device connects to the external network.
+Failed external-network attempts back off from 30 to 120 seconds to limit scan interference:
 
 - **SSID**: `FrameNav`
 - **Password**: `framenav1234`
 - **Network**: `10.254.254.0/24`
-- **Configuration URL**: http://10.254.254.1/
+- **Configuration URL**: https://framenav.device.igp.wiki/
+- **Local fallback**: http://10.254.254.1/
 
-FrameNav advertises a captive portal through DHCP option 114, answers local DNS queries with
-`10.254.254.1`, and redirects HTTP probe paths to the configuration page. Supported operating systems
-will usually open the page automatically after joining; the direct URL remains the reliable fallback.
+FrameNav advertises a captive portal through DHCP option 114, resolves local DNS names to
+`10.254.254.1`, and redirects HTTP probe paths to the HTTPS configuration page. Supported operating systems
+will usually open the page automatically after joining; the canonical domain remains the reliable URL.
+
+本地正式构建需要把证书放在被 Git 忽略的 `certs/server_cert.pem` 和
+`certs/server_key.pem`。CMake 会调用 `scripts/embed_tls_cert.py` 生成同样被忽略的嵌入源文件。
+在线更新需要设备连接可上网的外部 Wi-Fi。ZIP 可直接包含文件或多包一层目录，使用未加密的
+stored/deflate 压缩；设备读取 `framenav.device.igp.wiki_bundle.pem`（缺失时使用同名 `_bundle.crt`）
+和 `framenav.device.igp.wiki.key`，忽略 CSR 等其他文件。ZIP 最大 64 KiB，证书链最大 12 KiB，
+私钥最大 8 KiB。下载服务器的 HTTPS 使用系统 CA 包验证；下载后的证书链需能解析、叶证书 SAN
+需包含设备域名、私钥需匹配。设备尚无可信系统时钟，此处不额外校验证书有效期；手机仍会检查
+HTTPS 服务的完整信任链和有效期。
+`tls_cert` 分区以双槽保存证书和私钥，新数据完整写入并校验后才提交，更新中断时保留上一套；
+没有有效保存记录时使用内置默认值。当前 HTTPS 会话保持原凭据，重新插拔 USB 后启用更新。
+由于 HTTPS 服务使用内置私钥，拿到未启用 Flash Encryption/Secure Boot 的固件的人可以提取该私钥；
+当前方案适合先做默认正式证书，后续生产发布应启用芯片安全启动和加密，或在泄露后立即换证书。
 
 The Web interface is Chinese-first. Connection settings are shown first: it displays GNSS/camera status,
 firmware version, current track-storage usage, and the earliest retained record time,
 lists up to three saved camera bonds, can remove an individual local bond, and can open a 90-second
-continuous scan for pairing a new camera. Location and Bluetooth power modes provide preset policies plus
-collapsible advanced fields; preset fields are read-only, while Custom is editable. Runtime power changes
+continuous scan for pairing a new camera. The location page provides a manual phone-location button,
+accuracy, capture time, remaining lifetime and a configurable expiry in hours. It also accepts manual
+WGS-84 latitude/longitude input when the phone browser cannot provide a location. GNSS runs continuously.
+Phone acquisition first requests standard accuracy, then retries with high accuracy if unavailable or timed out.
+If Chrome cannot obtain a position, use the phone's built-in browser. Once saved to the device,
+the position remains available when switching browsers until it expires or the device loses power.
+Bluetooth power modes provide preset policies and collapsible custom fields. Runtime Bluetooth changes
 take effect immediately after saving. The pairing action disconnects the current camera but does not erase
 other saved bonds.
 

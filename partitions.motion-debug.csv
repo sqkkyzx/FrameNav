@@ -1,7 +1,0 @@
-# Test only. Existing partition offsets and sizes MUST match partitions.csv.
-# Name, Type, SubType, Offset, Size, Flags
-nvs,      data, nvs,     0x9000,  0x6000,
-phy_init, data, phy,     0xF000,  0x1000,
-app0,     app,  factory, 0x10000, 0x1F0000,
-track,    data, 0x40,    0x200000,0x177000,
-debuglog, data, nvs,     0x377000,0x10000,

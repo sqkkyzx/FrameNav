@@ -8,9 +8,24 @@ The initial FrameNav work in this repository is based on AlphaLoc commit
 
 ## Principal changes
 
-- Added BMI160 motion sensing, idle deep sleep with interrupt wake, circle-gesture
-  Wi-Fi activation and Web-activity timeout. Added an isolated persistent-debug
-  test target without changing the normal track partition or logging policy.
+- Sized TLS output for complete certificate chains and bounded concurrent HTTP
+  and HTTPS sessions with idle-session eviction to prevent socket exhaustion.
+  TLS releases temporary buffers and handshake credentials; the configuration
+  page streams bounded fragments to avoid large allocations during HTTPS use.
+  Suppressed favicon redirects to prevent redundant configuration-page downloads.
+
+- Added manual phone geolocation over the HTTPS configuration page, with a
+  configurable expiry in hours (six hours by default), continuously advancing
+  camera UTC, and immediate priority for fresh GNSS. Camera delivery, Web status
+  and track recording share this selector. The current receiver runs continuously.
+  Phone acquisition first allows standard accuracy with a recent 30-second cache,
+  then retries with high accuracy if the first request is unavailable or times out.
+
+- Added USB-cable-gated Wi-Fi configuration with a configurable idle timeout.
+- Start the local AP with USB configuration access and cap upstream retry
+  backoff so failed router searches do not continuously interrupt the AP.
+- Added a standalone HTTPS-hosted phone-location page that writes location over
+  a dedicated BLE GATT service, plus Compose deployment and GHCR publishing.
 - Added build targets and board integration for Seeed Studio XIAO ESP32-C6.
 - Added StarNav M10-K18 UART/NMEA integration, GNSS rate control, standby
   protocol handling, and connection-aware GNSS duty cycling.
@@ -20,8 +35,8 @@ The initial FrameNav work in this repository is based on AlphaLoc commit
 - Added a 1500 KiB internal-Flash circular track store with three-second,
   16-byte UTC/latitude/longitude/altitude records and power-loss recovery.
 - Reworked the Wi-Fi configuration interface as a Chinese-first FrameNav Web UI
-  with captive-portal support, camera bond management, location/Bluetooth
-  power profiles, firmware version, and live track-storage status.
+  with captive-portal support, camera bond management, Bluetooth power profiles,
+  phone-location controls, firmware version, and live track-storage status.
 - Added host-side tests and diagnostic tools. Private hardware validation logs
   and experiment records are not included in the public repository.
 - Renamed the user-facing project and device identity from AlphaLoc to FrameNav.

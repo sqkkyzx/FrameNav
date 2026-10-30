@@ -77,18 +77,6 @@ static uint32_t s_camera_generation, s_camera_seen_generation;
 static int64_t s_camera_changed_us;
 static location_power_policy_t s_pending_power_policy;
 static uint32_t s_power_policy_generation, s_power_policy_seen_generation;
-static bool s_system_sleep_requested, s_system_sleep_ready;
-void gps_request_system_sleep(bool requested) {
-  portENTER_CRITICAL(&s_camera_lock);
-  s_system_sleep_requested=requested;
-  if(!requested)s_system_sleep_ready=false;
-  portEXIT_CRITICAL(&s_camera_lock);
-}
-bool gps_system_sleep_ready(void) {
-  portENTER_CRITICAL(&s_camera_lock);
-  bool ready=s_system_sleep_ready&&!s_camera_connected&&s_system_sleep_requested;
-  portEXIT_CRITICAL(&s_camera_lock);return ready;
-}
 
 static void power_policy_to_duty(const location_power_policy_t *policy,
                                  gnss_duty_params_t *out) {
@@ -266,7 +254,6 @@ static void power_step(size_t *line_len) {
     policy_generation = s_power_policy_generation;
     policy = s_pending_power_policy;
     changed_us = s_camera_changed_us;
-    s_power.deep_requested=s_system_sleep_requested;
     portEXIT_CRITICAL(&s_camera_lock);
     if (policy_generation != s_power_policy_seen_generation) {
       s_power_policy_seen_generation = policy_generation;
@@ -289,9 +276,6 @@ static void power_step(size_t *line_len) {
       ESP_LOGI(TAG, "GNSS camera policy: connected=%d", connected);
     }
     gnss_power_poll(&s_power, esp_timer_get_time());
-    portENTER_CRITICAL(&s_camera_lock);
-    s_system_sleep_ready=s_power.phase==GNSS_POWER_SLEEP&&s_power.deep_committed;
-    portEXIT_CRITICAL(&s_camera_lock);
     unsigned actions = gnss_power_take_actions(&s_power);
     if (actions & GNSS_POWER_INVALIDATE_FIX) {
       if (xSemaphoreTake(s_fix_mutex, portMAX_DELAY) == pdTRUE) {
@@ -756,10 +740,6 @@ static void gps_task(void *arg) {
   }
   s_power.clock = power_clock;
   s_power.sleep_allowed = power_sleep_allowed;
-  // MCU may have woken while GNSS remains in indefinite backup. Always send
-  // an RX wake edge before identity/config queries (also safe on ordinary boot).
-  static const uint8_t boot_wake=0xff;
-  (void)power_uart_send(&boot_wake,1,NULL);
   gnss_rate_set_frame_observer(&s_rate, power_frame, NULL);
 #endif
   while (true) {

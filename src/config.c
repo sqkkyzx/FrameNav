@@ -6,6 +6,7 @@
 #include "config.h"
 
 #include <string.h>
+#include <ctype.h>
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -31,7 +32,6 @@
 #define BLE_SCAN_PERIOD_MAX_MS 10240U
 #define BLE_SCAN_WINDOW_MIN_MS 20U
 #define BLE_SCAN_WINDOW_MAX_MS 1000U
-
 static const char *TAG = "config";
 static SemaphoreHandle_t s_config_mutex = NULL;
 
@@ -97,6 +97,8 @@ void config_set_defaults(app_config_t *cfg)
   cfg->custom_ble_boot_fast_search_s = 30;
   cfg->custom_ble_scan_period_ms = 3000;
   cfg->custom_ble_scan_window_ms = 100;
+  cfg->wifi_idle_timeout_s = WIFI_IDLE_TIMEOUT_DEFAULT_S;
+  cfg->phone_location_ttl_hours = PHONE_LOCATION_TTL_DEFAULT_HOURS;
 #ifdef ALPHALOC_DEFAULT_CAMERA_NAME_PREFIX
   config_set_str_default(cfg->camera_name_prefix,
                          sizeof(cfg->camera_name_prefix),
@@ -132,14 +134,14 @@ void config_set_defaults(app_config_t *cfg)
   config_set_str_default(cfg->wifi_ssid, sizeof(cfg->wifi_ssid),
                          ALPHALOC_DEFAULT_WIFI_SSID);
 #else
-  config_set_str_default(cfg->wifi_ssid, sizeof(cfg->wifi_ssid), "WiFi");
+  config_set_str_default(cfg->wifi_ssid, sizeof(cfg->wifi_ssid), "");
 #endif
 
 #ifdef ALPHALOC_DEFAULT_WIFI_PASS
   config_set_str_default(cfg->wifi_pass, sizeof(cfg->wifi_pass),
                          ALPHALOC_DEFAULT_WIFI_PASS);
 #else
-  config_set_str_default(cfg->wifi_pass, sizeof(cfg->wifi_pass), "changeme");
+  config_set_str_default(cfg->wifi_pass, sizeof(cfg->wifi_pass), "");
 #endif
 }
 
@@ -237,6 +239,11 @@ void config_validate(app_config_t *cfg)
   {
     cfg->custom_ble_scan_window_ms = defaults.custom_ble_scan_window_ms;
   }
+  if (cfg->wifi_idle_timeout_s != WIFI_IDLE_TIMEOUT_DEFAULT_S &&
+      cfg->wifi_idle_timeout_s != WIFI_IDLE_TIMEOUT_LONG_S)
+  {
+    cfg->wifi_idle_timeout_s = defaults.wifi_idle_timeout_s;
+  }
 
   config_terminate_str(cfg->camera_name_prefix,
                        sizeof(cfg->camera_name_prefix));
@@ -245,6 +252,11 @@ void config_validate(app_config_t *cfg)
   config_terminate_str(cfg->wifi_pass, sizeof(cfg->wifi_pass));
   config_terminate_str(cfg->ap_ssid, sizeof(cfg->ap_ssid));
   config_terminate_str(cfg->ap_pass, sizeof(cfg->ap_pass));
+  if (cfg->phone_location_ttl_hours < 1 ||
+      cfg->phone_location_ttl_hours > PHONE_LOCATION_TTL_MAX_HOURS)
+  {
+    cfg->phone_location_ttl_hours = defaults.phone_location_ttl_hours;
+  }
 
   if (cfg->ap_ssid[0] == '\0')
   {
@@ -301,6 +313,8 @@ bool config_load(app_config_t *cfg)
   nvs_get_u32(nvs, "ble_boot", &cfg->custom_ble_boot_fast_search_s);
   nvs_get_u32(nvs, "ble_period", &cfg->custom_ble_scan_period_ms);
   nvs_get_u32(nvs, "ble_window", &cfg->custom_ble_scan_window_ms);
+  nvs_get_u32(nvs, "wifi_idle_s", &cfg->wifi_idle_timeout_s);
+  nvs_get_u32(nvs, "phone_ttl_h", &cfg->phone_location_ttl_hours);
   int16_t tz = cfg->tz_offset_min;
   int16_t dst = cfg->dst_offset_min;
   uint16_t old_tz = 0;
@@ -362,6 +376,7 @@ static bool config_save_unlocked(const app_config_t *cfg)
   if (err == ESP_OK) err = nvs_set_u32(nvs, "ble_boot", cfg->custom_ble_boot_fast_search_s);
   if (err == ESP_OK) err = nvs_set_u32(nvs, "ble_period", cfg->custom_ble_scan_period_ms);
   if (err == ESP_OK) err = nvs_set_u32(nvs, "ble_window", cfg->custom_ble_scan_window_ms);
+  if (err == ESP_OK) err = nvs_set_u32(nvs, "wifi_idle_s", cfg->wifi_idle_timeout_s);
   if (err == ESP_OK) err = nvs_set_i16(nvs, "tz_off", cfg->tz_offset_min);
   if (err == ESP_OK) err = nvs_set_i16(nvs, "dst_off", cfg->dst_offset_min);
   if (err == ESP_OK) err = nvs_set_str(nvs, "cam_name", cfg->camera_name_prefix);
@@ -370,6 +385,7 @@ static bool config_save_unlocked(const app_config_t *cfg)
   if (err == ESP_OK) err = nvs_set_str(nvs, "wifi_pass", cfg->wifi_pass);
   if (err == ESP_OK) err = nvs_set_str(nvs, "ap_ssid", cfg->ap_ssid);
   if (err == ESP_OK) err = nvs_set_str(nvs, "ap_pass", cfg->ap_pass);
+  if (err == ESP_OK) err = nvs_set_u32(nvs, "phone_ttl_h", cfg->phone_location_ttl_hours);
   if (err == ESP_OK) {
     err = nvs_commit(nvs);
   }

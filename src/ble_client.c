@@ -13,6 +13,9 @@
 #if ALPHALOC_BLE_CONFIG
 #include "ble_config_server.h"
 #endif
+#if ALPHALOC_BLE_LOCATION
+#include "ble_location_server.h"
+#endif
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -33,6 +36,10 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "store/config/ble_store_config.h"
+
+#ifndef ALPHALOC_BLE_LOCATION
+#define ALPHALOC_BLE_LOCATION 0
+#endif
 
 static const char *TAG = "ble_client";
 
@@ -93,7 +100,6 @@ static bool s_require_tz_dst;
 static int16_t s_tz_off_min;
 static int16_t s_dst_off_min;
 static bool s_connecting_camera;
-static _Atomic bool s_system_sleep;
 static uint8_t s_dd21_retry;
 static bool s_location_enabled;
 static bool s_dd21_ready;
@@ -1533,7 +1539,7 @@ bool ble_client_start_pairing(uint32_t duration_s) {
 int ble_client_gap_event_cb(struct ble_gap_event *event, void *arg) {
   switch (event->type) {
   case BLE_GAP_EVENT_DISC: {
-    if (s_system_sleep || s_connecting_camera || ble_client_is_connected()) {
+    if (s_connecting_camera || ble_client_is_connected()) {
       return 0;
     }
     struct ble_hs_adv_fields fields;
@@ -1848,7 +1854,6 @@ static void configure_scan_params(struct ble_gap_disc_params *params,
 }
 
 static void ble_start_scan(void) {
-  if (s_system_sleep) return;
   if (s_connecting_camera || ble_client_is_connected() || ble_gap_disc_active()) {
     return;
   }
@@ -1935,6 +1940,9 @@ static void ble_on_sync(void) {
 #if ALPHALOC_BLE_CONFIG
   ble_config_server_on_sync();
 #endif
+#if ALPHALOC_BLE_LOCATION
+  ble_location_server_on_sync();
+#endif
 }
 
 static void ble_host_task(void *param) {
@@ -1988,6 +1996,9 @@ void ble_client_init(const app_config_t *cfg) {
   ble_store_config_init();
 #if ALPHALOC_BLE_CONFIG
   ble_config_server_register((app_config_t *)cfg);
+#endif
+#if ALPHALOC_BLE_LOCATION
+  ble_location_server_register();
 #endif
 
   ble_svc_gap_device_name_set("FrameNav");
@@ -2049,18 +2060,4 @@ void ble_client_deinit(void) {
     esp_timer_delete(s_identity_retry_timer);
     s_identity_retry_timer = NULL;
   }
-}
-
-bool ble_client_pause_for_sleep(bool pause) {
-  s_system_sleep = pause;
-  if (!pause) { ble_start_scan(); return true; }
-  if (ble_gap_disc_active()) (void)ble_gap_disc_cancel();
-  return !s_connecting_camera && !ble_client_is_connected();
-}
-bool ble_client_stop_for_sleep(void) {
-  if (!s_system_sleep || s_connecting_camera || ble_client_is_connected()) return false;
-  if (nimble_port_stop() != 0) return false;
-  s_host_synced = false;
-  ble_client_deinit();
-  return nimble_port_deinit() == ESP_OK;
 }

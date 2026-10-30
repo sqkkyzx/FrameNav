@@ -1,4 +1,4 @@
-/* Test-only durable event ring. No credentials, locations or raw IMU samples.
+/* Test-only durable event ring. No credentials or location data.
  * SPDX-License-Identifier: Apache-2.0 */
 #include "test_debug.h"
 #if FRAMENAV_TEST_DEBUG
@@ -12,7 +12,6 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_system.h"
-#include "esp_sleep.h"
 #include "driver/usb_serial_jtag.h"
 #include "soc/usb_serial_jtag_struct.h"
 #define SLOTS 128U
@@ -28,10 +27,8 @@ static uint32_t sequence,boot_id;
 static _Atomic unsigned pending,dropped;
 static const char *TAG="test_debug";
 static const char *name(unsigned e) {
-  static const char *names[]={"?","BOOT","SENSOR_INIT","SENSOR_ERROR",
-    "CAPTURE_START","CAPTURE_END","SENSOR_STATE","CIRCLE","AP_START",
-    "AP_RESULT","WIFI_STOP","SOURCE","SLEEP_PREP","SLEEP_ABORT",
-    "SLEEP_ENTER","WIFI_ERROR"};
+  static const char *names[]={"?","BOOT","SOURCE","AP_START",
+    "WIFI_STOP","WIFI_ERROR"};
   return e<sizeof(names)/sizeof(names[0])?names[e]:"?";
 }
 static void print_record(const record_t *r) {
@@ -95,6 +92,6 @@ void test_debug_start(void) {
     vQueueDelete(queue);queue=NULL;nvs_close(handle);return;
   }
   ESP_LOGW(TAG,"TEST DEBUG enabled: independent 64KiB partition, last 128 events; not a power benchmark");
-  test_debug_event(DBG_BOOT,esp_reset_reason(),esp_sleep_get_wakeup_cause(),0,0);
+  test_debug_event(DBG_BOOT,esp_reset_reason(),0,0,0);
 }
 #endif

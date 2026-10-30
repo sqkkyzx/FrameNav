@@ -12,6 +12,10 @@
 #define CONFIG_STR_MAX_32 32
 #define CONFIG_STR_MAX_64 64
 #define CONFIG_STR_MAX_18 18
+#define WIFI_IDLE_TIMEOUT_DEFAULT_S 300U
+#define WIFI_IDLE_TIMEOUT_LONG_S 900U
+#define PHONE_LOCATION_TTL_DEFAULT_HOURS 6U
+#define PHONE_LOCATION_TTL_MAX_HOURS 720U
 
 typedef enum
 {
@@ -73,6 +77,8 @@ typedef struct
   char wifi_pass[CONFIG_STR_MAX_64];
   char ap_ssid[CONFIG_STR_MAX_32];
   char ap_pass[CONFIG_STR_MAX_64];
+  uint32_t wifi_idle_timeout_s;
+  uint32_t phone_location_ttl_hours;
 } app_config_t;
 
 void config_set_defaults(app_config_t *cfg);

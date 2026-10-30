@@ -40,7 +40,6 @@ typedef struct {
   bool (*sleep_allowed)(void *); // Recheck BLE events before issuing PMREQ.
   void *arg;
   bool identity_checked, seen_nmea, disable_after_wake, rejected;
-  bool deep_requested, deep_committed;
   unsigned identity_attempts, wake_attempts, actions;
   int64_t identity_deadline_us, last_nmea_us, sleep_started_us, wake_deadline_us;
 } gnss_power_t;

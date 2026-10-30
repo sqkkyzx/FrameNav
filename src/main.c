@@ -6,6 +6,13 @@
 #include <string.h>
 
 #include "ble_client.h"
+#include "location_service.h"
+#ifndef ALPHALOC_BLE_LOCATION
+#define ALPHALOC_BLE_LOCATION 0
+#endif
+#if ALPHALOC_BLE_LOCATION
+#include "ble_location_server.h"
+#endif
 #if ALPHALOC_BLE_CONFIG
 #include "ble_config_server.h"
 #endif
@@ -31,11 +38,7 @@
 #include "gnss_rate.h"
 #include "power_policy.h"
 #include "track_store.h"
-#include "bmi160_probe.h"
-#include "motion_service.h"
 #include "test_debug.h"
-#include "motion_policy.h"
-#include "esp_system.h"
 #if ALPHALOC_POWER_SOURCE_PROBE
 #include "power_source_probe.h"
 #endif
@@ -128,6 +131,9 @@ static int64_t s_config_window_end_time_us = 0;
 #endif
 
 static bool get_location_for_send(gps_fix_t *out_fix) {
+#if ALPHALOC_PHASE2
+  return location_service_get(out_fix);
+#else
   gps_fix_t fix;
   if (gps_get_latest(&fix) && fix.valid) {
 #if ALPHALOC_PHASE2
@@ -165,6 +171,7 @@ static bool get_location_for_send(gps_fix_t *out_fix) {
 #else
   return false;
 #endif
+#endif
 }
 
 static void focus_update_cb(void *ctx) {
@@ -178,11 +185,13 @@ static void focus_update_cb(void *ctx) {
   if (!get_location_for_send(&fix)) {
     return;
   }
+#if !ALPHALOC_PHASE2
   int64_t now = esp_timer_get_time();
   if ((now - fix.last_fix_time_us) >
       (int64_t)cfg_snapshot.max_gps_age_s * 1000000LL) {
     return;
   }
+#endif
   ble_client_send_location(&fix);
 }
 
@@ -196,11 +205,15 @@ static void location_publisher_task(void *arg) {
     }
     gps_fix_t fix;
     if (get_location_for_send(&fix)) {
+#if ALPHALOC_PHASE2
+      ble_client_send_location(&fix);
+#else
       int64_t now = esp_timer_get_time();
       if ((now - fix.last_fix_time_us) <=
           (int64_t)cfg_snapshot.max_gps_age_s * 1000000LL) {
         ble_client_send_location(&fix);
       }
+#endif
     }
     vTaskDelay(pdMS_TO_TICKS(cfg_snapshot.gps_interval_ms));
   }
@@ -217,6 +230,9 @@ static void config_window_task(void *arg) {
 #if ALPHALOC_BLE_CONFIG
   ble_config_server_start();
 #endif
+#if ALPHALOC_BLE_LOCATION
+  ble_location_server_start();
+#endif
 #if ALPHALOC_WIFI_WEB
   (void)wifi_web_start(cfg);
 #endif
@@ -225,6 +241,9 @@ static void config_window_task(void *arg) {
   vTaskDelay(pdMS_TO_TICKS(cfg_snapshot.config_window_s * 1000ULL));
 #if ALPHALOC_BLE_CONFIG
   ble_config_server_stop();
+#endif
+#if ALPHALOC_BLE_LOCATION
+  ble_location_server_stop();
 #endif
 #if ALPHALOC_WIFI_WEB
   wifi_web_stop();
@@ -236,52 +255,6 @@ static void config_window_task(void *arg) {
 #if ALPHALOC_USB_HOST_WIFI
 #define USB_CONFIG_POLL_MS 100U
 #define USB_CONFIG_START_RETRY_MS 5000U
-static TaskHandle_t s_led_task;
-static bool system_sleep_allowed(void) {
-  int64_t last = 0, now = esp_timer_get_time();
-  bool sensor = motion_service_status(&last);
-  int64_t web = wifi_web_last_activity_us();
-  return !usb_serial_jtag_is_connected() &&
-      motion_sleep_due(now, last, ble_client_is_connected(),
-                       wifi_web_has_clients(),
-                       wifi_web_is_started() && web > 0 && now-web < 30000000LL,
-                       sensor);
-}
-static void try_system_sleep(void) {
-  if (!ble_client_pause_for_sleep(true)) {
-    ble_client_pause_for_sleep(false); return;
-  }
-  ESP_LOGI(TAG, "Preparing deep sleep: waiting for GNSS standby confirmation");
-  test_debug_event(DBG_SLEEP_PREP,0,0,0,0);
-  gps_request_system_sleep(true);
-  int64_t deadline = esp_timer_get_time()+10000000LL;
-  while (!gps_system_sleep_ready() && esp_timer_get_time()<deadline) {
-    if (!system_sleep_allowed()) break;
-    vTaskDelay(pdMS_TO_TICKS(100));
-  }
-  if (!gps_system_sleep_ready() || !system_sleep_allowed() ||
-      !motion_service_arm_sleep()) goto cancel;
-  if (!track_store_quiesce(true)) goto cancel;
-  // Last check before stopping network services; after this point abort by
-  // restarting, so a partially stopped BLE host cannot strand the device.
-  if (!system_sleep_allowed() || gpio_get_level(GPIO_NUM_0)) goto cancel;
-  wifi_web_stop();
-  if (!ble_client_stop_for_sleep() || usb_serial_jtag_is_connected() ||
-      gpio_get_level(GPIO_NUM_0) || ble_client_is_connected()) {
-    ESP_LOGW(TAG, "Sleep interrupted during radio shutdown; restarting safely");
-    esp_restart();
-  }
-  if (s_led_task) vTaskSuspend(s_led_task);
-  motion_service_enter_sleep();
-cancel:
-  test_debug_event(DBG_SLEEP_ABORT,0,0,0,0);
-  track_store_quiesce(false);
-  motion_service_cancel_sleep();
-  gps_request_system_sleep(false);
-  ble_client_pause_for_sleep(false);
-  ESP_LOGI(TAG, "Deep sleep cancelled; normal operation resumed");
-}
-
 static void usb_host_wifi_task(void *arg) {
   app_config_t *cfg = (app_config_t *)arg;
   int64_t now_us = esp_timer_get_time();
@@ -293,8 +266,8 @@ static void usb_host_wifi_task(void *arg) {
   usb_config_gate_init(&gate, now_us, raw_allowed);
   int64_t retry_after_us = 0;
   bool previous_raw_allowed = raw_allowed;
-  int64_t gesture_opened = 0;
-
+  bool replug_required = false;
+  int64_t no_client_since_us = 0;
   while (true) {
     now_us = esp_timer_get_time();
     raw_host = usb_serial_jtag_is_connected();
@@ -304,56 +277,64 @@ static void usb_host_wifi_task(void *arg) {
     raw_allowed = usb_config_source_allows_wifi(raw_host, dp, dm);
     bool allowed = usb_config_gate_update(&gate, now_us, raw_allowed);
     bool running = wifi_web_is_started();
-    if (motion_service_take_circle()) {
-      test_debug_event(DBG_CIRCLE,allowed,running,0,0);
-      if (allowed) {
-        ESP_LOGI(TAG, "Circle recognized; USB source already manages WiFi");
-      } else if (wifi_web_start_gesture(cfg)) {
-        test_debug_event(DBG_AP_RESULT,1,1,0,0);
-        gesture_opened = esp_timer_get_time();
-        running = true;
-        ESP_LOGI(TAG, "Circle: configuration AP open, Web idle timeout=30s");
-      } else {
-        test_debug_event(DBG_AP_RESULT,0,1,0,0);
-        ESP_LOGW(TAG, "Circle recognized but configuration AP start failed");
-      }
-    }
-    if (allowed) gesture_opened = 0;
-    if (gesture_opened) {
-      int64_t last = wifi_web_last_activity_us();
-      if (last < gesture_opened) last = gesture_opened;
-      if (now_us-last >= 30000000LL) {
-        ESP_LOGI(TAG, "Gesture WiFi: no Web activity for 30s, closing");
-        test_debug_event(DBG_WIFI_STOP,1,0,0,0);
-        wifi_web_stop(); gesture_opened = 0; running = false;
-      }
-    }
-
     if (raw_allowed != previous_raw_allowed) {
       test_debug_event(DBG_SOURCE,raw_allowed,allowed,running,0);
-      ESP_LOGI(TAG, "USB config source candidate: SOF=%s D+/D-=%u%u allowed=%s",
+      ESP_LOGI(TAG, "USB cable candidate: data=%s D+/D-=%u%u connected=%s",
                raw_host ? "yes" : "no", dp, dm,
                raw_allowed ? "yes" : "no");
       previous_raw_allowed = raw_allowed;
     }
 
-    if (!allowed && !gesture_opened) {
+    app_config_t cfg_snapshot;
+    if (!config_get_snapshot(cfg, &cfg_snapshot)) {
+      cfg_snapshot = *cfg;
+      config_validate(&cfg_snapshot);
+    }
+
+    if (!allowed) {
       retry_after_us = 0;
+      replug_required = false;
+      no_client_since_us = 0;
       if (running) {
-        ESP_LOGI(TAG, "Battery/MI-shoe signature stable for 5s: stopping WiFi web");
+        ESP_LOGI(TAG, "USB cable absent for 5s: stopping WiFi web");
         test_debug_event(DBG_WIFI_STOP,2,0,0,0);
         wifi_web_stop();
       }
-    } else if (allowed && !running && now_us >= retry_after_us) {
-      ESP_LOGI(TAG, "Computer/charger signature stable for 2s: starting WiFi web");
+    } else if (allowed && !running && !replug_required && now_us >= retry_after_us) {
+      ESP_LOGI(TAG, "USB cable present for 2s: starting WiFi web");
       test_debug_event(DBG_AP_START,0,0,0,0);
       if (!wifi_web_start(cfg)) {
         retry_after_us = now_us +
                          (int64_t)USB_CONFIG_START_RETRY_MS * 1000LL;
-        ESP_LOGW(TAG, "WiFi web start failed; retry in 5s while USB host remains");
+        ESP_LOGW(TAG, "WiFi web start failed; retry in 5s while USB cable remains");
       }
     }
-    if (system_sleep_allowed()) try_system_sleep();
+
+    running = wifi_web_is_started();
+#if ALPHALOC_BLE_LOCATION
+    if (running) {
+      ble_location_server_start();
+    } else {
+      ble_location_server_stop();
+    }
+#endif
+    if (allowed && running && !replug_required) {
+      if (wifi_web_has_clients()) {
+        no_client_since_us = 0;
+      } else {
+        if (!no_client_since_us) no_client_since_us = now_us;
+        int64_t timeout_us = (int64_t)cfg_snapshot.wifi_idle_timeout_s * 1000000LL;
+        if (timeout_us > 0 && now_us >= no_client_since_us &&
+            now_us - no_client_since_us >= timeout_us) {
+          ESP_LOGI(TAG, "No WiFi clients for %us: stopping until USB replug",
+                   (unsigned)cfg_snapshot.wifi_idle_timeout_s);
+          test_debug_event(DBG_WIFI_STOP,3,0,0,0);
+          wifi_web_stop();
+          replug_required = true;
+          no_client_since_us = 0;
+        }
+      }
+    }
     vTaskDelay(pdMS_TO_TICKS(USB_CONFIG_POLL_MS));
   }
 }
@@ -618,7 +599,6 @@ void app_main(void) {
   }
 
   test_debug_start();
-  motion_service_boot();
   bool config_loaded = config_load(&s_cfg);
   (void)config_loaded;
 #if ALPHALOC_PHASE1 || ALPHALOC_PHASE2
@@ -636,21 +616,23 @@ void app_main(void) {
 #if ALPHALOC_PHASE2
   s_cfg.gps_interval_ms = ALPHALOC_LOCATION_INTERVAL_MS;
 #if ALPHALOC_POWER_SAVE
-  ESP_LOGW(TAG, "PHASE 2 POWER SAVE: FrameNav Web location/BLE profiles; "
-               "connected camera keeps GNSS real-time; no CPU light sleep; "
+  ESP_LOGW(TAG, "PHASE 2 POWER SAVE: continuous GNSS with phone-location fallback; "
+               "Web BLE power profiles; no CPU light sleep; "
                "no battery protection in firmware");
 #if ALPHALOC_USB_HOST_WIFI
-  ESP_LOGW(TAG, "Source-gated WiFi web: SOF or no-SOF D+/D-=11 starts after "
-                "2s; no-SOF D+/D-=10 stops after 5s (battery/HSA-S)");
+  ESP_LOGW(TAG, "USB-cable-gated WiFi web: data host or asserted D+/D- "
+                "starts after 2s; cable loss stops after 5s; idle timeout is 5/15m");
 #endif
 #define PHASE2_BUILD_LABEL "v17"
 #else
 #define PHASE2_BUILD_LABEL "v8.1"
 #endif
-  ESP_LOGW(TAG, "PHASE 2 " PHASE2_BUILD_LABEL " REAL GNSS ONLY: UART1 TX=GPIO%d RX=GPIO%d baud=%d; "
-               "publish interval=%ums; no fake fallback, no USB host time, max fix age=5s",
+  ESP_LOGW(TAG, "GNSS UART1 TX=GPIO%d RX=GPIO%d baud=%d; "
+               "publish interval=%ums; no fake fallback, no USB host time",
            GPS_UART_TX_PIN, GPS_UART_RX_PIN, GPS_UART_BAUD,
            (unsigned)s_cfg.gps_interval_ms);
+  ESP_LOGI(TAG, "Location: fresh GNSS first, phone fallback TTL=%uh",
+           (unsigned)s_cfg.phone_location_ttl_hours);
 #else
   ESP_LOGW(TAG, "PHASE 1 FAKE GPS ONLY: lat=48.137154 lon=11.576124");
 #if ALPHALOC_FAKE_GPS_USB_TIME
@@ -700,8 +682,7 @@ void app_main(void) {
 #endif
 
   ble_client_init(&s_cfg);
-  bmi160_probe_start();
-  motion_service_start();
+  location_service_init(&s_cfg);
   ble_client_set_focus_callback(focus_update_cb, &s_cfg);
 
 #if ALPHALOC_POWER_SOURCE_PROBE
@@ -755,11 +736,7 @@ void app_main(void) {
 #endif
 #if ALPHALOC_BOARD_XIAO_ESP32C6
   ret = xTaskCreate(xiao_status_led_task, "xiao_led", 3072, NULL, 1,
-#if ALPHALOC_USB_HOST_WIFI
-                   &s_led_task
-#else
                    NULL
-#endif
   );
   if (ret != pdPASS) {
     ESP_LOGE(TAG, "Failed to create xiao_status_led_task");

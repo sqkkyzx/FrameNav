@@ -2,7 +2,7 @@
 # Copyright 2026 FrameNav contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Deterministic USB SOF debounce checks; no USB, WiFi or serial is opened."""
+"""Deterministic USB cable debounce checks; no USB, WiFi or serial is opened."""
 
 import unittest
 
@@ -47,7 +47,7 @@ assert(!usb_config_gate_update(&gate,62999999,true));
 assert(usb_config_gate_update(&gate,63000000,true));
 """)
 
-    def test_host_loss_must_persist_five_seconds(self):
+    def test_cable_loss_must_persist_five_seconds(self):
         check("""
 usb_config_gate_t gate;
 usb_config_gate_init(&gate,0,true);
@@ -57,7 +57,7 @@ assert(usb_config_gate_update(&gate,7999999,false));
 assert(!usb_config_gate_update(&gate,8000000,false));
 """)
 
-    def test_short_sof_drop_and_short_false_attach_do_not_toggle(self):
+    def test_short_cable_drop_and_short_false_attach_do_not_toggle(self):
         check("""
 usb_config_gate_t gate;
 usb_config_gate_init(&gate,0,true);

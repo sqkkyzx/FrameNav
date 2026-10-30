@@ -44,6 +44,7 @@ size_t captive_dns_build_reply(const uint8_t *request, size_t request_len,
   }
 
   size_t offset = DNS_HEADER_LEN;
+  size_t hostname_len = 0;
   for (;;) {
     if (offset >= request_len) {
       return 0;
@@ -58,7 +59,13 @@ size_t captive_dns_build_reply(const uint8_t *request, size_t request_len,
         offset + label_len > request_len) {
       return 0;
     }
-    offset += label_len;
+    size_t separator = hostname_len != 0 ? 1 : 0;
+    if (hostname_len + separator + label_len > 253) return 0;
+    hostname_len += separator + label_len;
+    for (size_t i = 0; i < label_len; ++i) {
+      uint8_t c = request[offset++];
+      if (c == 0 || c == '.') return 0;
+    }
   }
 
   if (offset + 4 > request_len) {
@@ -72,13 +79,13 @@ size_t captive_dns_build_reply(const uint8_t *request, size_t request_len,
   }
 
   memcpy(reply, request, question_end);
-  write_be16(reply + 2, 0x8180U); // Standard no-error response.
+  write_be16(reply + 2, 0x8180U); // Preserve the established captive-DNS response.
   write_be16(reply + 4, 1);
+  write_be16(reply + 6, 0);
   write_be16(reply + 8, 0);
   write_be16(reply + 10, 0);
 
   if (question_type != DNS_TYPE_A || question_class != DNS_CLASS_IN) {
-    write_be16(reply + 6, 0);
     return question_end;
   }
   if (question_end + DNS_A_ANSWER_LEN > reply_capacity) {

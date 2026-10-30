@@ -26,10 +26,8 @@ typedef struct {
 
 /* Return the complete UBX frame length, or zero without writing on failure. */
 size_t gnss_pm_build_mon_ver(uint8_t *out, size_t cap);
-/* Reject zero (indefinite sleep) and durations above the documented maximum. */
+/* Reject zero and durations above the documented maximum. */
 size_t gnss_pm_build_request(uint8_t *out, size_t cap, uint32_t sleep_ms);
-// Only for system deep sleep with a verified external wake path.
-size_t gnss_pm_build_indefinite(uint8_t *out, size_t cap);
 
 /* Pass only a complete, checksum-verified MON-VER payload, not its UBX header.
  * False means malformed: out is cleared. True means parsed: supported is true
