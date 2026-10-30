@@ -81,10 +81,11 @@ for(size_t cap=0;cap<8;cap++) {
 }
 assert(!gnss_pm_build_mon_ver(NULL,8));
 assert(!gnss_pm_build_request(NULL,24,30000));
-assert(!gnss_pm_build_request(frame,32,0));
 assert(!gnss_pm_build_request(frame,32,GNSS_PM_MAX_SLEEP_MS+1));
 assert(!gnss_pm_build_request(frame,32,UINT32_MAX));
 assert(memcmp(frame,original,sizeof(frame))==0);
+assert(gnss_pm_build_request(frame,32,0)==24);
+assert(frame[10]==0 && frame[11]==0 && frame[12]==0 && frame[13]==0);
 """)
 
     def test_known_identity_module_optional_and_extension_order_independent(self):

@@ -17,6 +17,7 @@ static int64_t duty_deadline(int64_t now_us, uint32_t seconds) {
 }
 
 static bool duty_priority_work(const gnss_duty_t *state, int64_t now_us) {
+  if (state->params.require_camera && !state->camera_connected) return false;
   return state->params.continuous || state->camera_connected ||
          now_us < state->boot_deadline_us ||
          now_us < state->grace_deadline_us;
@@ -213,6 +214,7 @@ bool gnss_duty_is_sleeping(const gnss_duty_t *state) {
 
 bool gnss_duty_work_required(const gnss_duty_t *state, int64_t now_us) {
   if (!state) return false;
+  if (state->params.require_camera && !state->camera_connected) return false;
   if (duty_priority_work(state, now_us)) return true;
   return state->phase == GNSS_DUTY_PROBING && !state->probe_complete &&
          now_us < state->probe_deadline_us;
@@ -221,10 +223,16 @@ bool gnss_duty_work_required(const gnss_duty_t *state, int64_t now_us) {
 gnss_duty_action_t gnss_duty_poll(gnss_duty_t *state, int64_t now_us) {
   if (!state) return GNSS_DUTY_NONE;
   if (state->phase == GNSS_DUTY_SLEEPING) {
+    if (state->params.require_camera && !state->camera_connected)
+      return GNSS_DUTY_NONE;
     return duty_priority_work(state, now_us) || now_us >= state->sleep_deadline_us ?
         GNSS_DUTY_WAKE : GNSS_DUTY_NONE;
   }
   if (gnss_duty_work_required(state, now_us)) return GNSS_DUTY_NONE;
+  if (state->params.require_camera && !state->camera_connected) {
+    state->next_sleep_s = 0;
+    return GNSS_DUTY_SLEEP;
+  }
   if (state->phase == GNSS_DUTY_PROBING && !state->probe_complete) {
     // A timeout cannot supply a new speed estimate. Keep existing position
     // history and use 30 s; if no valid position has ever existed, use 90 s.

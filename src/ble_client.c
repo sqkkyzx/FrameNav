@@ -16,6 +16,9 @@
 #if ALPHALOC_BLE_LOCATION
 #include "ble_location_server.h"
 #endif
+#if ALPHALOC_WIFI_WEB
+#include "wifi_web.h"
+#endif
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -1579,6 +1582,9 @@ int ble_client_gap_event_cb(struct ble_gap_event *event, void *arg) {
 #if ALPHALOC_GNSS_STANDBY
         gps_camera_connection_changed(true);
 #endif
+#if ALPHALOC_WIFI_WEB
+        wifi_web_request_wake();
+#endif
 #if ALPHALOC_LOCATION_OBSERVER
         location_observer_reset(s_handles.conn_handle);
 #endif
@@ -1614,6 +1620,9 @@ int ble_client_gap_event_cb(struct ble_gap_event *event, void *arg) {
       s_handles.conn_handle = BLE_HS_CONN_HANDLE_NONE;
 #if ALPHALOC_GNSS_STANDBY
       gps_camera_connection_changed(false);
+#endif
+#if ALPHALOC_WIFI_WEB
+      wifi_web_request_wake();
 #endif
 #if ALPHALOC_LOCATION_OBSERVER
       location_observer_reset(BLE_HS_CONN_HANDLE_NONE);

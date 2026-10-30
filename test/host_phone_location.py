@@ -23,6 +23,10 @@ HARNESS = r"""
 #include "location_service.h"
 #include "track_store.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#ifdef ALPHALOC_LOCATION_NVS
+#include "nvs.h"
+#endif
 #define SEC 1000000LL
 #define EPOCH_MS 1793361600000ULL
 static int64_t now_us;
@@ -32,6 +36,41 @@ int64_t esp_timer_get_time(void) { return now_us; }
 bool gps_get_latest(gps_fix_t *out) { *out = raw; return true; }
 bool config_get_snapshot(const app_config_t *in, app_config_t *out) { *out = *in; return true; }
 void config_validate(app_config_t *in) { (void)in; }
+static int mutex_token;
+SemaphoreHandle_t xSemaphoreCreateMutex(void) { return &mutex_token; }
+int xSemaphoreTake(SemaphoreHandle_t mutex, int ticks) {
+  assert(mutex == &mutex_token && ticks == portMAX_DELAY); return pdTRUE;
+}
+void xSemaphoreGive(SemaphoreHandle_t mutex) { assert(mutex == &mutex_token); }
+#ifdef ALPHALOC_LOCATION_NVS
+static unsigned char nvs_blob[128];
+static size_t nvs_blob_size;
+static bool nvs_blob_present;
+int nvs_open(const char *name, int mode, nvs_handle_t *handle) {
+  assert(strcmp(name, "framenav_loc") == 0);
+  assert(mode == NVS_READONLY || mode == NVS_READWRITE);
+  *handle = 1; return ESP_OK;
+}
+int nvs_get_blob(nvs_handle_t handle, const char *key, void *out, size_t *size) {
+  assert(handle == 1 && strcmp(key, "fixed") == 0);
+  if (!nvs_blob_present) return ESP_ERR_NVS_NOT_FOUND;
+  if (*size < nvs_blob_size) return -1;
+  memcpy(out, nvs_blob, nvs_blob_size); *size = nvs_blob_size; return ESP_OK;
+}
+int nvs_set_blob(nvs_handle_t handle, const char *key, const void *data, size_t size) {
+  assert(handle == 1 && strcmp(key, "fixed") == 0 && size <= sizeof(nvs_blob));
+  memcpy(nvs_blob, data, size); nvs_blob_size = size; nvs_blob_present = true;
+  return ESP_OK;
+}
+int nvs_erase_key(nvs_handle_t handle, const char *key) {
+  assert(handle == 1 && strcmp(key, "fixed") == 0);
+  if (!nvs_blob_present) return ESP_ERR_NVS_NOT_FOUND;
+  nvs_blob_present = false; nvs_blob_size = 0; return ESP_OK;
+}
+int nvs_commit(nvs_handle_t handle) { assert(handle == 1); return ESP_OK; }
+void nvs_close(nvs_handle_t handle) { assert(handle == 1); }
+const char *esp_err_to_name(int error) { (void)error; return "mock"; }
+#endif
 static void reset(void) {
   now_us = SEC;
   cfg = (app_config_t){.phone_location_ttl_hours = PHONE_LOCATION_TTL_DEFAULT_HOURS,
@@ -46,24 +85,49 @@ static void reset(void) {
 """
 
 
-def run_service_c(source, extra_sources=(), include_dirs=()):
+def run_service_c(source, extra_sources=(), include_dirs=(), cflags=()):
     with tempfile.TemporaryDirectory(prefix="framenav-location-") as temporary:
         directory = Path(temporary)
         (directory / "freertos").mkdir()
         (directory / "freertos/FreeRTOS.h").write_text("""
 #pragma once
-typedef int portMUX_TYPE;
-#define portMUX_INITIALIZER_UNLOCKED 0
-#define portENTER_CRITICAL(lock) ((void)(lock))
-#define portEXIT_CRITICAL(lock) ((void)(lock))
 #define pdMS_TO_TICKS(ms) (ms)
+#define pdTRUE 1
+#define portMAX_DELAY (-1)
 """)
+        (directory / "freertos/semphr.h").write_text("""
+#pragma once
+typedef void *SemaphoreHandle_t;
+SemaphoreHandle_t xSemaphoreCreateMutex(void);
+int xSemaphoreTake(SemaphoreHandle_t mutex, int ticks);
+void xSemaphoreGive(SemaphoreHandle_t mutex);
+""")
+        (directory / "nvs.h").write_text("""
+#pragma once
+#include <stddef.h>
+#include <stdint.h>
+typedef int nvs_handle_t;
+typedef int esp_err_t;
+#define ESP_OK 0
+#define ESP_ERR_NVS_NOT_FOUND 1
+#define NVS_READONLY 0
+#define NVS_READWRITE 1
+esp_err_t nvs_open(const char *, int, nvs_handle_t *);
+esp_err_t nvs_get_blob(nvs_handle_t, const char *, void *, size_t *);
+esp_err_t nvs_set_blob(nvs_handle_t, const char *, const void *, size_t);
+esp_err_t nvs_erase_key(nvs_handle_t, const char *);
+esp_err_t nvs_commit(nvs_handle_t);
+void nvs_close(nvs_handle_t);
+const char *esp_err_to_name(esp_err_t);
+""")
+        (directory / "esp_log.h").write_text("#pragma once\n#define ESP_LOGW(...) ((void)0)\n")
         (directory / "esp_timer.h").write_text("#include <stdint.h>\nint64_t esp_timer_get_time(void);\n")
         harness = directory / "main.c"
         harness.write_text(HARNESS + source)
         executable = directory / "check"
         compiled = subprocess.run([
             "cc", "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra", "-Werror",
+            *cflags,
             "-I", str(directory), "-I", str(ROOT / "include"),
             str(ROOT / "src/location_service.c"), str(ROOT / "src/track_format.c"),
             str(harness), *map(str, extra_sources),
@@ -153,6 +217,84 @@ int main(void) {
   return 0;
 }
 """)
+
+    def test_fixed_location_priority_is_configurable_independently_of_search(self):
+        run_service_c(r"""
+int main(void) {
+  reset(); PHONE(); GNSS();
+  cfg.fixed_location_priority = FIXED_LOCATION_PRIORITY;
+  gps_fix_t fix; location_source_t source; uint32_t observed;
+  assert(location_service_details(&fix, &source, &observed));
+  assert(source == LOCATION_PHONE && fix.lat_deg == 23.5);
+  cfg.fixed_location_priority = FIXED_LOCATION_GPS_PRIORITY;
+  assert(location_service_details(&fix, &source, &observed));
+  assert(source == LOCATION_GNSS && fix.lat_deg == 22.5);
+  return 0;
+}
+""")
+
+    def test_all_six_gps_fixed_location_deletion_policies(self):
+        run_service_c(r"""
+int main(void) {
+  const unsigned delete_at[] = {60, 300, 0, 60, 300, 0};
+  for (unsigned policy = 0; policy < 6; ++policy) {
+    reset(); PHONE(); GNSS();
+    cfg.fixed_location_priority = FIXED_LOCATION_PRIORITY;
+    cfg.fixed_location_delete_policy = (uint8_t)policy;
+    gps_fix_t fix; location_source_t source; uint32_t observed;
+    assert(location_service_details(&fix, &source, &observed));
+    if (delete_at[policy] == 0 && policy == FIXED_LOCATION_DELETE_WHEN_FAR) {
+      phone_location_status_t status;
+      location_service_phone_status(&status); assert(!status.present);
+      continue;
+    }
+    const unsigned duration = delete_at[policy] ? delete_at[policy] : 300;
+    for (unsigned second = 1; second <= duration; ++second) {
+      now_us = SEC + (int64_t)second * SEC;
+      raw.last_fix_time_us = now_us;
+      raw.hour = 12;
+      raw.minute = (uint8_t)(second / 60);
+      raw.second = (uint8_t)(second % 60);
+      assert(location_service_details(&fix, &source, &observed));
+      phone_location_status_t status;
+      location_service_phone_status(&status);
+      if (delete_at[policy] && second < delete_at[policy]) assert(status.present);
+      if (delete_at[policy] && second == delete_at[policy]) assert(!status.present);
+    }
+    if (!delete_at[policy]) {
+      phone_location_status_t status;
+      location_service_phone_status(&status); assert(status.present);
+      assert(source == LOCATION_PHONE);
+    } else {
+      assert(source == LOCATION_GNSS);
+    }
+  }
+  return 0;
+}
+""")
+
+    def test_persisted_fixed_location_waits_for_reboot_clock_then_expires(self):
+        run_service_c(r"""
+int main(void) {
+  reset(); cfg.phone_location_ttl_hours = 6;
+  assert(location_service_set_phone(23.5, 114.5, 25, EPOCH_MS, EPOCH_MS));
+  assert(location_service_sync_phone_clock(EPOCH_MS + 3600000));
+  location_service_init(&cfg); // Simulate a power cycle; mock NVS survives.
+  phone_location_status_t status;
+  location_service_phone_status(&status);
+  assert(status.present && status.clock_pending && !status.available);
+  gps_fix_t fix; assert(!location_service_get(&fix));
+  assert(location_service_sync_phone_clock(EPOCH_MS + 2 * 3600000ULL));
+  location_service_phone_status(&status);
+  assert(status.present && !status.clock_pending && status.available);
+  assert(status.remaining_s == 4 * 3600);
+  assert(location_service_sync_phone_clock(EPOCH_MS + 7 * 3600000ULL));
+  location_service_phone_status(&status);
+  assert(status.present && !status.available);
+  assert(!location_service_get(&fix));
+  return 0;
+}
+""", cflags=("-DALPHALOC_LOCATION_NVS=1",))
 
     def test_camera_utc_advances_but_observation_and_coordinates_stay_fixed(self):
         run_service_c(r"""
@@ -266,13 +408,15 @@ int main(void) {
         source = (ROOT / "src/config.c").read_text()
         defines = "\n".join(re.findall(r"^#define .+$", source, re.M))
         functions = "\n".join(function_source("src/config.c", name) for name in (
-            "config_set_str_default", "config_terminate_str", "config_reset_default_str",
+            "config_set_str_default", "config_terminate_str",
             "config_set_defaults", "config_validate"))
         run_c('#include <assert.h>\n#include <string.h>\n#include "config.h"\n' +
               defines + "\n" + functions + r"""
 int main(void) {
   app_config_t cfg;
   config_set_defaults(&cfg); assert(cfg.phone_location_ttl_hours == 6);
+  assert(cfg.fixed_location_priority == FIXED_LOCATION_GPS_PRIORITY);
+  assert(cfg.fixed_location_delete_policy == FIXED_LOCATION_KEEP_UNTIL_EXPIRY);
   cfg.phone_location_ttl_hours = 1; config_validate(&cfg); assert(cfg.phone_location_ttl_hours == 1);
   cfg.phone_location_ttl_hours = 720; config_validate(&cfg); assert(cfg.phone_location_ttl_hours == 720);
   cfg.phone_location_ttl_hours = 0; config_validate(&cfg); assert(cfg.phone_location_ttl_hours == 6);
@@ -287,7 +431,8 @@ int main(void) {
         config = configparser.ConfigParser(interpolation=None)
         config.read(ROOT / "platformio.ini")
         flags = config["env:xiao-c6-gnss-power"]["build_flags"]
-        self.assertIn("ALPHALOC_GNSS_STANDBY=0", flags)
+        self.assertIn("ALPHALOC_GNSS_STANDBY=1", flags)
+        self.assertIn("ALPHALOC_LOCATION_NVS=1", flags)
         self.assertIn("ALPHALOC_GNSS_RATE_1HZ=1", flags)
         self.assertIn("location_service_get(&fix)", function_source("src/track_store.c", "track_store_task"))
         self.assertNotIn("location_service_clear_phone", function_source("src/wifi_web.c", "wifi_cleanup_resources"))
@@ -344,6 +489,11 @@ int main(void) {
   httpd_req_t req = request(valid);
   assert(handle_phone_location(&req) == ESP_OK && response_status == 200);
   gps_fix_t fix; assert(location_service_get(&fix) && fix.lat_deg == 23.5);
+  req = request("{\"now_ms\":1793361600000}");
+  assert(handle_phone_clock(&req) == ESP_OK && response_status == 200);
+  req = request("{\"now_ms\":0}");
+  handle_phone_clock(&req); assert(response_status == 400);
+  assert(location_service_get(&fix) && fix.lat_deg == 23.5);
   const char *bad[] = {
     "{}", "[]", "null", "{garbage}",
     "{\"latitude\":1e300,\"longitude\":0,\"accuracy\":1,\"timestamp_ms\":1793361600000,\"now_ms\":1793361600000}",
@@ -376,7 +526,7 @@ int main(void) {
 """, extra_sources=(cjson / "cJSON.c",), include_dirs=(cjson,))
 
     @unittest.skipUnless(shutil.which("node"), "requires Node.js for browser API mocks")
-    def test_browser_requests_fresh_geolocation_only_on_click_and_handles_denial(self):
+    def test_webui_uses_manual_location_without_phone_geolocation(self):
         source = (ROOT / "src/wifi_web.c").read_text()
         start = source.index('      "<script>(()=>')
         end = source.index('      "</body></html>"', start)
@@ -386,17 +536,16 @@ int main(void) {
         script = script.replace("%u", "1").replace("%d", "0")
         harness = r"""
 const vm = require('node:vm'), assert = require('node:assert/strict');
-const nodes = new Map(), calls = [], geo = [];
+const nodes = new Map(), calls = [];
 function node(selector) {
   if (!nodes.has(selector)) nodes.set(selector, {disabled:false, value:'', textContent:'', events:{},
     addEventListener(type, callback) {this.events[type] = callback;}});
   return nodes.get(selector);
 }
-const context = {window:{isSecureContext:true}, AbortController, Date,
+const context = {window:{}, AbortController, Date,
   setInterval(){}, setTimeout(){return 1;}, clearTimeout(){},
   document:{hidden:false, querySelector:node,
     querySelectorAll(){return [];}, addEventListener(){}},
-  navigator:{geolocation:{getCurrentPosition(ok, error, options){geo.push({ok,error,options});}}},
   fetch:async(path, options={})=>{
     calls.push({path,options});
     return {ok:true, text:async()=> '已保存', json:async()=>({status:'有效'})};
@@ -406,22 +555,8 @@ vm.createContext(context);
 """ + "vm.runInContext(" + json.dumps(script, ensure_ascii=False) + r""", context);
 (async()=>{
   await new Promise(setImmediate);
-  assert.equal(geo.length, 0);
-  node('#phone-get').events.click();
-  assert.equal(geo.length, 1);
-  assert.equal(geo[0].options.maximumAge, 600000);
-  assert.equal(geo[0].options.timeout, 15000);
-  assert.equal(geo[0].options.enableHighAccuracy, false);
-  assert.equal(node('#phone-get').disabled, true);
-  await geo[0].ok({coords:{latitude:23.5,longitude:114.5,accuracy:25},timestamp:Date.now()});
-  const post = calls.find(c=>c.path === '/location/phone');
-  assert.equal(post.options.method, 'POST');
-  assert.equal(post.options.headers['Content-Type'], 'application/json');
-  const data = JSON.parse(post.options.body);
-  assert.equal(data.latitude, 23.5);
-  assert.equal(data.longitude, 114.5);
-  assert.equal(typeof data.now_ms, 'number');
-  assert.equal(node('#phone-get').disabled, false);
+  assert.equal(typeof context.navigator, 'undefined');
+  assert.equal(node('#phone-get').events.click, undefined);
   node('#manual-lat').value = '24.1'; node('#manual-lon').value = '115.2';
   node('#phone-manual').events.click();
   await new Promise(setImmediate);
@@ -429,48 +564,10 @@ vm.createContext(context);
   assert.equal(JSON.parse(manual.options.body).latitude, 24.1);
   assert.equal(JSON.parse(manual.options.body).longitude, 115.2);
   assert.equal(JSON.parse(manual.options.body).accuracy, 0);
+  assert.equal(node('#phone-message').textContent, '已保存');
   node('#manual-lat').value = '91'; node('#manual-lon').value = '115.2';
   node('#phone-manual').events.click();
   assert.match(node('#phone-message').textContent, /有效/);
-  await new Promise(setImmediate);
-  const denialIndex = geo.length;
-  node('#phone-get').events.click();
-  assert.equal(geo.length, denialIndex + 1);
-  geo[denialIndex].error({code:1});
-  assert.match(node('#phone-message').textContent, /拒绝/);
-  assert.equal(node('#phone-get').disabled, false);
-  assert.equal(geo.length, denialIndex + 1, 'permission denial must not retry');
-  await new Promise(setImmediate);
-  const retryIndex = geo.length;
-  node('#phone-get').events.click();
-  assert.equal(geo.length, retryIndex + 1);
-  geo[retryIndex].error({code:3});
-  assert.equal(geo.length, retryIndex + 2);
-  assert.equal(node('#phone-get').disabled, true);
-  const highAccuracyIndex = retryIndex + 1;
-  assert.equal(geo[highAccuracyIndex].options.enableHighAccuracy, true);
-  assert.equal(geo[highAccuracyIndex].options.maximumAge, 60000);
-  assert.equal(geo[highAccuracyIndex].options.timeout, 60000);
-  assert.match(node('#phone-message').textContent, /高精度/);
-  geo[highAccuracyIndex].error({code:3});
-  assert.equal(geo.length, retryIndex + 2, 'high accuracy retries once');
-  assert.match(node('#phone-message').textContent, /超时/);
-  assert.equal(node('#phone-get').disabled, false);
-  await new Promise(setImmediate);
-  const cacheRetryIndex = geo.length;
-  node('#phone-get').events.click();
-  assert.equal(geo.length, cacheRetryIndex + 1);
-  geo[cacheRetryIndex].error({code:2});
-  assert.equal(geo.length, cacheRetryIndex + 2, 'cached location retry completes');
-  await geo[cacheRetryIndex + 1].ok({coords:{latitude:24,longitude:115,accuracy:10},timestamp:Date.now()});
-  const posts = calls.filter(c=>c.path === '/location/phone');
-  assert.equal(posts.length, 3);
-  assert.equal(JSON.parse(posts[2].options.body).latitude, 24);
-  assert.equal(node('#phone-get').disabled, false);
-  context.window.isSecureContext = false;
-  node('#phone-get').events.click();
-  assert.equal(geo.length, cacheRetryIndex + 2, 'insecure context must not call geolocation');
-  assert.match(node('#phone-message').textContent, /https:\/\/framenav.device.igp.wiki/);
   await new Promise(setImmediate);
   await node('#phone-clear').events.click();
   assert(calls.some(c=>c.path === '/location/phone/clear' && c.options.method === 'POST'));

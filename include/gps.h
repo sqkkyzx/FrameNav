@@ -34,10 +34,21 @@ typedef enum {
   GPS_CONSTELLATION_GLONASS = 1 << 1,
 } gps_constellation_t;
 
+typedef enum {
+  GPS_SEARCH_UNKNOWN = 0,
+  GPS_SEARCH_ACTIVE,
+  GPS_SEARCH_PAUSED,
+  GPS_SEARCH_WAKING,
+} gps_search_state_t;
+
 typedef struct {
   bool has_lock;
+  gps_search_state_t search_state;
+  // Satellites used for the current fix, reported by GGA.
   uint8_t satellites;
   gps_constellation_t constellations;
+  // Satellites currently visible, reported by GSV.
+  uint8_t satellites_visible;
 } gps_status_t;
 
 typedef struct {
@@ -54,6 +65,9 @@ bool gps_get_status(gps_status_t *out_status);
 #if ALPHALOC_GNSS_STANDBY
 // Notify a successful camera BLE link or its disconnect, not bond/auth status.
 void gps_camera_connection_changed(bool connected);
+// A connected Wi-Fi client is also an active GNSS work source. The GPS task
+// combines this state with the camera link before applying standby policy.
+void gps_wifi_connection_changed(bool connected);
 // Safe from the HTTP task; the GPS task applies the policy on its next pass.
 void gps_apply_power_policy(const location_power_policy_t *policy);
 #endif

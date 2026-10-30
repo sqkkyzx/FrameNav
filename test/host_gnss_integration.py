@@ -23,6 +23,8 @@ HARNESS = """
 #define ALPHALOC_GNSS_RATE_1HZ 1
 #define ALPHALOC_PHASE2 1
 #define ALPHALOC_FAKE_GPS 0
+#define GPS_GSV_TALKER_COUNT 7U
+#define GPS_GSV_FRESH_US 15000000LL
 """ + PRELUDE + "".join(
     f'#include "{ROOT / ("src/" + name + ".c")}"\n'
     for name in ("gnss_pm_protocol", "gnss_duty", "gnss_power", "gnss_rate")
@@ -41,12 +43,17 @@ static gnss_rate_t s_rate;
 static gps_config_t s_cfg={.uart_num=1};
 static gps_fix_t s_latest_fix;
 static gps_status_t s_status;
+static uint8_t s_gsv_satellites[7];
+static int64_t s_gsv_seen_us[7];
 static int s_fix_mutex=1;
 static int64_t s_last_no_fix_log_us;
 static int s_camera_lock;
 static bool s_camera_connected;
 static uint32_t s_camera_generation, s_camera_seen_generation;
 static int64_t s_camera_changed_us;
+static bool s_wifi_connected;
+static uint32_t s_wifi_generation, s_wifi_seen_generation;
+static int64_t s_wifi_changed_us;
 static location_power_policy_t s_pending_power_policy;
 static uint32_t s_power_policy_generation, s_power_policy_seen_generation;
 static uint32_t s_rmc_count, s_rmc_sample_count;
@@ -71,7 +78,7 @@ static int xSemaphoreTake(int mutex, int ticks) {
 static void xSemaphoreGive(int mutex) {
   assert(mutex==1 && held_mutexes==1); held_mutexes--;
 }
-""" + gps_source("gps_camera_connection_changed") + """
+""" + gps_source("gps_camera_connection_changed", "gps_wifi_connection_changed") + """
 static void mock_enter(int *lock) {
   assert(lock==&s_camera_lock && critical_depth==0); critical_depth++;
 }
@@ -115,12 +122,17 @@ static void power_log(gnss_power_event_t event, void *arg) { (void)event; (void)
 """ + gps_source(
     "rate_uart_send", "power_policy_to_duty", "power_sleep_allowed",
     "power_uart_send", "power_frame",
-    "power_step", "update_fix", "gps_get_latest", "gps_get_status"
+    "power_step", "update_fix", "gps_get_latest", "visible_satellites_now",
+    "gps_get_status"
 ) + """
 static void init(void) {
   now_us=0; line_length=0;
   s_camera_connected=false;
   s_camera_generation=s_camera_seen_generation=0; s_camera_changed_us=0;
+  s_wifi_connected=false;
+  s_wifi_generation=s_wifi_seen_generation=0; s_wifi_changed_us=0;
+  s_wifi_connected=false;
+  s_wifi_generation=s_wifi_seen_generation=0; s_wifi_changed_us=0;
   s_power_policy_generation=s_power_policy_seen_generation=0;
   memset(&s_pending_power_policy,0,sizeof(s_pending_power_policy));
   critical_depth=critical_exits=connect_after_exit=0;
@@ -156,6 +168,51 @@ def check(body):
 
 
 class GnssIntegrationChecks(unittest.TestCase):
+    def test_wifi_client_wakes_receiver_and_keeps_it_working_until_disconnect(self):
+        check("""
+init();
+step(45*SEC);
+assert(pm_requests==1 && s_power.phase==GNSS_POWER_SLEEP_SETTLE);
+assert(s_status.search_state==GPS_SEARCH_PAUSED);
+step(46*SEC+SEC/2+SEC/100);
+assert(s_power.phase==GNSS_POWER_SLEEP);
+assert(s_status.search_state==GPS_SEARCH_PAUSED);
+now_us=100*SEC; gps_wifi_connection_changed(true); step(now_us);
+assert(wake_bytes==1 && s_power.phase==GNSS_POWER_WAKING);
+assert(s_status.search_state==GPS_SEARCH_WAKING);
+gnss_power_note_nmea(&s_power,101*SEC);
+step(200*SEC);
+assert(s_power.phase==GNSS_POWER_WORK && pm_requests==1);
+assert(s_status.search_state==GPS_SEARCH_ACTIVE);
+now_us=201*SEC; gps_wifi_connection_changed(false); step(now_us);
+assert(pm_requests==1 && s_power.phase==GNSS_POWER_WORK);
+step(221*SEC); assert(pm_requests==2 && s_power.phase==GNSS_POWER_SLEEP_SETTLE);
+""")
+
+    def test_camera_and_wifi_sources_are_combined(self):
+        check("""
+init();
+now_us=10*SEC; gps_camera_connection_changed(true); step(now_us);
+now_us=11*SEC; gps_wifi_connection_changed(true); step(now_us);
+now_us=12*SEC; gps_camera_connection_changed(false); step(now_us);
+assert(s_power.duty.camera_connected && !pm_requests);
+now_us=13*SEC; gps_wifi_connection_changed(false); step(now_us);
+assert(!s_power.duty.camera_connected && !pm_requests);
+step(45*SEC); assert(pm_requests==1);
+""")
+
+    def test_no_camera_search_setting_maps_to_continuous_gnss_work(self):
+        check("""
+init();
+location_power_policy_t policy={.search_without_camera=true};
+gnss_duty_params_t params;
+power_policy_to_duty(&policy,&params);
+assert(params.continuous && !params.require_camera);
+policy.search_without_camera=false;
+power_policy_to_duty(&policy,&params);
+assert(!params.continuous && params.require_camera);
+""")
+
     def test_coalesced_connect_disconnect_keeps_actual_20_second_grace(self):
         check("""
 init();

@@ -14,5 +14,7 @@ void wifi_web_stop(void);
 bool wifi_web_is_started(void);
 bool wifi_web_has_clients(void);
 int64_t wifi_web_last_activity_us(void);
+void wifi_web_request_wake(void);
+bool wifi_web_take_wake_request(void);
 
 #endif

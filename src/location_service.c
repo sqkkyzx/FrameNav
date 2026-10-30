@@ -2,43 +2,172 @@
 #include "location_service.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "track_store.h"
+
+#ifndef ALPHALOC_LOCATION_NVS
+#define ALPHALOC_LOCATION_NVS 0
+#endif
+
+#if ALPHALOC_LOCATION_NVS
+#include "esp_log.h"
+#include "nvs.h"
+#endif
 
 #define GNSS_FRESH_US 5000000LL
 #define PHONE_MAX_CAPTURE_AGE_MS 60000ULL
+#define PHONE_CLOCK_STORE_INTERVAL_MS 300000ULL
+#define GPS_STABLE_1_MIN_US 60000000LL
+#define GPS_STABLE_5_MIN_US 300000000LL
+#define GPS_FIXED_DISTANCE_M 100.0
 #define UTC_MIN_MS 1577836800000ULL /* 2020-01-01 */
 #define UTC_MAX_MS 4102444799999ULL /* 2099-12-31 */
 
 typedef struct {
   bool present;
+  bool clock_confirmed;
   double latitude, longitude, accuracy_m;
   uint64_t captured_ms, clock_ms;
   int64_t received_us;
 } phone_fix_t;
 
-static app_config_t *s_cfg;
-static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
-static phone_fix_t s_phone;
+#if ALPHALOC_LOCATION_NVS
+#define PHONE_STORE_NAMESPACE "framenav_loc"
+#define PHONE_STORE_KEY "fixed"
+#define PHONE_STORE_MAGIC 0x46584C31U
+#define PHONE_STORE_VERSION 1U
 
-void location_service_init(app_config_t *cfg) {
-  s_cfg = cfg;
+typedef struct {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t reserved;
+  double latitude;
+  double longitude;
+  double accuracy_m;
+  uint64_t captured_ms;
+  uint64_t clock_ms;
+} phone_store_record_t;
+
+static bool phone_store_valid(const phone_store_record_t *record) {
+  return record && record->magic == PHONE_STORE_MAGIC &&
+         record->version == PHONE_STORE_VERSION &&
+         isfinite(record->latitude) && isfinite(record->longitude) &&
+         isfinite(record->accuracy_m) && record->latitude >= -90.0 &&
+         record->latitude <= 90.0 && record->longitude >= -180.0 &&
+         record->longitude <= 180.0 && record->accuracy_m >= 0.0 &&
+         record->accuracy_m <= 20000000.0 &&
+         record->captured_ms >= UTC_MIN_MS && record->captured_ms <= UTC_MAX_MS &&
+         record->clock_ms >= record->captured_ms &&
+         record->clock_ms <= UTC_MAX_MS;
 }
 
-static phone_fix_t phone_snapshot(void) {
-  portENTER_CRITICAL(&s_lock);
-  phone_fix_t phone = s_phone;
-  portEXIT_CRITICAL(&s_lock);
-  return phone;
+static bool phone_store_load(phone_fix_t *out) {
+  if (!out) return false;
+  nvs_handle_t nvs = 0;
+  if (nvs_open(PHONE_STORE_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+    return false;
+  }
+  phone_store_record_t record = {0};
+  size_t size = sizeof(record);
+  esp_err_t err = nvs_get_blob(nvs, PHONE_STORE_KEY, &record, &size);
+  nvs_close(nvs);
+  if (err != ESP_OK || size != sizeof(record) || !phone_store_valid(&record)) {
+    return false;
+  }
+  *out = (phone_fix_t){
+      .present = true,
+      .latitude = record.latitude,
+      .longitude = record.longitude,
+      .accuracy_m = record.accuracy_m,
+      .captured_ms = record.captured_ms,
+      .clock_ms = record.clock_ms,
+      .received_us = esp_timer_get_time(),
+  };
+  return true;
+}
+
+static bool phone_store_save(const phone_fix_t *phone) {
+  if (!phone || !phone->present) return false;
+  phone_store_record_t record = {
+      .magic = PHONE_STORE_MAGIC,
+      .version = PHONE_STORE_VERSION,
+      .latitude = phone->latitude,
+      .longitude = phone->longitude,
+      .accuracy_m = phone->accuracy_m,
+      .captured_ms = phone->captured_ms,
+      .clock_ms = phone->clock_ms,
+  };
+  nvs_handle_t nvs = 0;
+  esp_err_t err = nvs_open(PHONE_STORE_NAMESPACE, NVS_READWRITE, &nvs);
+  bool opened = err == ESP_OK;
+  if (err == ESP_OK) err = nvs_set_blob(nvs, PHONE_STORE_KEY, &record, sizeof(record));
+  if (err == ESP_OK) err = nvs_commit(nvs);
+  if (opened) nvs_close(nvs);
+  if (err != ESP_OK) {
+    ESP_LOGW("location", "Fixed location save failed: %s", esp_err_to_name(err));
+  }
+  return err == ESP_OK;
+}
+
+static void phone_store_clear(void) {
+  nvs_handle_t nvs;
+  esp_err_t err = nvs_open(PHONE_STORE_NAMESPACE, NVS_READWRITE, &nvs);
+  if (err != ESP_OK) return;
+  err = nvs_erase_key(nvs, PHONE_STORE_KEY);
+  if (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND) err = nvs_commit(nvs);
+  nvs_close(nvs);
+}
+#else
+static bool phone_store_load(phone_fix_t *out) {
+  (void)out;
+  return false;
+}
+static bool phone_store_save(const phone_fix_t *phone) { (void)phone; return true; }
+static void phone_store_clear(void) {}
+#endif
+
+static app_config_t *s_cfg;
+static SemaphoreHandle_t s_lock;
+static phone_fix_t s_phone;
+static bool s_initialized;
+static uint64_t s_phone_persisted_clock_ms;
+static int64_t s_gps_stable_since_us;
+static int64_t s_gps_last_fix_us;
+static int64_t s_gps_last_epoch_s;
+
+void location_service_init(app_config_t *cfg) {
+  if (!s_lock) s_lock = xSemaphoreCreateMutex();
+  if (!s_lock || xSemaphoreTake(s_lock, portMAX_DELAY) != pdTRUE) return;
+  s_cfg = cfg;
+  phone_fix_t restored = {0};
+  bool loaded = phone_store_load(&restored);
+  if (loaded) {
+    s_phone = restored;
+    s_phone_persisted_clock_ms = restored.clock_ms;
+    s_gps_stable_since_us = 0;
+    s_gps_last_fix_us = 0;
+    s_gps_last_epoch_s = 0;
+  } else if (!s_initialized) {
+    memset(&s_phone, 0, sizeof(s_phone));
+    s_phone_persisted_clock_ms = 0;
+    s_gps_stable_since_us = 0;
+    s_gps_last_fix_us = 0;
+    s_gps_last_epoch_s = 0;
+  }
+  s_initialized = true;
+  xSemaphoreGive(s_lock);
 }
 
 static bool phone_age(const phone_fix_t *phone, int64_t now_us,
                         uint32_t ttl_hours, uint64_t *age_us) {
-  if (!phone->present || now_us < phone->received_us || !ttl_hours ||
+  if (!phone->present || !phone->clock_confirmed ||
+      now_us < phone->received_us || !ttl_hours ||
       ttl_hours > PHONE_LOCATION_TTL_MAX_HOURS) return false;
   *age_us = (uint64_t)(now_us - phone->received_us) +
             (phone->clock_ms - phone->captured_ms) * 1000ULL;
@@ -55,20 +184,130 @@ bool location_service_set_phone(double latitude, double longitude,
       phone_now_ms < captured_ms || phone_now_ms > UTC_MAX_MS ||
       phone_now_ms - captured_ms > PHONE_MAX_CAPTURE_AGE_MS) return false;
   phone_fix_t phone = {
-      .present = true, .latitude = latitude, .longitude = longitude,
+      .present = true, .clock_confirmed = true,
+      .latitude = latitude, .longitude = longitude,
       .accuracy_m = accuracy_m, .captured_ms = captured_ms,
       .clock_ms = phone_now_ms, .received_us = esp_timer_get_time(),
   };
-  portENTER_CRITICAL(&s_lock);
+  if (!s_lock || xSemaphoreTake(s_lock, portMAX_DELAY) != pdTRUE) return false;
+  if (!phone_store_save(&phone)) {
+    xSemaphoreGive(s_lock);
+    return false;
+  }
   s_phone = phone;
-  portEXIT_CRITICAL(&s_lock);
+  s_phone_persisted_clock_ms = phone_now_ms;
+  s_gps_stable_since_us = 0;
+  s_gps_last_fix_us = 0;
+  s_gps_last_epoch_s = 0;
+  xSemaphoreGive(s_lock);
   return true;
 }
 
-void location_service_clear_phone(void) {
-  portENTER_CRITICAL(&s_lock);
+/* Called with s_lock held. Repeated/stale clock samples cannot extend TTL. */
+static void phone_sync_clock(uint64_t utc_ms, int64_t now_us) {
+  if (!s_phone.present || utc_ms < s_phone.clock_ms || utc_ms > UTC_MAX_MS)
+    return;
+  uint64_t estimated_ms = s_phone.clock_ms;
+  if (s_phone.clock_confirmed && now_us >= s_phone.received_us) {
+    estimated_ms += (uint64_t)(now_us - s_phone.received_us) / 1000ULL;
+  }
+  if (s_phone.clock_confirmed && utc_ms <= estimated_ms) return;
+  s_phone.clock_ms = utc_ms;
+  s_phone.received_us = now_us;
+  s_phone.clock_confirmed = true;
+  if (utc_ms - s_phone_persisted_clock_ms >= PHONE_CLOCK_STORE_INTERVAL_MS &&
+      phone_store_save(&s_phone)) {
+    s_phone_persisted_clock_ms = utc_ms;
+  }
+}
+
+bool location_service_sync_phone_clock(uint64_t phone_now_ms) {
+  if (phone_now_ms < UTC_MIN_MS || phone_now_ms > UTC_MAX_MS || !s_lock ||
+      xSemaphoreTake(s_lock, portMAX_DELAY) != pdTRUE) return false;
+  phone_sync_clock(phone_now_ms, esp_timer_get_time());
+  xSemaphoreGive(s_lock);
+  return true;
+}
+
+static void phone_clear(void) {
   memset(&s_phone, 0, sizeof(s_phone));
-  portEXIT_CRITICAL(&s_lock);
+  s_phone_persisted_clock_ms = 0;
+  s_gps_stable_since_us = 0;
+  s_gps_last_fix_us = 0;
+  s_gps_last_epoch_s = 0;
+  phone_store_clear();
+}
+
+void location_service_clear_phone(void) {
+  if (!s_lock || xSemaphoreTake(s_lock, portMAX_DELAY) != pdTRUE) return;
+  phone_clear();
+  xSemaphoreGive(s_lock);
+}
+
+static double location_distance_m(double lat1, double lon1,
+                                  double lat2, double lon2) {
+  const double radians = 0.017453292519943295769;
+  const double sin_lat = sin((lat2 - lat1) * radians / 2.0);
+  const double sin_lon = sin((lon2 - lon1) * radians / 2.0);
+  double h = sin_lat * sin_lat + cos(lat1 * radians) * cos(lat2 * radians) *
+             sin_lon * sin_lon;
+  if (h < 0.0) h = 0.0;
+  if (h > 1.0) h = 1.0;
+  return 12742000.0 * atan2(sqrt(h), sqrt(1.0 - h));
+}
+
+static void location_note_gps(const gps_fix_t *gps, int64_t now_us,
+                             int64_t epoch_s, const phone_fix_t *phone,
+                             uint8_t policy) {
+  if (!gps || !phone || !phone->present ||
+      now_us < gps->last_fix_time_us ||
+      now_us - gps->last_fix_time_us > GNSS_FRESH_US) {
+    s_gps_stable_since_us = 0;
+    s_gps_last_fix_us = 0;
+    s_gps_last_epoch_s = 0;
+    return;
+  }
+
+  int64_t stable_since;
+  if (s_gps_last_epoch_s == 0 || gps->last_fix_time_us < s_gps_last_fix_us ||
+      gps->last_fix_time_us - s_gps_last_fix_us > GNSS_FRESH_US) {
+    s_gps_stable_since_us = gps->last_fix_time_us;
+  } else if (gps->last_fix_time_us > s_gps_last_fix_us) {
+    const int64_t monotonic_delta_s =
+        (gps->last_fix_time_us - s_gps_last_fix_us) / 1000000LL;
+    const int64_t utc_delta_s = epoch_s - s_gps_last_epoch_s;
+    if (utc_delta_s <= 0 || llabs(utc_delta_s - monotonic_delta_s) > 3) {
+      s_gps_stable_since_us = gps->last_fix_time_us;
+    }
+  }
+  s_gps_last_fix_us = gps->last_fix_time_us;
+  s_gps_last_epoch_s = epoch_s;
+  stable_since = s_gps_stable_since_us;
+
+  const bool stable_1_min = gps->last_fix_time_us >= stable_since &&
+      gps->last_fix_time_us - stable_since >= GPS_STABLE_1_MIN_US;
+  const bool stable_5_min = gps->last_fix_time_us >= stable_since &&
+      gps->last_fix_time_us - stable_since >= GPS_STABLE_5_MIN_US;
+  const bool far = location_distance_m(phone->latitude, phone->longitude,
+                                        gps->lat_deg, gps->lon_deg) >
+                   GPS_FIXED_DISTANCE_M;
+  bool remove = false;
+  switch ((fixed_location_delete_policy_t)policy) {
+  case FIXED_LOCATION_DELETE_AFTER_1_MIN:
+    remove = stable_1_min; break;
+  case FIXED_LOCATION_DELETE_AFTER_5_MIN:
+    remove = stable_5_min; break;
+  case FIXED_LOCATION_DELETE_WHEN_FAR:
+    remove = far; break;
+  case FIXED_LOCATION_DELETE_AFTER_1_MIN_WHEN_FAR:
+    remove = stable_1_min && far; break;
+  case FIXED_LOCATION_DELETE_AFTER_5_MIN_WHEN_FAR:
+    remove = stable_5_min && far; break;
+  case FIXED_LOCATION_KEEP_UNTIL_EXPIRY:
+  default:
+    break;
+  }
+  if (remove) phone_clear();
 }
 
 void location_service_phone_status(phone_location_status_t *out) {
@@ -76,8 +315,11 @@ void location_service_phone_status(phone_location_status_t *out) {
   *out = (phone_location_status_t){0};
   app_config_t cfg;
   if (!s_cfg || !config_get_snapshot(s_cfg, &cfg)) return;
-  phone_fix_t phone = phone_snapshot();
+  if (!s_lock || xSemaphoreTake(s_lock, portMAX_DELAY) != pdTRUE) return;
+  phone_fix_t phone = s_phone;
+  xSemaphoreGive(s_lock);
   out->present = phone.present;
+  out->clock_pending = phone.present && !phone.clock_confirmed;
   out->latitude = phone.latitude;
   out->longitude = phone.longitude;
   out->accuracy_m = phone.accuracy_m;
@@ -97,23 +339,46 @@ bool location_service_details(gps_fix_t *fix, location_source_t *source,
   *fix = (gps_fix_t){0};
   *source = LOCATION_NONE;
   *observed_utc = 0;
-  int64_t now_us = esp_timer_get_time();
+  app_config_t cfg;
+  if (!s_cfg || !config_get_snapshot(s_cfg, &cfg)) return false;
   gps_fix_t gps = {0};
-  if (gps_get_latest(&gps) && gps.valid && gps.time_valid &&
+  uint32_t gps_utc = 0;
+  bool have_gps = gps_get_latest(&gps);
+  int64_t now_us = esp_timer_get_time();
+  bool gps_available = have_gps && gps.valid && gps.time_valid &&
       isfinite(gps.lat_deg) && isfinite(gps.lon_deg) &&
       fabs(gps.lat_deg) <= 90 && fabs(gps.lon_deg) <= 180 &&
       gps.last_fix_time_us >= 0 && now_us >= gps.last_fix_time_us &&
       now_us - gps.last_fix_time_us <= GNSS_FRESH_US &&
-      track_epoch_from_fix(&gps, observed_utc)) {
+      track_epoch_from_fix(&gps, &gps_utc);
+  if (!s_lock || xSemaphoreTake(s_lock, portMAX_DELAY) != pdTRUE) return false;
+  if (gps_available) {
+    phone_sync_clock((uint64_t)gps_utc * 1000ULL +
+                     (uint64_t)(now_us - gps.last_fix_time_us) / 1000ULL, now_us);
+  }
+  phone_fix_t phone = s_phone;
+  if (gps_available) {
+    location_note_gps(&gps, now_us, gps_utc, &phone,
+                      cfg.fixed_location_delete_policy);
+    phone = s_phone;
+  } else {
+    location_note_gps(NULL, now_us, 0, &phone,
+                      cfg.fixed_location_delete_policy);
+  }
+
+  uint64_t age = 0;
+  bool phone_available = phone_age(&phone, now_us,
+                                    cfg.phone_location_ttl_hours, &age);
+  xSemaphoreGive(s_lock);
+  if (gps_available &&
+      (cfg.fixed_location_priority == FIXED_LOCATION_GPS_PRIORITY ||
+       !phone_available)) {
     *fix = gps;
     *source = LOCATION_GNSS;
+    *observed_utc = gps_utc;
     return true;
   }
-  app_config_t cfg;
-  if (!s_cfg || !config_get_snapshot(s_cfg, &cfg)) return false;
-  phone_fix_t phone = phone_snapshot();
-  uint64_t age = 0;
-  if (!phone_age(&phone, now_us, cfg.phone_location_ttl_hours, &age)) return false;
+  if (!phone_available) return false;
   uint64_t clock_ms = phone.clock_ms + (uint64_t)(now_us - phone.received_us) / 1000ULL;
   if (clock_ms > UTC_MAX_MS) return false;
   time_t epoch = (time_t)(clock_ms / 1000ULL);

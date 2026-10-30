@@ -9,4 +9,3 @@ CONFIG_BT_LE_LP_CLK_SRC_MAIN_XTAL=y
 # Keep USB Serial/JTAG and unsolicited 115200-baud GNSS RX continuously usable.
 # BLE modem sleep is NOT CPU light sleep and does not disconnect the camera.
 CONFIG_FREERTOS_USE_TICKLESS_IDLE=n
-CONFIG_ESP_HTTPS_SERVER_ENABLE=y

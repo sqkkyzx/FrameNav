@@ -5,6 +5,8 @@
 
 #include "track_store.h"
 #include "location_service.h"
+#include "ble_client.h"
+#include "config.h"
 
 #include <stddef.h>
 #include <stdlib.h>
@@ -40,6 +42,7 @@ static const esp_partition_t *s_partition;
 static SemaphoreHandle_t s_mutex;
 static uint8_t *s_sector_buffer;
 static track_store_status_t s_status;
+static uint32_t s_interval_s = TRACK_STORE_INTERVAL_S;
 static uint32_t s_next_sector;
 static uint16_t s_next_record;
 static uint32_t s_next_sequence = 1;
@@ -241,10 +244,18 @@ bool track_store_init(void) {
              (unsigned)s_status.used_bytes,
              (unsigned)s_status.capacity_bytes,
              (unsigned)s_status.record_count,
-             (unsigned)TRACK_STORE_INTERVAL_S);
+             (unsigned)s_interval_s);
   }
   return ok;
 #endif
+}
+
+void track_store_set_interval(uint32_t interval_s) {
+  if (interval_s < LOCATION_RECORD_INTERVAL_MIN_S ||
+      interval_s > LOCATION_RECORD_INTERVAL_MAX_S) {
+    interval_s = LOCATION_RECORD_INTERVAL_DEFAULT_S;
+  }
+  s_interval_s = interval_s;
 }
 
 bool track_store_append_fix(const gps_fix_t *fix) {
@@ -260,7 +271,7 @@ bool track_store_append_fix(const gps_fix_t *fix) {
   if (s_status.latest_timestamp_utc != 0 &&
       (record.timestamp_utc <= s_status.latest_timestamp_utc ||
        record.timestamp_utc - s_status.latest_timestamp_utc <
-           TRACK_STORE_INTERVAL_S)) {
+           s_interval_s)) {
     xSemaphoreGive(s_mutex);
     return false;
   }
@@ -320,10 +331,18 @@ bool track_store_get_status(track_store_status_t *out_status) {
 }
 
 void track_store_task(void *arg) {
-  (void)arg;
+  const app_config_t *cfg = (const app_config_t *)arg;
   while (true) {
+    app_config_t snapshot;
+    if (!config_get_snapshot(cfg, &snapshot)) {
+      snapshot = *cfg;
+      config_validate(&snapshot);
+    }
+    track_store_set_interval(snapshot.track_interval_s);
     gps_fix_t fix;
-    if (location_service_get(&fix) && fix.valid && fix.time_valid) {
+    bool record_allowed = ble_client_is_connected() ||
+                          snapshot.record_without_camera;
+    if (record_allowed && location_service_get(&fix) && fix.valid && fix.time_valid) {
       (void)track_store_append_fix(&fix);
     }
     vTaskDelay(pdMS_TO_TICKS(500));

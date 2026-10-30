@@ -5,8 +5,7 @@
 
 #include "wifi_web.h"
 #include "location_service.h"
-#include "cert_store.h"
-#include "test_debug.h"
+#include "track_store.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -19,49 +18,36 @@
 #include "ble_client.h"
 #include "cJSON.h"
 #include "captive_dns.h"
-#include "esp_crt_bundle.h"
-#include "esp_app_desc.h"
 #include "esp_err.h"
 #include "esp_event.h"
-#include "esp_heap_caps.h"
-#include "esp_http_client.h"
 #include "esp_http_server.h"
-#include "esp_https_server.h"
 #include "esp_log.h"
+#include "lwip/ip4_addr.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_timer.h"
 #include "gps.h"
-#include "lwip/ip4_addr.h"
-#include "mbedtls/ssl.h"
-#include "track_store.h"
-
-#ifndef FRAMENAV_EMBEDDED_TLS
-#define FRAMENAV_EMBEDDED_TLS 0
-#endif
 
 #define FRAMENAV_HTTP_MAX_CLIENTS 2
-#define FRAMENAV_HTTPS_MAX_CLIENTS 6
-// Each server owns listen, control and message sockets, plus captive DNS and
-// an outbound TLS download. Browser HTTPS preconnections need six client slots.
 #define FRAMENAV_WEB_RESERVED_SOCKETS 8
+#define FRAMENAV_WIFI_SCAN_MAX_RESULTS 32U
+#define FRAMENAV_HTTP_MAX_REQ_HDR_LEN 2048U
+// ESP-IDF uses quarter-dBm units. 66 maps to 16.5 dBm, approximately half
+// the linear transmit power of the usual 20 dBm default.
+#define FRAMENAV_WIFI_MAX_TX_POWER_QDBM 66
 
 #if ALPHALOC_WIFI_WEB
 _Static_assert(CONFIG_LWIP_MAX_SOCKETS >= FRAMENAV_HTTP_MAX_CLIENTS +
-                   FRAMENAV_HTTPS_MAX_CLIENTS + FRAMENAV_WEB_RESERVED_SOCKETS,
-               "Increase CONFIG_LWIP_MAX_SOCKETS for concurrent HTTP/HTTPS");
-#if FRAMENAV_EMBEDDED_TLS
-#ifndef CONFIG_MBEDTLS_DYNAMIC_BUFFER
-#error "Enable CONFIG_MBEDTLS_DYNAMIC_BUFFER for concurrent HTTPS on the XIAO"
-#endif
-// PEM is larger than its DER certificate message, so this also covers updates.
-_Static_assert(MBEDTLS_SSL_OUT_CONTENT_LEN >= FRAMENAV_CERT_MAX_BYTES,
-               "Increase CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN for full chains");
-#endif
+                   FRAMENAV_WEB_RESERVED_SOCKETS,
+               "Increase CONFIG_LWIP_MAX_SOCKETS for the HTTP server");
 #endif
 
 #ifndef ALPHALOC_BATTERY_MONITOR
 #define ALPHALOC_BATTERY_MONITOR 0
+#endif
+
+#ifndef ALPHALOC_GNSS_STANDBY
+#define ALPHALOC_GNSS_STANDBY 0
 #endif
 
 #if ALPHALOC_BATTERY_MONITOR
@@ -85,9 +71,10 @@ static void radio_release(void) {
 }
 
 static httpd_handle_t s_server;
-static httpd_handle_t s_https_server;
 static portMUX_TYPE s_activity_lock = portMUX_INITIALIZER_UNLOCKED;
 static int64_t s_activity_us;
+static portMUX_TYPE s_wake_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_wake_requested;
 static void web_activity(void) {
   portENTER_CRITICAL(&s_activity_lock);
   s_activity_us = esp_timer_get_time();
@@ -99,6 +86,18 @@ int64_t wifi_web_last_activity_us(void) {
   portEXIT_CRITICAL(&s_activity_lock);
   return value;
 }
+void wifi_web_request_wake(void) {
+  portENTER_CRITICAL(&s_wake_lock);
+  s_wake_requested = true;
+  portEXIT_CRITICAL(&s_wake_lock);
+}
+bool wifi_web_take_wake_request(void) {
+  portENTER_CRITICAL(&s_wake_lock);
+  bool requested = s_wake_requested;
+  s_wake_requested = false;
+  portEXIT_CRITICAL(&s_wake_lock);
+  return requested;
+}
 static esp_err_t handle_activity(httpd_req_t *req) {
   web_activity();
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -109,22 +108,11 @@ static esp_err_t handle_favicon(httpd_req_t *req) {
   httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=86400");
   return httpd_resp_send(req, NULL, 0);
 }
+
 static app_config_t *s_cfg;
 static esp_netif_t *s_netif = NULL;
 static esp_netif_t *s_netif_sta = NULL;
 static esp_netif_t *s_netif_ap = NULL;
-static const char *constellation_to_str(gps_constellation_t mask) {
-  if (mask == (GPS_CONSTELLATION_GPS | GPS_CONSTELLATION_GLONASS)) {
-    return "gps+glonass";
-  }
-  if (mask == GPS_CONSTELLATION_GPS) {
-    return "gps";
-  }
-  if (mask == GPS_CONSTELLATION_GLONASS) {
-    return "glonass";
-  }
-  return "none";
-}
 static volatile bool s_started;
 static bool s_wifi_handlers_registered = false;
 static bool s_ip_handlers_registered = false;
@@ -134,7 +122,120 @@ static int64_t s_sta_start_us = 0;
 static bool s_ap_active = false;
 static bool s_sta_has_ip = false;
 static bool s_sta_configured = false;
-static bool s_cert_update_busy = false;
+
+typedef enum {
+  WIFI_SCAN_IDLE = 0,
+  WIFI_SCAN_RUNNING,
+  WIFI_SCAN_READING,
+  WIFI_SCAN_READY,
+  WIFI_SCAN_FAILED,
+} wifi_scan_state_t;
+
+typedef struct {
+  char ssid[33];
+  int8_t rssi;
+  bool secure;
+} wifi_scan_result_t;
+
+static wifi_scan_state_t s_wifi_scan_state = WIFI_SCAN_IDLE;
+static uint16_t s_wifi_scan_result_count;
+static wifi_scan_result_t s_wifi_scan_results[FRAMENAV_WIFI_SCAN_MAX_RESULTS];
+
+static esp_err_t handle_wifi_scan_start(httpd_req_t *req) {
+  web_activity();
+  portENTER_CRITICAL(&s_radio_lock);
+  bool available = s_started && !s_radio_owned &&
+                   s_wifi_scan_state != WIFI_SCAN_RUNNING &&
+                   s_wifi_scan_state != WIFI_SCAN_READING;
+  if (available) {
+    s_wifi_scan_state = WIFI_SCAN_RUNNING;
+    s_wifi_scan_result_count = 0;
+  }
+  portEXIT_CRITICAL(&s_radio_lock);
+  if (!available) {
+    httpd_resp_set_status(req, "409 Conflict");
+    return httpd_resp_sendstr(req, "设备正忙，请稍后重试。");
+  }
+
+  wifi_scan_config_t scan_cfg = {0};
+  scan_cfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+  scan_cfg.show_hidden = false;
+  scan_cfg.scan_time.active.min = 60;
+  scan_cfg.scan_time.active.max = 120;
+  if (esp_wifi_scan_start(&scan_cfg, false) != ESP_OK) {
+    portENTER_CRITICAL(&s_radio_lock);
+    s_wifi_scan_state = WIFI_SCAN_FAILED;
+    portEXIT_CRITICAL(&s_radio_lock);
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return httpd_resp_sendstr(req, "扫描失败，请稍后重试。");
+  }
+  httpd_resp_set_status(req, "202 Accepted");
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_sendstr(req, "{\"scanning\":true}");
+}
+
+static esp_err_t handle_wifi_scan(httpd_req_t *req) {
+  web_activity();
+  wifi_scan_state_t state;
+  uint16_t count = 0;
+  wifi_scan_result_t results[FRAMENAV_WIFI_SCAN_MAX_RESULTS] = {0};
+  portENTER_CRITICAL(&s_radio_lock);
+  state = s_wifi_scan_state;
+  if (state == WIFI_SCAN_READY) {
+    count = s_wifi_scan_result_count;
+    if (count > FRAMENAV_WIFI_SCAN_MAX_RESULTS) {
+      count = FRAMENAV_WIFI_SCAN_MAX_RESULTS;
+    }
+    memcpy(results, s_wifi_scan_results, sizeof(results));
+  }
+  portEXIT_CRITICAL(&s_radio_lock);
+
+  if (state == WIFI_SCAN_RUNNING || state == WIFI_SCAN_READING) {
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(req, "{\"scanning\":true}");
+  }
+  if (state == WIFI_SCAN_IDLE) {
+    httpd_resp_set_status(req, "409 Conflict");
+    return httpd_resp_sendstr(req, "请先开始扫描。");
+  }
+  if (state == WIFI_SCAN_FAILED) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return httpd_resp_sendstr(req, "扫描失败，请重试。");
+  }
+
+  cJSON *root = cJSON_CreateObject();
+  cJSON *items = root ? cJSON_AddArrayToObject(root, "networks") : NULL;
+  if (!root || !items) {
+    cJSON_Delete(root);
+    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                               "暂时无法读取网络列表");
+  }
+  for (uint16_t i = 0; i < count; ++i) {
+    cJSON *network = cJSON_CreateObject();
+    if (!network || !cJSON_AddStringToObject(network, "ssid", results[i].ssid) ||
+        !cJSON_AddNumberToObject(network, "rssi", results[i].rssi) ||
+        !cJSON_AddBoolToObject(network, "secure", results[i].secure)) {
+      cJSON_Delete(network);
+      cJSON_Delete(root);
+      return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                 "暂时无法读取网络列表");
+    }
+    cJSON_AddItemToArray(items, network);
+  }
+  char *json = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  if (!json) {
+    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                               "暂时无法读取网络列表");
+  }
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  esp_err_t response = httpd_resp_sendstr(req, json);
+  free(json);
+  return response;
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data);
@@ -148,16 +249,7 @@ static bool start_softap(void);
 #define ALPHALOC_WIFI_RECONNECT_BACKOFF_MS 1500
 #endif
 
-#define FRAMENAV_HOSTNAME "framenav.device.igp.wiki"
-#if FRAMENAV_EMBEDDED_TLS
-#define ALPHALOC_AP_URL "https://" FRAMENAV_HOSTNAME "/"
-#else
-#define ALPHALOC_AP_URL "http://" FRAMENAV_HOSTNAME "/"
-#endif
-#define ALPHALOC_HTTP_URL "http://" FRAMENAV_HOSTNAME "/"
-#define FRAMENAV_CERT_UPDATE_URL \
-  "https://framenav.igp.wiki/download/certs.zip"
-#define FRAMENAV_CONTACT_EMAIL "sqkkyzx@outlook.com"
+#define ALPHALOC_AP_URL "http://10.254.254.1/"
 #define FRAMENAV_PAIRING_WINDOW_S 90U
 #define ALPHALOC_WIFI_ACTIVITY_HOLD_US 30000000LL
 
@@ -166,67 +258,22 @@ static esp_timer_handle_t s_fallback_timer = NULL;
 static captive_dns_handle_t s_captive_dns = NULL;
 static uint8_t s_sta_retry_count = 0;
 
-#if FRAMENAV_EMBEDDED_TLS
-extern const unsigned char framenav_server_cert[];
-extern const unsigned int framenav_server_cert_len;
-extern const unsigned char framenav_server_key[];
-extern const unsigned int framenav_server_key_len;
-#endif
-
-static tls_credentials_t s_tls_owned;
-static const uint8_t *s_tls_cert;
-static size_t s_tls_cert_len;
-static const uint8_t *s_tls_key;
-static size_t s_tls_key_len;
-
-static void tls_cert_release_owned(void) {
-  tls_credentials_free(&s_tls_owned);
-  s_tls_cert = NULL;
-  s_tls_cert_len = 0;
-  s_tls_key = NULL;
-  s_tls_key_len = 0;
-}
-
-static bool tls_cert_load(void) {
-  tls_cert_release_owned();
-  tls_credentials_t stored = {
-      .cert = malloc(FRAMENAV_CERT_MAX_BYTES + 1U),
-      .key = malloc(FRAMENAV_KEY_MAX_BYTES + 1U),
-  };
-  if (stored.cert && stored.key &&
-      cert_store_read(stored.cert, FRAMENAV_CERT_MAX_BYTES + 1U, &stored.cert_len,
-                        stored.key, FRAMENAV_KEY_MAX_BYTES + 1U, &stored.key_len)) {
-    const uint8_t *key = stored.key;
-    size_t key_size = stored.key_len + 1U;
-#if FRAMENAV_EMBEDDED_TLS
-    if (!stored.key_len) {
-      key = framenav_server_key; /* Migrate old certificate-only records. */
-      key_size = framenav_server_key_len;
-    }
-#endif
-    if (tls_credentials_validate(stored.cert, stored.cert_len + 1U,
-                                   key, key_size)) {
-      s_tls_owned = stored;
-      s_tls_cert = stored.cert;
-      s_tls_cert_len = stored.cert_len + 1U;
-      s_tls_key = key;
-      s_tls_key_len = key_size;
-      ESP_LOGI(TAG, "Using downloaded local TLS credentials");
-      return true;
-    }
+static void configure_wifi_tx_power(void) {
+  int8_t before = 0;
+  int8_t after = 0;
+  bool have_before = esp_wifi_get_max_tx_power(&before) == ESP_OK;
+  esp_err_t err = esp_wifi_set_max_tx_power(FRAMENAV_WIFI_MAX_TX_POWER_QDBM);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to limit WiFi TX power: %s", esp_err_to_name(err));
+    return;
   }
-  tls_credentials_free(&stored);
-#if FRAMENAV_EMBEDDED_TLS
-  s_tls_cert = framenav_server_cert;
-  s_tls_cert_len = framenav_server_cert_len;
-  s_tls_key = framenav_server_key;
-  s_tls_key_len = framenav_server_key_len;
-  ESP_LOGI(TAG, "Using embedded default TLS credentials");
-  return s_tls_cert_len > 0 && s_tls_key_len > 0;
-#else
-  ESP_LOGW(TAG, "No TLS certificate is available");
-  return false;
-#endif
+  if (have_before && esp_wifi_get_max_tx_power(&after) == ESP_OK) {
+    ESP_LOGI(TAG, "WiFi max TX power: %d -> %d quarter-dBm (%.1f dBm)",
+             (int)before, (int)after, (double)after / 4.0);
+  } else {
+    ESP_LOGI(TAG, "WiFi max TX power limited to %.1f dBm",
+             (double)FRAMENAV_WIFI_MAX_TX_POWER_QDBM / 4.0);
+  }
 }
 
 static bool configure_softap_network(esp_netif_t *netif) {
@@ -258,7 +305,7 @@ static bool configure_softap_network(esp_netif_t *netif) {
     return false;
   }
 
-  // RFC 8910 DHCP option 114 gives newer clients the portal URI directly.
+  // RFC 8910 DHCP option 114 gives newer clients the local HTTP address.
   // The URI string is static because ESP-IDF retains its pointer.
   err = esp_netif_dhcps_option(
       netif, ESP_NETIF_OP_SET, ESP_NETIF_CAPTIVEPORTAL_URI,
@@ -288,10 +335,6 @@ static void wifi_cleanup_resources(void) {
   if (s_server) {
     httpd_stop(s_server);
     s_server = NULL;
-  }
-  if (s_https_server) {
-    httpd_ssl_stop(s_https_server);
-    s_https_server = NULL;
   }
   if (s_reconnect_timer) {
     esp_timer_stop(s_reconnect_timer);
@@ -331,7 +374,10 @@ static void wifi_cleanup_resources(void) {
   s_sta_configured = false;
   s_sta_retry_count = 0;
   s_sta_start_us = 0;
-  tls_cert_release_owned();
+  portENTER_CRITICAL(&s_radio_lock);
+  s_wifi_scan_state = WIFI_SCAN_IDLE;
+  s_wifi_scan_result_count = 0;
+  portEXIT_CRITICAL(&s_radio_lock);
   portENTER_CRITICAL(&s_activity_lock);
   s_activity_us = 0;
   portEXIT_CRITICAL(&s_activity_lock);
@@ -358,11 +404,6 @@ static void wifi_fallback_cb(void *arg) {
 }
 
 static bool start_softap(void) {
-  app_config_t cfg;
-  if (!config_get_snapshot(s_cfg, &cfg)) {
-    cfg = *s_cfg;
-    config_validate(&cfg);
-  }
   if (!s_netif_ap) {
     s_netif_ap = esp_netif_create_default_wifi_ap();
     if (!s_netif_ap) {
@@ -374,14 +415,18 @@ static bool start_softap(void) {
     return false;
   }
   wifi_config_t wifi_cfg = {0};
-  strncpy((char *)wifi_cfg.ap.ssid, cfg.ap_ssid,
-          sizeof(wifi_cfg.ap.ssid) - 1);
+  uint8_t ap_mac[6] = {0};
+  esp_err_t err = esp_wifi_get_mac(WIFI_IF_AP, ap_mac);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to read AP MAC: %s", esp_err_to_name(err));
+    return false;
+  }
+  snprintf((char *)wifi_cfg.ap.ssid, sizeof(wifi_cfg.ap.ssid),
+           "FrameNav-%02X%02X%02X", ap_mac[3], ap_mac[4], ap_mac[5]);
   wifi_cfg.ap.ssid_len = strlen((char *)wifi_cfg.ap.ssid);
-  strncpy((char *)wifi_cfg.ap.password, cfg.ap_pass,
+  strncpy((char *)wifi_cfg.ap.password, "framenav",
           sizeof(wifi_cfg.ap.password) - 1);
-  wifi_cfg.ap.authmode = strlen((char *)wifi_cfg.ap.password) == 0
-                             ? WIFI_AUTH_OPEN
-                             : WIFI_AUTH_WPA2_PSK;
+  wifi_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
   wifi_cfg.ap.max_connection = 4;
   wifi_cfg.ap.channel = 1;
   wifi_cfg.ap.ssid_hidden = 0;
@@ -389,7 +434,7 @@ static bool start_softap(void) {
 
   // Keep the configured STA alive while the fallback AP is available. This
   // lets the device both offer local setup access and reach the Internet.
-  esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+  err = esp_wifi_set_mode(WIFI_MODE_APSTA);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to switch to AP mode: %s", esp_err_to_name(err));
     return false;
@@ -424,7 +469,7 @@ static bool start_softap(void) {
                esp_err_to_name(err));
     }
   }
-  ESP_LOGI(TAG, "AP configured: ssid=%s captive=%s", cfg.ap_ssid,
+  ESP_LOGI(TAG, "AP configured: ssid=%s captive=%s", wifi_cfg.ap.ssid,
            ALPHALOC_AP_URL);
   return true;
 }
@@ -445,6 +490,80 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     return;
   }
   if (event_base != WIFI_EVENT) {
+    return;
+  }
+
+  if (event_id == WIFI_EVENT_SCAN_DONE) {
+    portENTER_CRITICAL(&s_radio_lock);
+    bool consume_scan = s_wifi_scan_state == WIFI_SCAN_RUNNING;
+    if (consume_scan) s_wifi_scan_state = WIFI_SCAN_READING;
+    portEXIT_CRITICAL(&s_radio_lock);
+    if (!consume_scan) return;
+
+    uint16_t count = 0;
+    wifi_ap_record_t *records = NULL;
+    // This callback runs on ESP-IDF's small system-event task stack. Keep the
+    // bounded result buffer on the heap so AP start events cannot overflow it.
+    wifi_scan_result_t *results = calloc(FRAMENAV_WIFI_SCAN_MAX_RESULTS,
+                                         sizeof(*results));
+    if (!results) {
+      (void)esp_wifi_clear_ap_list();
+    }
+    uint16_t result_count = 0;
+    const wifi_event_sta_scan_done_t *done =
+        (const wifi_event_sta_scan_done_t *)event_data;
+    bool ok = results && (!done || done->status == 0) &&
+              esp_wifi_scan_get_ap_num(&count) == ESP_OK;
+    if (ok && count > 0) {
+      uint16_t capacity = count > FRAMENAV_WIFI_SCAN_MAX_RESULTS
+                              ? FRAMENAV_WIFI_SCAN_MAX_RESULTS : count;
+      records = calloc(capacity, sizeof(*records));
+      if (!records) {
+        ok = false;
+      } else {
+        count = capacity;
+        if (esp_wifi_scan_get_ap_records(&count, records) != ESP_OK) {
+          ok = false;
+        }
+      }
+    } else if (ok) {
+      (void)esp_wifi_clear_ap_list();
+    }
+    if (!ok) (void)esp_wifi_clear_ap_list();
+    if (ok) {
+      for (uint16_t i = 0; i < count && result_count < FRAMENAV_WIFI_SCAN_MAX_RESULTS;
+           ++i) {
+        char ssid[33] = {0};
+        memcpy(ssid, records[i].ssid, sizeof(ssid) - 1U);
+        if (!ssid[0]) continue;
+        bool duplicate = false;
+        for (uint16_t j = 0; j < result_count; ++j) {
+          if (strcmp(results[j].ssid, ssid) == 0) {
+            duplicate = true;
+            break;
+          }
+        }
+        if (duplicate) continue;
+        snprintf(results[result_count].ssid, sizeof(results[result_count].ssid),
+                 "%s", ssid);
+        results[result_count].rssi = records[i].rssi;
+        results[result_count].secure = records[i].authmode != WIFI_AUTH_OPEN;
+        ++result_count;
+      }
+    }
+    free(records);
+
+    portENTER_CRITICAL(&s_radio_lock);
+    if (ok) {
+      memcpy(s_wifi_scan_results, results, sizeof(s_wifi_scan_results));
+      s_wifi_scan_result_count = result_count;
+      s_wifi_scan_state = WIFI_SCAN_READY;
+    } else {
+      s_wifi_scan_result_count = 0;
+      s_wifi_scan_state = WIFI_SCAN_FAILED;
+    }
+    portEXIT_CRITICAL(&s_radio_lock);
+    free(results);
     return;
   }
 
@@ -726,14 +845,130 @@ static bool format_track_time(uint32_t timestamp_utc, int16_t tz_offset_min,
   time_t local_time = (time_t)local_seconds;
   struct tm civil;
   if (!gmtime_r(&local_time, &civil)) return false;
-  const char sign = offset_min < 0 ? '-' : '+';
-  const int abs_offset = offset_min < 0 ? -offset_min : offset_min;
   int written = snprintf(out, out_len,
-                         "%04d-%02d-%02d %02d:%02d:%02d（UTC%c%02d:%02d）",
+                         "%04d-%02d-%02d %02d:%02d:%02d",
                          civil.tm_year + 1900, civil.tm_mon + 1, civil.tm_mday,
-                         civil.tm_hour, civil.tm_min, civil.tm_sec, sign,
-                         abs_offset / 60, abs_offset % 60);
+                         civil.tm_hour, civil.tm_min, civil.tm_sec);
   return written > 0 && (size_t)written < out_len;
+}
+
+static esp_err_t send_json(httpd_req_t *req, cJSON *root) {
+  if (!root) {
+    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                               "暂时无法读取设备数据");
+  }
+  char *json = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  if (!json) {
+    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                               "暂时无法读取设备数据");
+  }
+  httpd_resp_set_type(req, "application/json; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  esp_err_t response = httpd_resp_sendstr(req, json);
+  free(json);
+  return response;
+}
+
+static esp_err_t handle_config(httpd_req_t *req) {
+  web_activity();
+  app_config_t cfg;
+  if (!config_get_snapshot(s_cfg, &cfg)) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return httpd_resp_sendstr(req, "设备正忙，请稍后重试。");
+  }
+  cJSON *root = cJSON_CreateObject();
+  if (!root) return send_json(req, NULL);
+#define ADD_CONFIG_STRING(name, value) \
+  do { if (!cJSON_AddStringToObject(root, name, value)) goto no_memory; } while (0)
+#define ADD_CONFIG_NUMBER(name, value) \
+  do { if (!cJSON_AddNumberToObject(root, name, value)) goto no_memory; } while (0)
+  ADD_CONFIG_STRING("cam_name", cfg.camera_name_prefix);
+  ADD_CONFIG_STRING("cam_mac", cfg.camera_mac_prefix);
+  ADD_CONFIG_STRING("wifi_ssid", cfg.wifi_ssid);
+  ADD_CONFIG_NUMBER("tz", cfg.tz_offset_min);
+  ADD_CONFIG_NUMBER("dst", cfg.dst_offset_min);
+  ADD_CONFIG_NUMBER("max_gps_age", cfg.max_gps_age_s);
+  ADD_CONFIG_NUMBER("phone_ttl_h", cfg.phone_location_ttl_hours);
+  ADD_CONFIG_NUMBER("fixed_prio", cfg.fixed_location_priority);
+  ADD_CONFIG_NUMBER("fixed_delete", cfg.fixed_location_delete_policy);
+  ADD_CONFIG_NUMBER("gnss_idle", cfg.gnss_without_camera);
+  ADD_CONFIG_NUMBER("track_idle", cfg.record_without_camera);
+  ADD_CONFIG_NUMBER("track_int_s", cfg.track_interval_s);
+  ADD_CONFIG_NUMBER("wifi_idle_s", cfg.wifi_idle_timeout_s);
+  ADD_CONFIG_NUMBER("ble_mode", cfg.bluetooth_power_mode);
+  ADD_CONFIG_NUMBER("ble_boot", cfg.custom_ble_boot_fast_search_s);
+  ADD_CONFIG_NUMBER("ble_period", (double)cfg.custom_ble_scan_period_ms / 1000.0);
+  ADD_CONFIG_NUMBER("ble_window", cfg.custom_ble_scan_window_ms);
+#undef ADD_CONFIG_STRING
+#undef ADD_CONFIG_NUMBER
+  return send_json(req, root);
+
+no_memory:
+#undef ADD_CONFIG_STRING
+#undef ADD_CONFIG_NUMBER
+  cJSON_Delete(root);
+  return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                             "暂时无法读取设备配置");
+}
+
+static esp_err_t handle_storage(httpd_req_t *req) {
+  web_activity();
+  track_store_status_t status = {0};
+  (void)track_store_get_status(&status);
+  cJSON *root = cJSON_CreateObject();
+  if (!root) return send_json(req, NULL);
+  if (!cJSON_AddBoolToObject(root, "available", status.available) ||
+      !cJSON_AddNumberToObject(root, "capacity_bytes", status.capacity_bytes) ||
+      !cJSON_AddNumberToObject(root, "used_bytes", status.used_bytes) ||
+      !cJSON_AddNumberToObject(root, "record_count", status.record_count)) {
+    cJSON_Delete(root);
+    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                               "暂时无法读取存储信息");
+  }
+  return send_json(req, root);
+}
+
+static esp_err_t handle_bonds(httpd_req_t *req) {
+  web_activity();
+  ble_client_bond_t bonds[BLE_CLIENT_MAX_BONDS] = {0};
+  int count = ble_client_get_bonds(bonds, BLE_CLIENT_MAX_BONDS);
+  if (count < 0) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return httpd_resp_sendstr(req, "暂时无法读取已配对设备。");
+  }
+  cJSON *root = cJSON_CreateObject();
+  cJSON *items = root ? cJSON_AddArrayToObject(root, "bonds") : NULL;
+  if (!root || !items) {
+    cJSON_Delete(root);
+    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                               "暂时无法读取已配对设备");
+  }
+  for (int i = 0; i < count && i < BLE_CLIENT_MAX_BONDS; ++i) {
+    char mac[18];
+    char token[13];
+    snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+             bonds[i].addr[5], bonds[i].addr[4], bonds[i].addr[3],
+             bonds[i].addr[2], bonds[i].addr[1], bonds[i].addr[0]);
+    snprintf(token, sizeof(token), "%02X%02X%02X%02X%02X%02X",
+             bonds[i].addr[5], bonds[i].addr[4], bonds[i].addr[3],
+             bonds[i].addr[2], bonds[i].addr[1], bonds[i].addr[0]);
+    cJSON *item = cJSON_CreateObject();
+    if (!item ||
+        !cJSON_AddStringToObject(item, "name",
+                                 bonds[i].name[0] ? bonds[i].name : "未命名设备") ||
+        !cJSON_AddStringToObject(item, "mac", mac) ||
+        !cJSON_AddStringToObject(item, "token", token) ||
+        !cJSON_AddNumberToObject(item, "type", bonds[i].addr_type) ||
+        !cJSON_AddBoolToObject(item, "connected", bonds[i].connected)) {
+      cJSON_Delete(item);
+      cJSON_Delete(root);
+      return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                 "暂时无法读取已配对设备");
+    }
+    cJSON_AddItemToArray(items, item);
+  }
+  return send_json(req, root);
 }
 
 static esp_err_t handle_location(httpd_req_t *req) {
@@ -741,84 +976,76 @@ static esp_err_t handle_location(httpd_req_t *req) {
   app_config_t cfg;
   if (!config_get_snapshot(s_cfg, &cfg)) {
     httpd_resp_set_status(req, "503 Service Unavailable");
-    return httpd_resp_sendstr(req, "Configuration busy");
+    return httpd_resp_sendstr(req, "设备正忙，请稍后重试。");
   }
   gps_fix_t fix = {0};
   location_source_t source = LOCATION_NONE;
   uint32_t observed = 0;
   bool valid = location_service_details(&fix, &source, &observed);
-  char coordinates[96] = "—", altitude[48] = "—", time_text[96] = "—", age[48] = "—";
-  const char *label = "无有效定位";
-  const char *time_label = "定位时间";
+  char coordinates[64] = "—", time_text[96] = "—";
+  const char *label = "—";
   if (valid && isfinite(fix.lat_deg) && isfinite(fix.lon_deg)) {
-    int64_t seconds = (esp_timer_get_time() - fix.last_fix_time_us) / 1000000;
-    snprintf(coordinates, sizeof(coordinates), "经度 %.6f，纬度 %.6f（WGS-84）", fix.lon_deg, fix.lat_deg);
-    if (fix.altitude_valid && isfinite(fix.altitude_m))
-      snprintf(altitude, sizeof(altitude), "%.1f 米", fix.altitude_m);
-    else snprintf(altitude, sizeof(altitude), "未提供");
-    snprintf(age, sizeof(age), "%lld 秒前", (long long)seconds);
+    label = source == LOCATION_PHONE ? "固定位置" :
+            source == LOCATION_GNSS ? "卫星" : "—";
+    snprintf(coordinates, sizeof(coordinates), "%.6f, %.6f",
+             fix.lat_deg, fix.lon_deg);
     if (observed) format_track_time(observed, cfg.tz_offset_min, cfg.dst_offset_min, time_text, sizeof(time_text));
-    label = source == LOCATION_PHONE ? "手机位置（手动获取）" : "GNSS 卫星定位";
   } else valid = false;
   phone_location_status_t phone;
   location_service_phone_status(&phone);
-  char phone_coordinates[96] = "—", phone_accuracy[48] = "—";
-  char phone_time[96] = "—", phone_remaining[96] = "—";
+  gps_status_t gps_status = {0};
+  (void)gps_get_status(&gps_status);
+  char phone_coordinates[64] = "—", phone_remaining[48] = "—";
   if (phone.present) {
-    snprintf(phone_coordinates, sizeof(phone_coordinates), "经度 %.6f，纬度 %.6f（WGS-84）",
-               phone.longitude, phone.latitude);
-    snprintf(phone_accuracy, sizeof(phone_accuracy), "约 %.0f 米", phone.accuracy_m);
-    format_track_time(phone.captured_utc, cfg.tz_offset_min, cfg.dst_offset_min,
-                        phone_time, sizeof(phone_time));
+    snprintf(phone_coordinates, sizeof(phone_coordinates), "%.6f, %.6f",
+             phone.latitude, phone.longitude);
   }
-  if (phone.available)
-    snprintf(phone_remaining, sizeof(phone_remaining), "%u 小时 %u 分 %u 秒",
+  if (phone.available) {
+    if (phone.remaining_s < 60) {
+      snprintf(phone_remaining, sizeof(phone_remaining), "不足 1 分钟");
+    } else if (phone.remaining_s < 3600) {
+      snprintf(phone_remaining, sizeof(phone_remaining), "%u 分钟",
+               (unsigned)((phone.remaining_s + 59) / 60));
+    } else {
+      snprintf(phone_remaining, sizeof(phone_remaining), "%u 小时 %u 分",
                (unsigned)(phone.remaining_s / 3600),
-               (unsigned)(phone.remaining_s / 60 % 60), (unsigned)(phone.remaining_s % 60));
-  char json[2048];
+               (unsigned)(phone.remaining_s / 60 % 60));
+    }
+  }
+  char json[768];
   int len = snprintf(json, sizeof(json),
-      "{\"status\":\"%s\",\"source\":\"%s\",\"coordinates\":\"%s\",\"altitude\":\"%s\","
-      "\"time\":\"%s\",\"timeLabel\":\"%s\",\"age\":\"%s\","
-      "\"phoneStatus\":\"%s\",\"phoneCoordinates\":\"%s\",\"phoneAccuracy\":\"%s\","
-      "\"phoneTime\":\"%s\",\"phoneRemaining\":\"%s\"}",
-      valid ? "有效" : "无有效定位（尚未获取或已过期）", label, coordinates, altitude,
-      time_text, time_label, age,
-      phone.available ? "有效" : phone.present ? "已过期，请重新获取" : "尚未获取",
-      phone_coordinates, phone_accuracy, phone_time, phone_remaining);
+      "{\"status\":\"%s\",\"source\":\"%s\",\"coordinates\":\"%s\","
+      "\"time\":\"%s\",\"phoneStatus\":\"%s\",\"phoneCoordinates\":\"%s\","
+      "\"phoneRemaining\":\"%s\",\"satellites\":%u,"
+      "\"satellitesVisible\":%u,\"gnss\":\"%s\"}",
+      valid ? "已定位" : "暂不可用", label, coordinates, time_text,
+      phone.clock_pending ? "等待校时" :
+          phone.available ? "已保存" : phone.present ? "已过期" : "尚未设置",
+      phone_coordinates, phone_remaining, (unsigned)gps_status.satellites,
+      (unsigned)gps_status.satellites_visible,
+      gps_status.has_lock ? "已定位" :
+          gps_status.search_state == GPS_SEARCH_PAUSED ? "已暂停搜星" :
+          gps_status.search_state == GPS_SEARCH_WAKING ? "正在恢复" :
+          gps_status.search_state == GPS_SEARCH_ACTIVE ? "搜索中" : "状态未知");
   if (len < 0 || (size_t)len >= sizeof(json))
-    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Status too large");
+    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                               "暂时无法读取定位信息");
   httpd_resp_set_type(req, "application/json; charset=utf-8");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   return httpd_resp_send(req, json, len);
 }
 
 static void wifi_page_state(char *dot_class, size_t dot_len, char *state,
-                            size_t state_len, char *address,
-                            size_t address_len) {
-  if (!dot_class || !state || !address || dot_len == 0 || state_len == 0 ||
-      address_len == 0) {
+                            size_t state_len) {
+  if (!dot_class || !state || dot_len == 0 || state_len == 0) {
     return;
   }
   const char *dot = s_sta_has_ip ? "dot-green" :
                     (s_ap_active ? "dot-blue" : "dot-yellow");
-  const char *text = s_sta_has_ip
-                         ? (s_ap_active ? "已连接外部 Wi‑Fi，同时保留设备热点"
-                                        : "已连接外部 Wi‑Fi")
-                         : (s_ap_active ? "设备热点已开启，正在等待外部 Wi‑Fi"
-                                        : "正在连接外部 Wi‑Fi");
+  const char *text = s_sta_has_ip ? "已连外部网络" :
+                     (s_ap_active ? "热点已开启" : "正在连接");
   snprintf(dot_class, dot_len, "%s", dot);
   snprintf(state, state_len, "%s", text);
-  snprintf(address, address_len, "未分配");
-  if (s_sta_has_ip && s_netif_sta) {
-    esp_netif_ip_info_t ip_info = {0};
-    if (esp_netif_get_ip_info(s_netif_sta, &ip_info) == ESP_OK &&
-        ip_info.ip.addr != 0) {
-      ip4_addr_t lwip_ip = {.addr = ip_info.ip.addr};
-      (void)ip4addr_ntoa_r(&lwip_ip, address, (int)address_len);
-    }
-  } else if (s_ap_active) {
-    snprintf(address, address_len, "10.254.254.1（设备热点）");
-  }
 }
 
 static esp_err_t handle_root(httpd_req_t *req) {
@@ -832,53 +1059,30 @@ static esp_err_t handle_root(httpd_req_t *req) {
   char *page = malloc(page_len);
   if (!page) {
     return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                               "No memory");
+                               "页面暂时无法打开，请稍后重试");
   }
   gps_status_t gps_status = {0};
-  const char *gps_const_str = "未知星座";
-  if (gps_get_status(&gps_status)) {
-    gps_const_str = constellation_to_str(gps_status.constellations);
-  }
+  (void)gps_get_status(&gps_status);
   bool cam_connected = ble_client_is_connected();
   bool cam_bonded = ble_client_is_bonded();
   const char *cam_dot_class =
       cam_connected ? (cam_bonded ? "dot-green" : "dot-blue") : "dot-red";
   const char *cam_conn_str = cam_connected ? "已连接" : "未连接";
-  const char *cam_bond_str = cam_bonded ? "已配对" : "未完成配对";
-  const char *gps_dot_class = gps_status.has_lock ? "dot-green" : "dot-red";
-  const char *gps_lock_str = gps_status.has_lock ? "定位有效" : "等待定位";
+  const char *gps_dot_class = gps_status.has_lock ? "dot-green" :
+      gps_status.search_state == GPS_SEARCH_PAUSED ? "dot-gray" :
+      gps_status.search_state == GPS_SEARCH_WAKING ? "dot-blue" : "dot-yellow";
+  const char *gps_lock_str = gps_status.has_lock ? "已定位" :
+      gps_status.search_state == GPS_SEARCH_PAUSED ? "已暂停搜星" :
+      gps_status.search_state == GPS_SEARCH_WAKING ? "正在恢复" : "搜索中";
   char wifi_dot_class[16];
   char wifi_state[96];
-  char wifi_address[64];
   wifi_page_state(wifi_dot_class, sizeof(wifi_dot_class), wifi_state,
-                  sizeof(wifi_state), wifi_address, sizeof(wifi_address));
-  const esp_app_desc_t *app_desc = esp_app_get_description();
-  const char *firmware_version =
-      app_desc && app_desc->version[0] ? app_desc->version : "未知";
-  track_store_status_t track_status = {0};
-  char track_usage[96] = "不可用";
-  char track_earliest[96] = "暂无记录";
-  if (track_store_get_status(&track_status)) {
-    const double used_kib = (double)track_status.used_bytes / 1024.0;
-    const double capacity_kib = (double)track_status.capacity_bytes / 1024.0;
-    const double percent = track_status.capacity_bytes
-                               ? (double)track_status.used_bytes * 100.0 /
-                                     (double)track_status.capacity_bytes
-                               : 0.0;
-    snprintf(track_usage, sizeof(track_usage),
-             "%.1f / %.0f KiB（%.1f%%）· %u 条", used_kib, capacity_kib,
-             percent, (unsigned)track_status.record_count);
-    if (track_status.earliest_timestamp_utc != 0) {
-      (void)format_track_time(track_status.earliest_timestamp_utc,
-                              cfg.tz_offset_min, cfg.dst_offset_min,
-                              track_earliest, sizeof(track_earliest));
-    }
-  }
+                  sizeof(wifi_state));
 #if ALPHALOC_BATTERY_MONITOR
   battery_status_t bat = {0};
   bool bat_ok = battery_get_status(&bat) && bat.valid;
   const char *bat_dot_class = "dot-gray";
-  char bat_text[64] = "电池：未知";
+  char bat_text[64] = "电量：—";
   if (bat_ok) {
     if (bat.percent > 50.0f) {
       bat_dot_class = "dot-green";
@@ -887,18 +1091,27 @@ static esp_err_t handle_root(httpd_req_t *req) {
     } else {
       bat_dot_class = "dot-red";
     }
-    snprintf(bat_text, sizeof(bat_text), "电池：%.0f%%（%.2fV）",
-             (double)bat.percent, (double)bat.voltage_v);
+    snprintf(bat_text, sizeof(bat_text), "电量：%.0f%%",
+             (double)bat.percent);
   }
 #endif
   char camera_name[CONFIG_STR_MAX_32 * 6];
   char camera_mac[CONFIG_STR_MAX_18 * 6];
   char wifi_ssid[CONFIG_STR_MAX_32 * 6];
-  char ap_ssid[CONFIG_STR_MAX_32 * 6];
   html_escape_attr(camera_name, sizeof(camera_name), cfg.camera_name_prefix);
   html_escape_attr(camera_mac, sizeof(camera_mac), cfg.camera_mac_prefix);
   html_escape_attr(wifi_ssid, sizeof(wifi_ssid), cfg.wifi_ssid);
-  html_escape_attr(ap_ssid, sizeof(ap_ssid), cfg.ap_ssid);
+  track_store_status_t storage = {0};
+  bool storage_available = track_store_get_status(&storage);
+  char storage_count[24] = "不可用";
+  char storage_used[64] = "不可用";
+  if (storage_available) {
+    snprintf(storage_count, sizeof(storage_count), "%u",
+             (unsigned)storage.record_count);
+    snprintf(storage_used, sizeof(storage_used), "%.1f KB / %.1f KB",
+             (double)storage.used_bytes / 1024.0,
+             (double)storage.capacity_bytes / 1024.0);
+  }
 
   ble_client_bond_t bonds[BLE_CLIENT_MAX_BONDS] = {0};
   int bond_count = ble_client_get_bonds(bonds, BLE_CLIENT_MAX_BONDS);
@@ -907,45 +1120,45 @@ static esp_err_t handle_root(httpd_req_t *req) {
   if (!bonds_html) {
     free(page);
     return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                               "No memory");
+                               "页面暂时无法打开，请稍后重试");
   }
   size_t bonds_used = 0;
   bonds_html[0] = '\0';
   if (bond_count < 0) {
     bonds_used = (size_t)snprintf(
         bonds_html, bonds_html_len,
-        "<p class=\"muted\">暂时无法读取配对记录，请稍后刷新。</p>");
+        "<p class=\"muted\">暂时无法读取设备列表，请稍后刷新。</p>");
   } else if (bond_count == 0) {
     bonds_used = (size_t)snprintf(
         bonds_html, bonds_html_len,
-        "<p class=\"muted\">尚未保存任何相机配对记录。</p>");
+        "<p class=\"muted\">还没有添加设备。</p>");
   } else {
     for (int i = 0; i < bond_count && bonds_used < bonds_html_len; ++i) {
-      char mac[18];
       char token[13];
-      snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+      char mac[18];
+      snprintf(token, sizeof(token), "%02X%02X%02X%02X%02X%02X",
                bonds[i].addr[5], bonds[i].addr[4], bonds[i].addr[3],
                bonds[i].addr[2], bonds[i].addr[1], bonds[i].addr[0]);
-      snprintf(token, sizeof(token), "%02X%02X%02X%02X%02X%02X",
+      snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
                bonds[i].addr[5], bonds[i].addr[4], bonds[i].addr[3],
                bonds[i].addr[2], bonds[i].addr[1], bonds[i].addr[0]);
       const char *raw_name = bonds[i].name[0] != '\0'
                                  ? bonds[i].name
-                                 : "未识别的 Sony 相机";
+                                 : "未命名设备";
       char display_name[BLE_CLIENT_CAMERA_NAME_MAX * 6];
       html_escape_attr(display_name, sizeof(display_name), raw_name);
       int n = snprintf(
           bonds_html + bonds_used, bonds_html_len - bonds_used,
           "<div class=\"bond\"><div><strong>%s</strong>"
-          "<small>%s · 地址类型 %u%s</small></div>"
+          "<small>%s · MAC %s</small></div>"
           "<form class=\"inline\" method=\"POST\" action=\"/bond/delete\">"
           "<input type=\"hidden\" name=\"bond\" value=\"%s\">"
           "<input type=\"hidden\" name=\"type\" value=\"%u\">"
           "<button class=\"danger\" type=\"submit\" "
-          "onclick=\"return confirm('确定解除这台相机的本机配对记录？')\">"
-          "解除配对</button></form></div>",
-          display_name, mac, (unsigned)bonds[i].addr_type,
-          bonds[i].connected ? " · 当前连接" : "", token,
+          "onclick=\"return confirm('确定移除该设备？')\">"
+          "移除</button></form></div>",
+          display_name,
+          bonds[i].connected ? "正在使用" : "已添加", mac, token,
           (unsigned)bonds[i].addr_type);
       if (n < 0 || (size_t)n >= bonds_html_len - bonds_used) {
         bonds_html[bonds_html_len - 1] = '\0';
@@ -955,15 +1168,10 @@ static esp_err_t handle_root(httpd_req_t *req) {
     }
   }
 
-  uint32_t pairing_left = ble_client_pairing_seconds_remaining();
-  char pairing_state[128];
-  if (pairing_left > 0) {
-    snprintf(pairing_state, sizeof(pairing_state),
-             "新相机配对模式已开启，剩余约 %u 秒。请同时在相机菜单中进入配对。",
-             (unsigned)pairing_left);
-  } else {
-    snprintf(pairing_state, sizeof(pairing_state),
-             "配对模式未开启。已有相机会继续按省电策略自动重连。");
+  char pairing_notice[96] = "";
+  if (ble_client_pairing_seconds_remaining() > 0) {
+    snprintf(pairing_notice, sizeof(pairing_notice),
+             "<p class=\"hint\">请在设备上确认配对</p>");
   }
 
   bluetooth_power_policy_t bluetooth_policy;
@@ -979,43 +1187,42 @@ static esp_err_t handle_root(httpd_req_t *req) {
       "<title>帧迹 FrameNav</title><style>"
       "*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
       "margin:0 auto;padding:20px;max-width:720px;color:#17231c;background:#eef3ef}"
-      ".brand{font-size:27px;font-weight:780}.brand span{color:#257149}.tagline,.muted,small,.hint{color:#66736b}"
-      ".tagline{margin:4px 0 16px}.card{background:#fff;border:1px solid #d7dfd9;border-radius:15px;"
+      ".brand{font-size:27px;font-weight:780}.brand span{color:#257149}.muted,small,.hint{color:#66736b}.phone-location{font-size:13px}"
+      ".card{background:#fff;border:1px solid #d7dfd9;border-radius:8px;"
       "padding:18px;margin:13px 0;box-shadow:0 3px 14px rgba(20,50,30,.05)}"
-      "h2{font-size:18px;margin:0 0 5px}h3{font-size:14px;margin:18px 0 8px}.caption{font-size:12px;color:#718078;margin:0 0 14px}"
+      "h2{font-size:18px;margin:0 0 5px}h3{font-size:14px;margin:18px 0 8px}"
       ".statusbar{display:flex;flex-wrap:wrap;gap:9px 15px;font-size:13px}.statusitem{display:flex;align-items:center;gap:6px}"
       ".dot{width:9px;height:9px;flex-shrink:0;border-radius:50%%}.dot-green{background:#2e9a55}.dot-red{background:#d9534f}"
       ".location-status .statusitem{min-width:0;max-width:100%%;line-height:1.5}"
       ".location-status .statusitem>span:last-child{min-width:0;overflow-wrap:anywhere}"
       ".dot-blue{background:#2f6fdb}.dot-yellow{background:#f0b429}.dot-gray{background:#9aa3af}"
       "label.field{display:block;margin:13px 0 5px;font-weight:650;font-size:13px}"
-      "input.text,select{width:100%%;padding:10px;border:1px solid #cbd6ce;border-radius:9px;background:#fff;color:#17231c}"
-      "input:disabled{opacity:.62}button{padding:10px 14px;border:0;border-radius:9px;background:#257149;color:#fff;font-weight:700;white-space:nowrap;flex-shrink:0}"
+      "input.text,select{width:100%%;padding:10px;border:1px solid #cbd6ce;border-radius:8px;background:#fff;color:#17231c}"
+      "input:disabled{opacity:.62}button{padding:10px 14px;border:0;border-radius:8px;background:#257149;color:#fff;font-weight:700;white-space:nowrap;flex-shrink:0}"
       ".danger{background:#bd3e3e}.secondary{background:#34463b}.bond{display:flex;justify-content:space-between;gap:10px;"
       "align-items:center;padding:11px 0;border-top:1px solid #e6ece8}.bond small{display:block;margin-top:3px}"
-      ".inline{margin:0;flex-shrink:0}.bond>div{min-width:0;overflow-wrap:anywhere}.inline input{display:none}.hint{font-size:12px;line-height:1.55}.grid{display:grid;grid-template-columns:1fr 1fr;gap:11px}"
-      ".modes{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.mode{display:flex;gap:8px;border:1px solid #d4ddd7;"
-      "border-radius:10px;padding:10px;font-size:12px}.mode input{margin-top:2px}.mode strong{display:block;font-size:13px;margin-bottom:3px}"
-      ".mode span span{display:block;color:#6c7971;line-height:1.4}details{margin-top:12px;border-top:1px solid #e2e8e4;padding-top:12px}"
-      "summary{font-weight:700;font-size:13px;cursor:pointer}.summary-state{float:right;color:#77847c;font-weight:500}"
-      ".rule{font-size:12px;line-height:1.55;background:#f0f6f2;border-radius:9px;padding:10px;margin:12px 0}"
+      ".inline{margin:0;flex-shrink:0}.bond>div{min-width:0;overflow-wrap:anywhere}.inline input{display:none}.hint{font-size:12px;line-height:1.55}.grid{display:grid;grid-template-columns:1fr 1fr;gap:11px}.no-camera-settings{grid-template-columns:repeat(3,minmax(0,1fr))}"
+      ".wifi-picker{display:flex;align-items:center;gap:8px}.wifi-picker select{flex:1;min-width:0}.wifi-picker button{flex-shrink:0}"
+      ".manual-location{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;gap:8px;align-items:end}.manual-location>div{min-width:0}.manual-location .field{margin:0 0 5px}.manual-location button{padding:10px 4px;font-size:12px}"
+      ".modes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.mode{display:flex;gap:8px;border:1px solid #d4ddd7;"
+      "border-radius:8px;padding:10px;font-size:12px}.mode input{margin-top:2px}.mode strong{display:block;font-size:13px;margin-bottom:3px}"
+      "details{margin-top:12px;border-top:1px solid #e2e8e4;padding-top:12px}"
       ".unit{display:flex;align-items:center;gap:7px}.unit input{flex:1}.unit span{font-size:12px;color:#68756d;white-space:nowrap}"
-      ".divider{height:1px;background:#e2e8e4;margin:18px 0}.savebar{display:flex;justify-content:space-between;align-items:center;gap:12px;"
-      "margin:15px 0}.savebar .hint{margin:0}footer{font-size:12px;color:#66736b;margin:18px 2px}a{color:#257149}"
-      "@media(max-width:520px){body{padding:12px}.grid,.modes{grid-template-columns:1fr}.bond{align-items:flex-start}}"
+      ".savebar{display:flex;justify-content:flex-end;align-items:center;gap:12px;margin:15px 0}"
+      "@media(max-width:520px){body{padding:12px}.grid,.no-camera-settings{grid-template-columns:1fr}.bond{align-items:flex-start}}"
       "</style></head><body><div class=\"brand\">帧迹 <span>FrameNav</span></div>"
-      "<p class=\"tagline\">独立相机定位设备</p><form id=\"settings\" method=\"POST\" action=\"/save\"></form>"
+      "<form id=\"settings\" method=\"POST\" action=\"/save\"></form>"
       "<section class=\"card\"><h2>运行状态</h2><div class=\"statusbar\">"
-      "<div class=\"statusitem\"><span class=\"dot %s\"></span><span>GNSS：%s · %u 颗卫星 · %s</span></div>"
-      "<div class=\"statusitem\"><span class=\"dot %s\"></span><span>相机：%s · %s</span></div>"
-      "<div class=\"statusitem\"><span class=\"dot %s\"></span><span>Wi‑Fi：%s · 地址 %s</span></div>"
-      "<div class=\"statusitem\"><span class=\"dot dot-gray\"></span><span>固件版本：%s</span></div>"
-      "<div class=\"statusitem\"><span class=\"dot dot-gray\"></span><span>轨迹数据：%s</span></div>"
-      "<div class=\"statusitem\"><span class=\"dot dot-gray\"></span><span>最早记录：%s</span></div>",
-      gps_dot_class, gps_lock_str, (unsigned)gps_status.satellites,
-      gps_const_str, cam_dot_class, cam_conn_str, cam_bond_str,
-      wifi_dot_class, wifi_state, wifi_address, firmware_version, track_usage,
-      track_earliest);
+      "<div class=\"statusitem\"><span id=\"loc-running-gnss-dot\" class=\"dot %s\"></span><span>卫星定位：<span id=\"loc-running-gnss\">%s</span></span></div>"
+      "<div class=\"statusitem\"><span class=\"dot %s\"></span><span>设备：%s</span></div>"
+      "<div class=\"statusitem\"><span class=\"dot %s\"></span><span>Wi‑Fi：%s</span></div>",
+      gps_dot_class, gps_lock_str, cam_dot_class, cam_conn_str,
+      wifi_dot_class, wifi_state);
+  ok = ok && page_send(
+      req, page, page_len,
+      "<div class=\"statusitem\"><span class=\"dot dot-gray\"></span><span>搜到卫星：<span id=\"loc-running-satellites-visible\">%u</span> 颗 · 定位使用：<span id=\"loc-running-satellites\">%u</span> 颗</span></div>",
+      (unsigned)gps_status.satellites_visible,
+      (unsigned)gps_status.satellites);
 #if ALPHALOC_BATTERY_MONITOR
   ok = ok && page_send(req, page, page_len,
                          "<div class=\"statusitem\"><span class=\"dot %s\"></span><span>%s</span></div>",
@@ -1026,71 +1233,62 @@ static esp_err_t handle_root(httpd_req_t *req) {
       "</div></section><section class=\"card\"><h2>当前定位</h2>"
       "<div class=\"statusbar location-status\">"
       "<div class=\"statusitem\"><span id=\"loc-dot\" class=\"dot dot-gray\"></span><span>状态：<span id=\"loc-status\">读取中…</span></span></div>"
-      "<div class=\"statusitem\"><span class=\"dot dot-gray\"></span><span>定位来源：<span id=\"loc-source\">—</span></span></div>"
+      "<div class=\"statusitem\"><span class=\"dot dot-gray\"></span><span>来源：<span id=\"loc-source\">—</span></span></div>"
       "<div class=\"statusitem\"><span class=\"dot dot-gray\"></span><span>坐标：<span id=\"loc-coordinates\">—</span></span></div>"
-      "<div class=\"statusitem\"><span class=\"dot dot-gray\"></span><span>海拔：<span id=\"loc-altitude\">—</span></span></div>"
-      "<div class=\"statusitem\"><span class=\"dot dot-gray\"></span><span><span id=\"loc-timeLabel\">定位时间</span>：<span id=\"loc-time\">—</span></span></div>"
-      "<div class=\"statusitem\"><span class=\"dot dot-gray\"></span><span>观测距今：<span id=\"loc-age\">—</span></span></div></div>"
-      "<details><summary>定位显示说明</summary><p class=\"hint\">每 3 秒刷新，不触发额外定位查询。显示设备当前选用的位置，不代表相机已写入 EXIF。"
-      "时间按所选时区显示；手机位置的获取时间保持不变，相机时间会继续前进。</p></details></section>"
-      "<section class=\"card\"><h2>连接设置</h2>"
-      "<p class=\"caption\">管理相机配对和配置页网络。</p><h3>相机配对</h3>");
+      "<div class=\"statusitem\"><span class=\"dot dot-gray\"></span><span>时间：<span id=\"loc-time\">—</span></span></div></div></section>"
+      "<section class=\"card\"><h2>连接设置</h2><h3>已配对设备</h3>");
   ok = ok && page_send(req, page, page_len, "%s", bonds_html);
   ok = ok && page_send(
       req, page, page_len,
-      "<p class=\"hint\">%s</p><form method=\"POST\" action=\"/pair/start\">"
-      "<button class=\"secondary\" type=\"submit\">配对新相机（90 秒）</button></form>"
-      "<details><summary>新配对筛选规则</summary><div class=\"rule\">只在手动开始新配对时生效；一般保持为空。</div>"
-      "<label class=\"field\">相机名称前缀</label><input class=\"text\" form=\"settings\" name=\"cam_name\" value=\"%s\" "
-      "placeholder=\"留空：接受所有受支持的 Sony 相机\">"
-      "<label class=\"field\">相机 MAC 前缀</label><input class=\"text\" form=\"settings\" name=\"cam_mac\" value=\"%s\" placeholder=\"通常留空\"></details>"
-      "<details><summary>Wi‑Fi 高级配置</summary><h3>接入现有 Wi‑Fi（仅 2.4 GHz）</h3>"
-      "<label class=\"field\">Wi‑Fi 名称</label><input class=\"text\" form=\"settings\" name=\"wifi_ssid\" value=\"%s\">"
-      "<label class=\"field\">Wi‑Fi 密码</label><input class=\"text\" form=\"settings\" type=\"password\" name=\"wifi_pass\" placeholder=\"留空则保持当前密码\">"
-      "<h3>设备备用热点</h3><label class=\"field\">热点名称</label>"
-      "<input class=\"text\" form=\"settings\" name=\"ap_ssid\" value=\"%s\">"
-      "<label class=\"field\">热点密码</label><input class=\"text\" form=\"settings\" type=\"password\" name=\"ap_pass\" placeholder=\"留空则保持当前密码\">"
-      "<label class=\"field\">USB 插入后无设备接入自动关闭</label><select class=\"text\" form=\"settings\" name=\"wifi_idle_s\">"
+      "%s<form method=\"POST\" action=\"/pair/start\">"
+      "<button class=\"secondary\" type=\"submit\">添加设备</button></form>"
+      "<details><summary>更多设备设置</summary>"
+      "<label class=\"field\">设备名称</label><input class=\"text\" form=\"settings\" name=\"cam_name\" value=\"%s\" placeholder=\"留空自动选择\">"
+      "<label class=\"field\">设备地址</label><input class=\"text\" form=\"settings\" name=\"cam_mac\" value=\"%s\" placeholder=\"选填\"></details>"
+      "<details><summary>Wi‑Fi</summary>"
+      "<label class=\"field\">网络名称</label><div class=\"wifi-picker\"><select class=\"text\" form=\"settings\" name=\"wifi_ssid\" id=\"wifi-ssid\"><option value=\"%s\" selected>%s</option></select><button class=\"secondary\" id=\"wifi-scan\" type=\"button\">扫描网络</button></div>"
+      "<p class=\"hint\">仅支持 2.4G Wi‑Fi</p><p class=\"hint\" id=\"wifi-scan-message\" role=\"status\"></p>"
+      "<label class=\"field\">网络密码</label><input class=\"text\" form=\"settings\" type=\"password\" name=\"wifi_pass\" placeholder=\"不修改请留空\">"
+      "</details><details><summary>热点运行时间</summary><label class=\"field\">无人使用时关闭热点</label><select class=\"text\" form=\"settings\" name=\"wifi_idle_s\">"
       "<option value=\"300\" %s>5 分钟</option><option value=\"900\" %s>15 分钟</option></select>"
-      "<p class=\"hint\">Wi‑Fi 只在检测到 USB 线缆时开启；备用热点按关联设备保持，接入现有 Wi‑Fi 时按近期网页活动保持。无设备接入或活动达到所选时间后关闭，需拔出 USB 再重新插入才能再次开启。</p></details></section>",
-      pairing_state, camera_name, camera_mac, wifi_ssid, ap_ssid,
+      "</details></section>",
+      pairing_notice, camera_name, camera_mac, wifi_ssid,
+      cfg.wifi_ssid[0] != '\0' ? wifi_ssid : "请选择网络",
       cfg.wifi_idle_timeout_s == WIFI_IDLE_TIMEOUT_DEFAULT_S ? "selected" : "",
       cfg.wifi_idle_timeout_s == WIFI_IDLE_TIMEOUT_LONG_S ? "selected" : "");
   free(bonds_html);
 
   ok = ok && page_send(
       req, page, page_len,
-      "<section class=\"card\"><h2>安全连接</h2>"
-      "<p class=\"hint\">配置页使用 <strong>" FRAMENAV_HOSTNAME
-      "</strong>。设备同时提供热点并尝试连接已保存的外部 Wi‑Fi；更新证书需要外部 Wi‑Fi 能上网。</p>"
-      "<form method=\"POST\" action=\"/cert/update\">"
-      "<button class=\"secondary\" type=\"submit\">下载并更新证书和私钥</button></form>"
-      "<p class=\"hint\">更新地址：" FRAMENAV_CERT_UPDATE_URL
-      "。将一起下载证书和私钥，校验通过后保存；更新失败时保留现有凭据。"
-      "保存后重新插拔 USB 才会加载新证书和私钥。</p></section>");
-
-  ok = ok && page_send(
-      req, page, page_len,
-      "<section class=\"card\"><h2>定位设置</h2><p class=\"caption\">控制发送给相机的位置和时间信息。</p>"
-      "<p class=\"hint\">GPS 始终搜星，有有效卫星定位时优先使用 GPS；没有 GPS 时，使用尚未过期的手机位置。</p>"
-      "<h3>室内手机位置</h3>"
-      "<button class=\"secondary\" id=\"phone-get\" type=\"button\">从手机获取一次定位</button> "
-      "<button class=\"secondary\" id=\"phone-clear\" type=\"button\">清除手机位置</button>"
-      "<p class=\"hint\" id=\"phone-message\" role=\"status\">请在系统浏览器打开 HTTPS 配置页，点击获取并允许手机定位。</p>"
-      "<p class=\"hint\">先尝试普通定位 15 秒，可使用手机最近 10 分钟的位置；失败后再尝试高精度定位 60 秒。室内请保持移动数据可用。Chrome 定位失败时，请用手机自带浏览器获取；位置保存到设备后，切换浏览器仍可使用。</p>"
-      "<h3>无法调用手机定位时手动输入</h3><div class=\"grid\">"
-      "<div><label class=\"field\">纬度</label><input class=\"text\" id=\"manual-lat\" type=\"number\" min=\"-90\" max=\"90\" step=\"0.000001\" placeholder=\"例如 23.1291\"></div>"
-      "<div><label class=\"field\">经度</label><input class=\"text\" id=\"manual-lon\" type=\"number\" min=\"-180\" max=\"180\" step=\"0.000001\" placeholder=\"例如 113.2644\"></div></div>"
-      "<button class=\"secondary\" id=\"phone-manual\" type=\"button\">保存手动位置</button>"
-      "<p class=\"hint\">手动位置按同一有效期保存；GPS 有效时仍自动优先使用 GPS。坐标使用 WGS‑84 十进制度。</p>"
-      "<p>手机位置：<span id=\"loc-phoneStatus\">读取中</span></p>"
-      "<p id=\"loc-phoneCoordinates\">—</p>"
-      "<p>手机估算精度：<span id=\"loc-phoneAccuracy\">—</span></p>"
-      "<p>获取时间：<span id=\"loc-phoneTime\">—</span></p>"
-      "<p>剩余有效期：<span id=\"loc-phoneRemaining\">—</span></p>"
-      "<label class=\"field\">手机位置有效期</label><div class=\"unit\">"
+      "<section class=\"card\"><h2>定位设置</h2>"
+      "<h3>固定位置</h3>"
+      "<button class=\"secondary\" id=\"phone-clear\" type=\"button\">清除固定位置</button>"
+      "<p class=\"hint\" id=\"phone-message\" role=\"status\"></p>"
+      "<p class=\"muted phone-location\">固定位置：<span id=\"loc-phoneStatus\">尚未设置</span></p>"
+      "<p class=\"muted phone-location\">坐标：<span id=\"loc-phoneCoordinates\">—</span> · 有效期：<span id=\"loc-phoneRemaining\">—</span></p>"
+      "<h3>直接填写</h3><div class=\"manual-location\">"
+      "<div><label class=\"field\" for=\"manual-lat\">纬度</label><input class=\"text\" id=\"manual-lat\" type=\"number\" min=\"-90\" max=\"90\" step=\"0.000001\" placeholder=\"例如 23.1291\"></div>"
+      "<div><label class=\"field\" for=\"manual-lon\">经度</label><input class=\"text\" id=\"manual-lon\" type=\"number\" min=\"-180\" max=\"180\" step=\"0.000001\" placeholder=\"例如 113.2644\"></div>"
+      "<button class=\"secondary\" id=\"phone-manual\" type=\"button\">保存固定位置</button></div>"
+      "<label class=\"field\">位置有效期</label><div class=\"unit\">"
       "<input class=\"text\" form=\"settings\" type=\"number\" name=\"phone_ttl_h\" value=\"%u\" min=\"1\" max=\"720\" step=\"1\"><span>小时</span></div>"
-      "<p class=\"hint\">默认 6 小时，从手机获取时间开始计算；修改后请保存设置。关闭 Wi-Fi 或拔插 USB 不清除位置，整机断电后需重新获取。</p>"
+      "<label class=\"field\">卫星位置最大年龄</label><div class=\"unit\"><input class=\"text\" form=\"settings\" type=\"number\" name=\"max_gps_age\" value=\"%u\" min=\"0\" max=\"86400\" step=\"1\"><span>秒</span></div>"
+      "<label class=\"field\">GPS 定位优先级</label><select class=\"text\" form=\"settings\" name=\"fixed_prio\">"
+      "<option value=\"0\" %s>有 GPS 定位时优先使用 GPS 定位</option>"
+      "<option value=\"1\" %s>不使用 GPS 位置直到固定位置过期</option></select>"
+      "<label class=\"field\">GPS 稳定后的固定位置处理</label><select class=\"text\" form=\"settings\" name=\"fixed_delete\">"
+      "<option value=\"0\" %s>GPS 稳定 1 分钟后删除</option>"
+      "<option value=\"1\" %s>GPS 稳定 5 分钟后删除</option>"
+      "<option value=\"2\" %s>GPS 偏离固定位置超过 100 米后删除</option>"
+      "<option value=\"3\" %s>GPS 稳定 1 分钟且偏离超过 100 米后删除</option>"
+      "<option value=\"4\" %s>GPS 稳定 5 分钟且偏离超过 100 米后删除</option>"
+      "<option value=\"5\" %s>固定位置过期前不删除</option></select>"
+      "<h3>未连接相机时</h3><p class=\"hint\">相机或手机连接时会自动搜星；此项控制两者都断开后的行为。</p>"
+      "<div class=\"grid no-camera-settings\"><div><label class=\"field\">相机和手机都未连接时搜星</label><select class=\"text\" form=\"settings\" name=\"gnss_idle\">"
+      "<option value=\"0\" %s>关闭</option><option value=\"1\" %s>开启</option></select></div>"
+      "<div><label class=\"field\">记录位置</label><select class=\"text\" form=\"settings\" name=\"track_idle\">"
+      "<option value=\"0\" %s>关闭</option><option value=\"1\" %s>开启</option></select></div>"
+      "<div><label class=\"field\">记录间隔</label><div class=\"unit\"><input class=\"text\" form=\"settings\" type=\"number\" name=\"track_int_s\" value=\"%u\" min=\"1\" max=\"3600\" step=\"1\"><span>秒</span></div></div></div>"
       "<label class=\"field\">照片时区</label><select form=\"settings\" id=\"timezone\" name=\"tz\">"
       "<option value=\"-720\">(UTC−12:00) 国际日期变更线西</option><option value=\"-660\">(UTC−11:00) 萨摩亚</option>"
       "<option value=\"-600\">(UTC−10:00) 夏威夷</option><option value=\"-570\">(UTC−09:30) 马克萨斯群岛</option>"
@@ -1111,80 +1309,106 @@ static esp_err_t handle_root(httpd_req_t *req) {
       "<option value=\"630\">(UTC+10:30) 豪勋爵岛</option><option value=\"660\">(UTC+11:00) 所罗门群岛</option>"
       "<option value=\"720\">(UTC+12:00) 奥克兰 / 斐济</option><option value=\"765\">(UTC+12:45) 查塔姆群岛</option>"
       "<option value=\"780\">(UTC+13:00) 汤加</option><option value=\"840\">(UTC+14:00) 莱恩群岛</option></select>"
-      "<label class=\"field\">夏时令偏移</label><select form=\"settings\" id=\"dst\" name=\"dst\">"
-      "<option value=\"0\">不使用夏时令</option><option value=\"30\">增加 30 分钟</option>"
-      "<option value=\"60\">增加 1 小时</option><option value=\"120\">增加 2 小时</option></select>"
-      "<p class=\"hint\">设备不会自动判断夏时令；切换时需要手动修改。</p></section>",
-      (unsigned)cfg.phone_location_ttl_hours);
+      "<label class=\"field\">夏令时</label><select form=\"settings\" id=\"dst\" name=\"dst\">"
+      "<option value=\"0\">关闭</option><option value=\"30\">增加 30 分钟</option>"
+      "<option value=\"60\">增加 1 小时</option><option value=\"120\">增加 2 小时</option></select></section>",
+      (unsigned)cfg.phone_location_ttl_hours,
+      (unsigned)cfg.max_gps_age_s,
+      cfg.fixed_location_priority == FIXED_LOCATION_GPS_PRIORITY ? "selected" : "",
+      cfg.fixed_location_priority == FIXED_LOCATION_PRIORITY ? "selected" : "",
+      cfg.fixed_location_delete_policy == FIXED_LOCATION_DELETE_AFTER_1_MIN ? "selected" : "",
+      cfg.fixed_location_delete_policy == FIXED_LOCATION_DELETE_AFTER_5_MIN ? "selected" : "",
+      cfg.fixed_location_delete_policy == FIXED_LOCATION_DELETE_WHEN_FAR ? "selected" : "",
+      cfg.fixed_location_delete_policy == FIXED_LOCATION_DELETE_AFTER_1_MIN_WHEN_FAR ? "selected" : "",
+      cfg.fixed_location_delete_policy == FIXED_LOCATION_DELETE_AFTER_5_MIN_WHEN_FAR ? "selected" : "",
+      cfg.fixed_location_delete_policy == FIXED_LOCATION_KEEP_UNTIL_EXPIRY ? "selected" : "",
+      cfg.gnss_without_camera == 0 ? "selected" : "",
+      cfg.gnss_without_camera == 1 ? "selected" : "",
+      cfg.record_without_camera == 0 ? "selected" : "",
+      cfg.record_without_camera == 1 ? "selected" : "",
+      (unsigned)cfg.track_interval_s);
 
   ok = ok && page_send(
       req, page, page_len,
-      "<section class=\"card\"><h2>省电设置</h2><p class=\"caption\">GPS 持续搜星；可单独配置蓝牙搜索策略。</p>"
-      "<h3>蓝牙省电模式</h3><div class=\"modes\">"
-      "<label class=\"mode\"><input form=\"settings\" type=\"radio\" name=\"ble_mode\" value=\"0\"><span><strong>省电</strong><span>连接相机可能需要等待更久。</span></span></label>"
-      "<label class=\"mode\"><input form=\"settings\" type=\"radio\" name=\"ble_mode\" value=\"1\" checked><span><strong>正常</strong><span>兼顾待机和重连速度。</span></span></label>"
-      "<label class=\"mode\"><input form=\"settings\" type=\"radio\" name=\"ble_mode\" value=\"2\"><span><strong>自定义</strong><span>自行配置搜索参数。</span></span></label></div>"
-      "<details id=\"ble-advanced\"><summary>蓝牙省电高级配置 <span class=\"summary-state\" id=\"ble-state\">只读</span></summary>"
-      "<label class=\"field\">开机快速搜索持续时间</label><div class=\"unit\"><input class=\"text ble-custom\" form=\"settings\" type=\"number\" "
+      "<section class=\"card\"><h2>内部存储</h2>"
+      "<div class=\"statusbar\"><div class=\"statusitem\"><span>轨迹条数：<span id=\"storage-record-count\">%s</span></span></div>"
+      "<div class=\"statusitem\"><span>存储占用：<span id=\"storage-space\">%s</span></span></div></div></section>",
+      storage_count, storage_used);
+
+  ok = ok && page_send(
+      req, page, page_len,
+      "<section class=\"card\"><h2>省电设置</h2>"
+      "<h3>设备连接模式</h3><div class=\"modes\">"
+      "<label class=\"mode\"><input form=\"settings\" type=\"radio\" name=\"ble_mode\" value=\"0\"><span><strong>省电</strong></span></label>"
+      "<label class=\"mode\"><input form=\"settings\" type=\"radio\" name=\"ble_mode\" value=\"1\" checked><span><strong>平衡</strong></span></label>"
+      "<label class=\"mode\"><input form=\"settings\" type=\"radio\" name=\"ble_mode\" value=\"2\"><span><strong>自定义</strong></span></label></div>"
+      "<details id=\"ble-advanced\"><summary>高级设置</summary>"
+      "<label class=\"field\">开机后查找设备</label><div class=\"unit\"><input class=\"text ble-custom\" form=\"settings\" type=\"number\" "
       "name=\"ble_boot\" value=\"%u\" min=\"0\" max=\"300\"><span>秒</span></div>"
-      "<div class=\"grid\"><div><label class=\"field\">断联后蓝牙搜索周期</label><div class=\"unit\"><input class=\"text ble-custom\" form=\"settings\" "
+      "<div class=\"grid\"><div><label class=\"field\">再次查找间隔</label><div class=\"unit\"><input class=\"text ble-custom\" form=\"settings\" "
       "type=\"number\" name=\"ble_period\" value=\"%.2f\" min=\"1\" max=\"10.24\" step=\"0.01\"><span>秒</span></div></div>"
-      "<div><label class=\"field\">蓝牙搜索连续监听时长</label><div class=\"unit\"><input class=\"text ble-custom\" form=\"settings\" type=\"number\" "
-      "name=\"ble_window\" value=\"%u\" min=\"20\" max=\"1000\"><span>毫秒</span></div></div></div>"
-      "<p class=\"hint\">无配对记录时连续扫描；已有配对时，快速搜索阶段每秒监听 300 毫秒。</p></details></section>",
+      "<div><label class=\"field\">每次查找时长</label><div class=\"unit\"><input class=\"text ble-custom\" form=\"settings\" type=\"number\" "
+      "name=\"ble_window\" value=\"%u\" min=\"20\" max=\"1000\"><span>毫秒</span></div></div></div></details></section>",
       (unsigned)bluetooth_policy.boot_fast_search_s,
       (double)bluetooth_policy.scan_period_ms / 1000.0,
       (unsigned)bluetooth_policy.scan_window_ms);
 
   ok = ok && page_send(
       req, page, page_len,
-      "<div class=\"savebar\"><p class=\"hint\">定位与省电设置保存后立即生效；Wi‑Fi 设置下次开启配置网络时生效。</p>"
-      "<button form=\"settings\" type=\"submit\">保存设置</button></div>"
-      "<footer>配置地址：<a href=\"" ALPHALOC_AP_URL "\">" ALPHALOC_AP_URL
-      "</a><br>联系邮箱：<a href=\"mailto:" FRAMENAV_CONTACT_EMAIL "\">" FRAMENAV_CONTACT_EMAIL "</a>"
-      "<br>FrameNav 是基于 <a href=\"https://github.com/finfinack/alphaloc\">AlphaLoc</a> "
-      "开发的开源项目，采用 <a href=\"https://www.apache.org/licenses/LICENSE-2.0\">Apache-2.0</a> 许可证。</footer>"
+      "<div class=\"savebar\"><button form=\"settings\" type=\"submit\">保存设置</button></div>"
       "<script>(()=>{const q=(s)=>document.querySelector(s),qa=(s)=>[...document.querySelectorAll(s)];"
-      "let locating=false;async function liveLocation(){if(document.hidden||locating)return;locating=true;"
+      "let locating=false,lastClockSync=0,clockSyncPromise=null;"
+      "async function syncClock(){if(Date.now()-lastClockSync<300000)return;"
+      "if(!clockSyncPromise)clockSyncPromise=fetch('/location/clock',{method:'POST',"
+      "headers:{'Content-Type':'application/json'},body:JSON.stringify({now_ms:Date.now()}),cache:'no-store'})"
+      ".then(r=>{if(!r.ok)throw Error();lastClockSync=Date.now();}).catch(()=>{}).finally(()=>{clockSyncPromise=null;});"
+      "await clockSyncPromise;}"
+      "async function liveLocation(){if(document.hidden||locating)return;locating=true;"
       "const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),5000);"
-      "try{const r=await fetch('/location',{cache:'no-store',signal:controller.signal});if(!r.ok)throw Error();"
-      "const d=await r.json();['status','source','coordinates','altitude','time','timeLabel','age',"
-      "'phoneStatus','phoneCoordinates','phoneAccuracy','phoneTime','phoneRemaining'].forEach(k=>q('#loc-'+k).textContent=d[k]);"
-      "q('#loc-dot').className='dot '+(d.status==='有效'?'dot-green':'dot-red');}"
-      "catch(e){q('#loc-status').textContent='读取失败，无法确认当前定位';"
+      "try{await syncClock();const r=await fetch('/location',{cache:'no-store',signal:controller.signal});if(!r.ok)throw Error();"
+      "const d=await r.json();[['status','status'],['source','source'],['coordinates','coordinates'],['time','time'],['phoneStatus','phoneStatus'],['phoneCoordinates','phoneCoordinates'],['phoneRemaining','phoneRemaining']].forEach(([id,key])=>{const n=q('#loc-'+id);if(n)n.textContent=d[key]||'—';});"
+      "q('#loc-running-satellites').textContent=d.satellites;q('#loc-running-satellites-visible').textContent=d.satellitesVisible;"
+      "q('#loc-running-gnss').textContent=d.gnss;q('#loc-running-gnss-dot').className='dot '+(d.gnss==='已定位'?'dot-green':d.gnss==='搜索中'?'dot-yellow':d.gnss==='正在恢复'?'dot-blue':'dot-gray');"
+      "q('#loc-dot').className='dot '+(d.status==='已定位'?'dot-green':'dot-red');}"
+      "catch(e){q('#loc-status').textContent='暂时无法读取';"
       "q('#loc-dot').className='dot dot-gray';"
-      "['source','coordinates','altitude','time','age','phoneStatus','phoneCoordinates','phoneAccuracy','phoneTime','phoneRemaining'].forEach(k=>q('#loc-'+k).textContent='—');}"
-      "finally{clearTimeout(timer);locating=false;}}setInterval(liveLocation,3000);"
-      "document.addEventListener('visibilitychange',liveLocation);liveLocation();"
-      "const pg=q('#phone-get'),pc=q('#phone-clear'),pm=q('#phone-message'),manualButton=q('#phone-manual'),ml=q('#manual-lat'),mn=q('#manual-lon');"
-      "function phoneBusy(b){pg.disabled=pc.disabled=manualButton.disabled=b;}"
+      "['source','coordinates','time','phoneStatus','phoneCoordinates','phoneRemaining'].forEach(k=>q('#loc-'+k).textContent='—');"
+      "q('#loc-running-satellites').textContent='—';q('#loc-running-satellites-visible').textContent='—';}"
+      "finally{clearTimeout(timer);locating=false;}}setInterval(liveLocation,10000);"
+      "document.addEventListener('visibilitychange',liveLocation);"
+      "if(window.addEventListener)window.addEventListener('load',liveLocation,{once:true});"
+      "const pc=q('#phone-clear'),pm=q('#phone-message'),manualButton=q('#phone-manual'),ml=q('#manual-lat'),mn=q('#manual-lon');"
+      "const wifiScan=q('#wifi-scan'),wifiList=q('#wifi-ssid'),wifiMessage=q('#wifi-scan-message');"
+      "async function scanWifi(){wifiScan.disabled=true;wifiMessage.textContent='正在扫描…';"
+      "try{const start=await fetch('/wifi/scan/start',{method:'POST',cache:'no-store'});if(!start.ok)throw Error();"
+      "let data;for(let i=0;i<40;i++){await new Promise(r=>setTimeout(r,250));"
+      "const r=await fetch('/wifi/scan',{cache:'no-store'});if(!r.ok)throw Error();data=await r.json();if(!data.scanning)break;}"
+      "if(!data||data.scanning)throw Error();const selected=wifiList.value;wifiList.replaceChildren();"
+      "const placeholder=document.createElement('option');placeholder.value='';placeholder.textContent='请选择网络';wifiList.appendChild(placeholder);"
+      "let found=false;data.networks.forEach(n=>{if(n.ssid===selected)found=true;const o=document.createElement('option');o.value=n.ssid;o.textContent=n.ssid+(n.secure?'（需要密码）':'（开放网络）');wifiList.appendChild(o);});"
+      "if(selected&&!found){const o=document.createElement('option');o.value=selected;o.textContent=selected+'（当前设置）';wifiList.appendChild(o);}"
+      "if(selected)wifiList.value=selected;"
+      "wifiMessage.textContent=data.networks.length?'请选择网络名称。':'没有找到网络，请重新扫描。';"
+      "}catch(e){wifiMessage.textContent='扫描失败，请重试。';}finally{wifiScan.disabled=false;}}"
+      "wifiScan.addEventListener('click',scanWifi);"
+      "function phoneBusy(b){pc.disabled=manualButton.disabled=b;}"
       "async function phonePost(path,data){const c=new AbortController(),t=setTimeout(()=>c.abort(),8000);"
       "try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},"
       "body:JSON.stringify(data),signal:c.signal});const text=await r.text();if(!r.ok)throw Error(text);pm.textContent=text;}"
       "finally{clearTimeout(t);}}"
-      "pg.addEventListener('click',()=>{if(!window.isSecureContext){pm.textContent='请使用 https://" FRAMENAV_HOSTNAME "/ 打开后获取定位';return;}"
-      "if(!navigator.geolocation){pm.textContent='当前浏览器不支持定位，请用手机系统浏览器打开';return;}"
-      "phoneBusy(true);pm.textContent='正在请求手机定位，请允许定位权限…';"
-      "const save=async p=>{try{pm.textContent='正在保存手机位置…';"
-      "await phonePost('/location/phone',{latitude:p.coords.latitude,longitude:p.coords.longitude,"
-      "accuracy:p.coords.accuracy,timestamp_ms:Math.trunc(p.timestamp),now_ms:Date.now()});liveLocation();}"
-      "catch(e){pm.textContent='保存失败：'+(e.message||'请重试');}finally{phoneBusy(false);}};"
-      "const failed=e=>{pm.textContent=({1:'定位权限被拒绝，请在浏览器设置中允许定位',2:'手机暂时无法定位，请先在地图 App 确认定位正常',3:'手机定位超时，请先在地图 App 完成定位，并尝试手机自带浏览器'})[e.code]||'手机定位失败';phoneBusy(false);};"
-      "navigator.geolocation.getCurrentPosition(save,e=>{if(e.code!==2&&e.code!==3){failed(e);return;}"
-      "pm.textContent='普通定位暂不可用，正在尝试高精度定位，最多等待 60 秒…';"
-      "navigator.geolocation.getCurrentPosition(save,failed,{enableHighAccuracy:true,maximumAge:60000,timeout:60000});},"
-      "{enableHighAccuracy:false,maximumAge:600000,timeout:15000});});"
       "manualButton.addEventListener('click',()=>{const latitude=Number(ml.value),longitude=Number(mn.value);"
-      "if(!Number.isFinite(latitude)||!Number.isFinite(longitude)||latitude<-90||latitude>90||longitude<-180||longitude>180){pm.textContent='请输入有效的纬度（−90 至 90）和经度（−180 至 180）';return;}"
-      "phoneBusy(true);pm.textContent='正在保存手动位置…';phonePost('/location/phone',{latitude,longitude,accuracy:0,timestamp_ms:Date.now(),now_ms:Date.now()}).then(liveLocation).catch(e=>{pm.textContent='保存失败：'+(e.message||'请重试');}).finally(()=>phoneBusy(false));});"
+      "if(!Number.isFinite(latitude)||!Number.isFinite(longitude)||latitude<-90||latitude>90||longitude<-180||longitude>180){pm.textContent='请输入有效的经纬度';return;}"
+      "phoneBusy(true);pm.textContent='正在保存…';phonePost('/location/phone',{latitude,longitude,accuracy:0,timestamp_ms:Date.now(),now_ms:Date.now()}).then(()=>liveLocation()).catch(e=>{pm.textContent='保存失败：'+(e.message||'未知错误');}).finally(()=>phoneBusy(false));});"
       "pc.addEventListener('click',async()=>{phoneBusy(true);try{await phonePost('/location/phone/clear',{});liveLocation();}"
-      "catch(e){pm.textContent='清除失败：'+(e.message||'请重试');}finally{phoneBusy(false);}});"
-      "function pulse(){if(!document.hidden)fetch('/activity',{cache:'no-store'}).catch(()=>{})}"
-      "setInterval(pulse,10000);document.addEventListener('visibilitychange',pulse);pulse();"
-      "const bi=qa('.ble-custom'),bs=q('#ble-state');"
+      "catch(e){pm.textContent='清除失败：'+(e.message||'未知错误');}finally{phoneBusy(false);}});"
+      "async function storageStatus(){try{const r=await fetch('/storage',{cache:'no-store'});if(!r.ok)throw Error();const d=await r.json();"
+      "q('#storage-record-count').textContent=d.available?d.record_count:'不可用';"
+      "q('#storage-space').textContent=d.available?`${(d.used_bytes/1024).toFixed(1)} KB / ${(d.capacity_bytes/1024).toFixed(1)} KB`:'不可用';}catch(e){}}"
+      "storageStatus();setInterval(storageStatus,30000);"
+      "const bi=qa('.ble-custom');"
       "const bp={0:[15,10,100],1:[30,3,100]};"
       "function ble(m,change){if(bp[m]&&change)bi.forEach((e,i)=>e.value=bp[m][i]);"
-      "bi.forEach(e=>e.disabled=m!==2);bs.textContent=m===2?'可编辑':'只读'}"
+      "bi.forEach(e=>e.disabled=m!==2)}"
       "qa('[name=ble_mode]').forEach(e=>e.addEventListener('change',()=>ble(+e.value,true)));"
       "q('[name=ble_mode][value=\"%u\"]').checked=true;"
       "q('#timezone').value=\"%d\";q('#dst').value=\"%d\";ble(%u,false)})();</script>"
@@ -1203,18 +1427,19 @@ static esp_err_t handle_save(httpd_req_t *req) {
   web_activity();
   char body[2048];
   if (req->content_len >= sizeof(body)) {
-    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Request too large");
+    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                               "提交内容过长，请减少设置项后重试");
   }
   size_t total = 0;
   while (total < req->content_len) {
     int recv = httpd_req_recv(req, body + total, req->content_len - total);
     if (recv <= 0) {
-      return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No data");
+      return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "没有收到设置内容");
     }
     total += (size_t)recv;
   }
   if (total == 0) {
-    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No data");
+    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "没有收到设置内容");
   }
   body[total] = '\0';
 
@@ -1262,24 +1487,43 @@ static esp_err_t handle_save(httpd_req_t *req) {
     next.wifi_pass[sizeof(next.wifi_pass) - 1] = '\0';
   }
 
-  form_get(body, "ap_ssid", value, sizeof(value));
-  if (strstr(body, "ap_ssid=") != NULL) {
-    strncpy(next.ap_ssid, value, sizeof(next.ap_ssid) - 1);
-    next.ap_ssid[sizeof(next.ap_ssid) - 1] = '\0';
-  }
-
-  form_get(body, "ap_pass", value, sizeof(value));
-  if (value[0] != '\0') {
-    strncpy(next.ap_pass, value, sizeof(next.ap_pass) - 1);
-    next.ap_pass[sizeof(next.ap_pass) - 1] = '\0';
-  }
-
   uint32_t parsed = 0;
+  form_get(body, "max_gps_age", value, sizeof(value));
+  if (strstr(body, "max_gps_age=") != NULL) {
+    if (!parse_u32_range(value, 86400, &parsed)) {
+      return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                 "卫星位置最大年龄请设置为 0 至 86400 秒");
+    }
+    next.max_gps_age_s = parsed;
+  }
+
   form_get(body, "phone_ttl_h", value, sizeof(value));
   if (strstr(body, "phone_ttl_h=") != NULL) {
     if (!parse_u32_range(value, PHONE_LOCATION_TTL_MAX_HOURS, &parsed) || parsed < 1)
-      return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Phone location TTL must be 1-720 hours");
+      return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                 "位置有效期请设置为 1 至 720 小时");
     next.phone_location_ttl_hours = parsed;
+  }
+  form_get(body, "fixed_prio", value, sizeof(value));
+  if (parse_u32_range(value, FIXED_LOCATION_PRIORITY, &parsed)) {
+    next.fixed_location_priority = (uint8_t)parsed;
+  }
+  form_get(body, "fixed_delete", value, sizeof(value));
+  if (parse_u32_range(value, FIXED_LOCATION_KEEP_UNTIL_EXPIRY, &parsed)) {
+    next.fixed_location_delete_policy = (uint8_t)parsed;
+  }
+  form_get(body, "gnss_idle", value, sizeof(value));
+  if (parse_u32_range(value, 1, &parsed)) {
+    next.gnss_without_camera = (uint8_t)parsed;
+  }
+  form_get(body, "track_idle", value, sizeof(value));
+  if (parse_u32_range(value, 1, &parsed)) {
+    next.record_without_camera = (uint8_t)parsed;
+  }
+  form_get(body, "track_int_s", value, sizeof(value));
+  if (parse_u32_range(value, LOCATION_RECORD_INTERVAL_MAX_S, &parsed) &&
+      parsed >= LOCATION_RECORD_INTERVAL_MIN_S) {
+    next.track_interval_s = parsed;
   }
   form_get(body, "ble_mode", value, sizeof(value));
   if (parse_u32_range(value, BLUETOOTH_POWER_CUSTOM, &parsed)) {
@@ -1306,7 +1550,7 @@ static esp_err_t handle_save(httpd_req_t *req) {
 
   if (!config_apply(s_cfg, &next)) {
     return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                               "Save failed");
+                               "设置未能保存，请重试");
   }
   app_config_t applied;
   if (!config_get_snapshot(s_cfg, &applied)) {
@@ -1317,6 +1561,11 @@ static esp_err_t handle_save(httpd_req_t *req) {
       strcmp(previous.wifi_pass, applied.wifi_pass) != 0) {
     wifi_apply_sta_config(&applied);
   }
+#if ALPHALOC_GNSS_STANDBY
+  location_power_policy_t location_policy;
+  config_resolve_location_power(&applied, &location_policy);
+  gps_apply_power_policy(&location_policy);
+#endif
   ble_client_config_changed();
   ESP_LOGI(TAG, "Settings applied: bluetooth_mode=%u",
            (unsigned)applied.bluetooth_power_mode);
@@ -1366,9 +1615,27 @@ static esp_err_t handle_phone_location(httpd_req_t *req) {
   if (!valid || !location_service_set_phone(latitude, longitude, accuracy,
                                                (uint64_t)captured_ms, (uint64_t)now_ms)) {
     httpd_resp_set_status(req, "400 Bad Request");
-    return httpd_resp_sendstr(req, "手机定位数据无效、已陈旧或手机时间不正确，请重新获取。\n");
+    return httpd_resp_sendstr(req, "位置无效或已过期，请重新获取。\n");
   }
-  return httpd_resp_sendstr(req, "手机位置已保存；无 GPS 时将在有效期内使用，GPS 恢复后自动优先使用 GPS。\n");
+  return httpd_resp_sendstr(req, "固定位置已保存。\n");
+}
+
+static esp_err_t handle_phone_clock(httpd_req_t *req) {
+  web_activity();
+  httpd_resp_set_type(req, "text/plain; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  cJSON *json = read_phone_json(req);
+  double now_ms = 0;
+  bool valid = json && json_number(json, "now_ms", &now_ms) &&
+      now_ms >= 1577836800000.0 && now_ms <= 4102444799999.0 &&
+      floor(now_ms) == now_ms;
+  cJSON_Delete(json);
+  if (!valid) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    return httpd_resp_sendstr(req, "时间无效，请刷新页面后重试。\n");
+  }
+  (void)location_service_sync_phone_clock((uint64_t)now_ms);
+  return httpd_resp_sendstr(req, "OK\n");
 }
 
 static esp_err_t handle_phone_clear(httpd_req_t *req) {
@@ -1379,11 +1646,11 @@ static esp_err_t handle_phone_clear(httpd_req_t *req) {
   if (!cJSON_IsObject(json)) {
     cJSON_Delete(json);
     httpd_resp_set_status(req, "400 Bad Request");
-    return httpd_resp_sendstr(req, "Invalid request");
+    return httpd_resp_sendstr(req, "请求无效，请刷新页面后重试。");
   }
   cJSON_Delete(json);
   location_service_clear_phone();
-  return httpd_resp_sendstr(req, "手机位置已清除。\n");
+  return httpd_resp_sendstr(req, "固定位置已清除。\n");
 }
 
 static esp_err_t handle_pair_start(httpd_req_t *req) {
@@ -1391,7 +1658,7 @@ static esp_err_t handle_pair_start(httpd_req_t *req) {
   if (!ble_client_start_pairing(FRAMENAV_PAIRING_WINDOW_S)) {
     httpd_resp_set_status(req, "503 Service Unavailable");
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
-    return httpd_resp_sendstr(req, "蓝牙尚未就绪，暂时无法开始配对。\n");
+    return httpd_resp_sendstr(req, "暂时无法添加设备，请稍后重试。\n");
   }
   return redirect_to_root(req);
 }
@@ -1400,14 +1667,15 @@ static esp_err_t handle_bond_delete(httpd_req_t *req) {
   web_activity();
   char body[128];
   if (req->content_len == 0 || req->content_len >= sizeof(body)) {
-    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid request");
+    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                               "请求无效，请刷新页面后重试");
   }
   size_t total = 0;
   while (total < req->content_len) {
     int received = httpd_req_recv(req, body + total,
                                   req->content_len - total);
     if (received <= 0) {
-      return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No data");
+      return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "没有收到设备信息");
     }
     total += (size_t)received;
   }
@@ -1421,13 +1689,13 @@ static esp_err_t handle_bond_delete(httpd_req_t *req) {
   ble_client_bond_t bond = {0};
   if (!parse_bond_token(token, bond.addr) ||
       !parse_u32_range(type_text, UINT8_MAX, &addr_type)) {
-    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid bond");
+    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "设备信息无效");
   }
   bond.addr_type = (uint8_t)addr_type;
   if (!ble_client_delete_bond(&bond)) {
     httpd_resp_set_status(req, "409 Conflict");
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
-    return httpd_resp_sendstr(req, "配对记录不存在或删除失败，请刷新后重试。\n");
+      return httpd_resp_sendstr(req, "未能移除设备，请刷新页面后重试。\n");
   }
   return redirect_to_root(req);
 }
@@ -1441,161 +1709,53 @@ static esp_err_t handle_captive_redirect(httpd_req_t *req,
   return httpd_resp_sendstr(req, "打开 FrameNav 配置页");
 }
 
-#if FRAMENAV_EMBEDDED_TLS
-typedef struct {
-  uint8_t *buffer;
-  size_t length, capacity;
-  bool failed;
-} cert_download_ctx_t;
-
-static void cert_download_free(cert_download_ctx_t *ctx) {
-  volatile uint8_t *bytes = ctx->buffer;
-  for (size_t i = 0; i < ctx->capacity; ++i) bytes[i] = 0;
-  free(ctx->buffer);
-  *ctx = (cert_download_ctx_t){0};
-}
-
-static bool cert_download_append(cert_download_ctx_t *ctx, const uint8_t *data,
-                                  size_t incoming) {
-  if (incoming > FRAMENAV_TLS_ZIP_MAX_BYTES - ctx->length) {
-    ctx->failed = true;
-    return false;
-  }
-  size_t needed = ctx->length + incoming;
-  if (needed > ctx->capacity) {
-    size_t capacity = ctx->capacity ? ctx->capacity : 4096U;
-    while (capacity < needed) capacity *= 2U;
-    /* Wipe the previous allocation before freeing: it may contain a key. */
-    uint8_t *buffer = malloc(capacity);
-    if (!buffer) {
-      ctx->failed = true;
-      return false;
-    }
-    if (ctx->length) memcpy(buffer, ctx->buffer, ctx->length);
-    size_t length = ctx->length;
-    cert_download_free(ctx);
-    *ctx = (cert_download_ctx_t){.buffer = buffer, .capacity = capacity,
-                                .length = length};
-  }
-  memcpy(ctx->buffer + ctx->length, data, incoming);
-  ctx->length += incoming;
-  return true;
-}
-
-static bool download_updated_tls_credentials(void) {
-  cert_download_ctx_t ctx = {0};
-  esp_http_client_config_t config = {
-      .url = FRAMENAV_CERT_UPDATE_URL,
-      .method = HTTP_METHOD_GET,
-      .timeout_ms = 15000,
-      .buffer_size = 1024,
-      .buffer_size_tx = 512,
-      .crt_bundle_attach = esp_crt_bundle_attach,
-      .disable_auto_redirect = true,
-  };
-  esp_http_client_handle_t client = esp_http_client_init(&config);
-  if (!client) return false;
-  bool ok = esp_http_client_open(client, 0) == ESP_OK;
-  int64_t content_length = ok ? esp_http_client_fetch_headers(client) : -1;
-  ok = ok && content_length >= 0 &&
-       content_length <= FRAMENAV_TLS_ZIP_MAX_BYTES &&
-       esp_http_client_get_status_code(client) == 200;
-  uint8_t chunk[1024];
-  int64_t deadline = esp_timer_get_time() + 30000000LL;
-  /* fetch_headers() may already have cached the entire body. Drain read()
-   * even when the network receive counter reports completion. */
-  while (ok) {
-    if (esp_timer_get_time() >= deadline) { ok = false; break; }
-    int received = esp_http_client_read(client, (char *)chunk, sizeof(chunk));
-    if (received <= 0) {
-      ok = received == 0 && esp_http_client_is_complete_data_received(client);
-      break;
-    }
-    ok = cert_download_append(&ctx, chunk, (size_t)received);
-  }
-  ok = ok && esp_http_client_is_complete_data_received(client);
-  /* Free the outbound TLS session before allocating/parsing the new pair. */
-  esp_http_client_cleanup(client);
-  volatile uint8_t *chunk_bytes = chunk;
-  for (size_t i = 0; i < sizeof(chunk); ++i) chunk_bytes[i] = 0;
-  tls_credentials_t credentials = {0};
-  ok = ok && !ctx.failed &&
-       tls_credentials_from_zip(ctx.buffer, ctx.length, &credentials);
-  cert_download_free(&ctx);
-  if (ok) ok = cert_store_write(credentials.cert, credentials.cert_len,
-                                  credentials.key, credentials.key_len);
-  tls_credentials_free(&credentials);
-  return ok;
-}
-#endif
-
-static esp_err_t handle_cert_update(httpd_req_t *req) {
-  web_activity();
-  httpd_resp_set_type(req, "text/plain; charset=utf-8");
-  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-#if !FRAMENAV_EMBEDDED_TLS
-  httpd_resp_set_status(req, "503 Service Unavailable");
-  return httpd_resp_sendstr(req, "No embedded TLS key");
-#else
-  if (!s_sta_has_ip) {
-    httpd_resp_set_status(req, "503 Service Unavailable");
-    return httpd_resp_sendstr(
-        req, "请先连接可上网的 Wi‑Fi，设备热点本身不能下载证书");
-  }
-  portENTER_CRITICAL(&s_radio_lock);
-  bool claimed = !s_cert_update_busy && !s_radio_owned;
-  if (claimed) s_cert_update_busy = true;
-  portEXIT_CRITICAL(&s_radio_lock);
-  if (!claimed) {
-    httpd_resp_set_status(req, "409 Conflict");
-    return httpd_resp_sendstr(req, "设备正在更新证书或使用 Wi‑Fi，请稍后重试");
-  }
-  bool ok = download_updated_tls_credentials();
-  portENTER_CRITICAL(&s_radio_lock);
-  s_cert_update_busy = false;
-  portEXIT_CRITICAL(&s_radio_lock);
-  if (!ok) {
-    httpd_resp_set_status(req, "502 Bad Gateway");
-    return httpd_resp_sendstr(
-        req, "下载、解包或证书与私钥校验失败，或保存失败；现有 HTTPS 服务继续使用原凭据。\n");
-  }
-  return httpd_resp_sendstr(
-      req, "证书和私钥已校验并保存；重新插拔 USB 让 HTTPS 服务加载新凭据。\n");
-#endif
-}
-
 static esp_err_t register_web_routes(httpd_handle_t server) {
   esp_err_t err;
   httpd_uri_t root = {
       .uri = "/", .method = HTTP_GET, .handler = handle_root, .user_ctx = NULL};
   httpd_uri_t location = {
       .uri = "/location", .method = HTTP_GET, .handler = handle_location};
+  httpd_uri_t config = {
+      .uri = "/config", .method = HTTP_GET, .handler = handle_config};
+  httpd_uri_t storage = {
+      .uri = "/storage", .method = HTTP_GET, .handler = handle_storage};
+  httpd_uri_t bonds = {
+      .uri = "/bonds", .method = HTTP_GET, .handler = handle_bonds};
   httpd_uri_t phone_location = {
       .uri = "/location/phone", .method = HTTP_POST, .handler = handle_phone_location};
+  httpd_uri_t phone_clock = {
+      .uri = "/location/clock", .method = HTTP_POST, .handler = handle_phone_clock};
   httpd_uri_t phone_clear = {
       .uri = "/location/phone/clear", .method = HTTP_POST, .handler = handle_phone_clear};
   httpd_uri_t activity = {
       .uri = "/activity", .method = HTTP_GET, .handler = handle_activity};
   httpd_uri_t favicon = {
       .uri = "/favicon.ico", .method = HTTP_GET, .handler = handle_favicon};
+  httpd_uri_t wifi_scan = {
+      .uri = "/wifi/scan", .method = HTTP_GET, .handler = handle_wifi_scan};
+  httpd_uri_t wifi_scan_start = {.uri = "/wifi/scan/start",
+                                 .method = HTTP_POST,
+                                 .handler = handle_wifi_scan_start};
   httpd_uri_t save = {
       .uri = "/save", .method = HTTP_POST, .handler = handle_save};
-  httpd_uri_t cert_update = {.uri = "/cert/update",
-                             .method = HTTP_POST,
-                             .handler = handle_cert_update};
   httpd_uri_t pair_start = {
       .uri = "/pair/start", .method = HTTP_POST, .handler = handle_pair_start};
   httpd_uri_t bond_delete = {.uri = "/bond/delete",
                              .method = HTTP_POST,
                              .handler = handle_bond_delete};
   err = httpd_register_uri_handler(server, &root);
+  if (err == ESP_OK) err = httpd_register_uri_handler(server, &config);
+  if (err == ESP_OK) err = httpd_register_uri_handler(server, &storage);
+  if (err == ESP_OK) err = httpd_register_uri_handler(server, &bonds);
   if (err == ESP_OK) err = httpd_register_uri_handler(server, &location);
   if (err == ESP_OK) err = httpd_register_uri_handler(server, &phone_location);
+  if (err == ESP_OK) err = httpd_register_uri_handler(server, &phone_clock);
   if (err == ESP_OK) err = httpd_register_uri_handler(server, &phone_clear);
   if (err == ESP_OK) err = httpd_register_uri_handler(server, &activity);
   if (err == ESP_OK) err = httpd_register_uri_handler(server, &favicon);
+  if (err == ESP_OK) err = httpd_register_uri_handler(server, &wifi_scan);
+  if (err == ESP_OK) err = httpd_register_uri_handler(server, &wifi_scan_start);
   if (err == ESP_OK) err = httpd_register_uri_handler(server, &save);
-  if (err == ESP_OK) err = httpd_register_uri_handler(server, &cert_update);
   if (err == ESP_OK) err = httpd_register_uri_handler(server, &pair_start);
   if (err == ESP_OK) err = httpd_register_uri_handler(server, &bond_delete);
   if (err == ESP_OK) {
@@ -1604,51 +1764,6 @@ static esp_err_t register_web_routes(httpd_handle_t server) {
   }
   return err;
 }
-
-#if FRAMENAV_EMBEDDED_TLS
-static void https_session_event(esp_https_server_user_cb_arg_t *session) {
-  if (session && session->user_cb_state == HTTPD_SSL_USER_CB_SESS_CREATE) {
-    ESP_LOGI(TAG, "HTTPS client handshake succeeded; heap free=%u largest=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-  }
-}
-
-static bool start_https_server(void) {
-  if (!s_tls_cert && !tls_cert_load()) return false;
-  httpd_ssl_config_t config = HTTPD_SSL_CONFIG_DEFAULT();
-  config.httpd.uri_match_fn = httpd_uri_match_wildcard;
-  config.httpd.stack_size = 16384;
-  config.httpd.max_uri_handlers = 12;
-  config.httpd.max_open_sockets = FRAMENAV_HTTPS_MAX_CLIENTS;
-  config.httpd.lru_purge_enable = true;
-  // Session tickets triggered read/cleanup crashes with this IDF dynamic-TLS
-  // configuration. Keep established HTTPS connections and use full handshakes.
-  config.session_tickets = false;
-  config.user_cb = https_session_event;
-  config.servercert = s_tls_cert;
-  config.servercert_len = s_tls_cert_len;
-  config.prvtkey_pem = s_tls_key;
-  config.prvtkey_len = s_tls_key_len;
-  esp_err_t err = httpd_ssl_start(&s_https_server, &config);
-  if (err != ESP_OK) {
-    ESP_LOGW(TAG, "HTTPS server start failed: %s", esp_err_to_name(err));
-    s_https_server = NULL;
-    return false;
-  }
-  err = register_web_routes(s_https_server);
-  if (err != ESP_OK) {
-    ESP_LOGW(TAG, "HTTPS route registration failed: %s", esp_err_to_name(err));
-    httpd_ssl_stop(s_https_server);
-    s_https_server = NULL;
-    return false;
-  }
-  ESP_LOGI(TAG, "HTTPS web ready: %s; TLS output=%u bytes, clients=%u",
-           ALPHALOC_AP_URL, (unsigned)MBEDTLS_SSL_OUT_CONTENT_LEN,
-           (unsigned)FRAMENAV_HTTPS_MAX_CLIENTS);
-  return true;
-}
-#endif
 
 static bool wifi_web_start_unlocked(app_config_t *cfg) {
   if (s_started) {
@@ -1766,6 +1881,7 @@ static bool wifi_web_start_unlocked(app_config_t *cfg) {
     wifi_cleanup_resources();
     return false;
   }
+  configure_wifi_tx_power();
   err = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "Failed to enable WiFi power save: %s", esp_err_to_name(err));
@@ -1780,11 +1896,12 @@ static bool wifi_web_start_unlocked(app_config_t *cfg) {
 
   httpd_config_t server_cfg = HTTPD_DEFAULT_CONFIG();
   server_cfg.uri_match_fn = httpd_uri_match_wildcard;
+  server_cfg.max_req_hdr_len = FRAMENAV_HTTP_MAX_REQ_HDR_LEN;
   // The Chinese settings page performs several large snprintf operations.
   // Keep its generated HTML on the heap and retain enough HTTP-task stack for
   // libc formatting plus captive-portal redirects on memory-constrained C6.
   server_cfg.stack_size = 16384;
-  server_cfg.max_uri_handlers = 12;
+  server_cfg.max_uri_handlers = 16;
   server_cfg.max_open_sockets = FRAMENAV_HTTP_MAX_CLIENTS;
   server_cfg.lru_purge_enable = true;
   err = httpd_start(&s_server, &server_cfg);
@@ -1799,12 +1916,6 @@ static bool wifi_web_start_unlocked(app_config_t *cfg) {
     wifi_cleanup_resources();
     return false;
   }
-
-#if FRAMENAV_EMBEDDED_TLS
-  (void)cert_store_init();
-  (void)tls_cert_load();
-  (void)start_https_server();
-#endif
 
   if (!s_ap_active && !s_sta_has_ip && s_fallback_timer) {
     (void)esp_timer_start_once(

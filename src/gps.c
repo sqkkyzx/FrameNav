@@ -24,6 +24,8 @@
 
 #define GPS_UART_BUF_SIZE 2048
 #define GPS_LINE_MAX 128
+#define GPS_GSV_TALKER_COUNT 7U
+#define GPS_GSV_FRESH_US 15000000LL
 
 static const char *TAG = "gps";
 
@@ -65,6 +67,8 @@ static SemaphoreHandle_t s_fix_mutex;
 static gps_config_t s_cfg;
 static gps_status_t s_status;
 static int64_t s_last_no_fix_log_us;
+static uint8_t s_gsv_satellites[GPS_GSV_TALKER_COUNT];
+static int64_t s_gsv_seen_us[GPS_GSV_TALKER_COUNT];
 
 #if ALPHALOC_GNSS_STANDBY
 #if !ALPHALOC_GNSS_RATE_1HZ || !ALPHALOC_PHASE2 || ALPHALOC_FAKE_GPS
@@ -75,6 +79,9 @@ static portMUX_TYPE s_camera_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_camera_connected;
 static uint32_t s_camera_generation, s_camera_seen_generation;
 static int64_t s_camera_changed_us;
+static bool s_wifi_connected;
+static uint32_t s_wifi_generation, s_wifi_seen_generation;
+static int64_t s_wifi_changed_us;
 static location_power_policy_t s_pending_power_policy;
 static uint32_t s_power_policy_generation, s_power_policy_seen_generation;
 
@@ -82,9 +89,10 @@ static void power_policy_to_duty(const location_power_policy_t *policy,
                                  gnss_duty_params_t *out) {
   if (!policy || !out) return;
   *out = (gnss_duty_params_t){
-      .continuous = policy->continuous,
-      .boot_work_s = policy->boot_work_s,
-      .disconnect_grace_s = policy->disconnect_grace_s,
+      .continuous = policy->continuous || policy->search_without_camera,
+      .require_camera = !policy->search_without_camera,
+      .boot_work_s = 0,
+      .disconnect_grace_s = 0,
       .stationary_sleep_s = policy->stationary_sleep_s,
       .moving_sleep_s = policy->moving_sleep_s,
       .fast_sleep_s = policy->fast_sleep_s,
@@ -107,6 +115,14 @@ void gps_camera_connection_changed(bool connected) {
   s_camera_connected = connected;
   s_camera_changed_us = esp_timer_get_time();
   ++s_camera_generation;
+  portEXIT_CRITICAL(&s_camera_lock);
+}
+
+void gps_wifi_connection_changed(bool connected) {
+  portENTER_CRITICAL(&s_camera_lock);
+  s_wifi_connected = connected;
+  s_wifi_changed_us = esp_timer_get_time();
+  ++s_wifi_generation;
   portEXIT_CRITICAL(&s_camera_lock);
 }
 #endif
@@ -169,8 +185,9 @@ static void rate_log(gnss_rate_event_t event, void *arg) {
 static bool power_sleep_allowed(void *arg) {
   (void)arg;
   portENTER_CRITICAL(&s_camera_lock);
-  bool allowed = !s_camera_connected &&
-                 s_camera_generation == s_camera_seen_generation;
+  bool allowed = !s_camera_connected && !s_wifi_connected &&
+                 s_camera_generation == s_camera_seen_generation &&
+                 s_wifi_generation == s_wifi_seen_generation;
   portEXIT_CRITICAL(&s_camera_lock);
   return allowed;
 }
@@ -207,8 +224,8 @@ static void power_log(gnss_power_event_t event, void *arg) {
     ESP_LOGW(TAG, "GNSS power: MON-VER unconfirmed; standby disabled, keep working");
     break;
   case GNSS_POWER_SLEEP_SENT:
-    ESP_LOGI(TAG, "GNSS standby requested: sleep=%us speed=%.3fm/s comparable=%d; "
-                 "UART wake + finite receiver timer; uptime_ms=%lld",
+    ESP_LOGI(TAG, "GNSS standby requested: sleep=%us (0=until camera/Wi-Fi); "
+                 "speed=%.3fm/s comparable=%d; uptime_ms=%lld",
              (unsigned)s_power.duty.next_sleep_s, s_power.duty.last_speed_mps,
              s_power.duty.have_speed, (long long)(esp_timer_get_time() / 1000));
     break;
@@ -216,13 +233,16 @@ static void power_log(gnss_power_event_t event, void *arg) {
     ESP_LOGI(TAG, "GNSS standby: UART quiet; actual low current requires measurement");
     break;
   case GNSS_POWER_WAKE_SENT:
-    ESP_LOGI(TAG, "GNSS wake requested: camera=%d; waiting for new NMEA; uptime_ms=%lld",
-             s_power.duty.camera_connected, (long long)(esp_timer_get_time() / 1000));
+    ESP_LOGI(TAG, "GNSS wake requested: camera=%d wifi=%d; waiting for new NMEA; "
+                 "uptime_ms=%lld",
+             s_camera_connected, s_wifi_connected,
+             (long long)(esp_timer_get_time() / 1000));
     break;
   case GNSS_POWER_WAKE_OK:
     ESP_LOGI(TAG, "GNSS awake: fresh NMEA resumed; 1Hz RAM restore pending while working; mode=%s",
              s_power.disable_after_wake ? "standby-disabled" :
-             s_power.duty.camera_connected ? "camera-work" : "timed-work");
+             (s_camera_connected ? "camera-work" :
+              (s_wifi_connected ? "wifi-work" : "timed-work")));
     break;
   case GNSS_POWER_WAKE_RETRY:
     ESP_LOGW(TAG, "GNSS wake: retry %u/3", s_power.wake_attempts);
@@ -243,17 +263,23 @@ static void power_step(size_t *line_len) {
   // A connect arriving during UART TX must trigger a wake before another
   // blocking read. Bound the loop against continual external event churn.
   for (unsigned pass = 0; pass < 4; ++pass) {
-    bool connected;
-    uint32_t generation;
+    bool camera_connected;
+    uint32_t camera_generation;
+    bool wifi_connected;
+    uint32_t wifi_generation;
     uint32_t policy_generation;
-    int64_t changed_us;
+    int64_t camera_changed_us;
+    int64_t wifi_changed_us;
     location_power_policy_t policy;
     portENTER_CRITICAL(&s_camera_lock);
-    connected = s_camera_connected;
-    generation = s_camera_generation;
+    camera_connected = s_camera_connected;
+    camera_generation = s_camera_generation;
+    wifi_connected = s_wifi_connected;
+    wifi_generation = s_wifi_generation;
     policy_generation = s_power_policy_generation;
     policy = s_pending_power_policy;
-    changed_us = s_camera_changed_us;
+    camera_changed_us = s_camera_changed_us;
+    wifi_changed_us = s_wifi_changed_us;
     portEXIT_CRITICAL(&s_camera_lock);
     if (policy_generation != s_power_policy_seen_generation) {
       s_power_policy_seen_generation = policy_generation;
@@ -270,10 +296,18 @@ static void power_step(size_t *line_len) {
                (double)policy.fast_speed_kmh_x10 / 10.0,
                (unsigned)policy.fix_timeout_s);
     }
-    if (generation != s_camera_seen_generation) {
-      s_camera_seen_generation = generation;
-      gnss_power_camera_event(&s_power, connected, changed_us);
-      ESP_LOGI(TAG, "GNSS camera policy: connected=%d", connected);
+    if (camera_generation != s_camera_seen_generation ||
+        wifi_generation != s_wifi_seen_generation) {
+      s_camera_seen_generation = camera_generation;
+      s_wifi_seen_generation = wifi_generation;
+      bool work_source = camera_connected || wifi_connected;
+      int64_t changed_us = camera_changed_us > wifi_changed_us ?
+          camera_changed_us : wifi_changed_us;
+      if (!work_source || work_source != s_power.duty.camera_connected) {
+        gnss_power_camera_event(&s_power, work_source, changed_us);
+      }
+      ESP_LOGI(TAG, "GNSS work-source policy: camera=%d wifi=%d active=%d",
+               camera_connected, wifi_connected, work_source);
     }
     gnss_power_poll(&s_power, esp_timer_get_time());
     unsigned actions = gnss_power_take_actions(&s_power);
@@ -283,6 +317,9 @@ static void power_step(size_t *line_len) {
         s_latest_fix.time_valid = false;
         s_status.has_lock = false;
         s_status.satellites = 0;
+        s_status.satellites_visible = 0;
+        memset(s_gsv_satellites, 0, sizeof(s_gsv_satellites));
+        memset(s_gsv_seen_us, 0, sizeof(s_gsv_seen_us));
         xSemaphoreGive(s_fix_mutex);
       }
     }
@@ -297,9 +334,21 @@ static void power_step(size_t *line_len) {
       s_rmc_sample_us = esp_timer_get_time();
     }
     portENTER_CRITICAL(&s_camera_lock);
-    bool changed = s_camera_generation != s_camera_seen_generation;
+    bool changed = s_camera_generation != s_camera_seen_generation ||
+                   s_wifi_generation != s_wifi_seen_generation;
     portEXIT_CRITICAL(&s_camera_lock);
     if (!changed) break;
+  }
+  gps_search_state_t search_state = GPS_SEARCH_ACTIVE;
+  if (s_power.phase == GNSS_POWER_SLEEP_SETTLE ||
+      s_power.phase == GNSS_POWER_SLEEP) {
+    search_state = GPS_SEARCH_PAUSED;
+  } else if (s_power.phase == GNSS_POWER_WAKING) {
+    search_state = GPS_SEARCH_WAKING;
+  }
+  if (xSemaphoreTake(s_fix_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    s_status.search_state = search_state;
+    xSemaphoreGive(s_fix_mutex);
   }
 }
 #endif
@@ -450,6 +499,68 @@ static int split_csv(char *buf, const char *fields[], int max_fields) {
     p = comma + 1;
   }
   return count;
+}
+
+static int gsv_talker_index(const char *sentence) {
+  if (!sentence || strlen(sentence) < 6 || sentence[0] != '$' ||
+      sentence[3] != 'G' || sentence[4] != 'S' || sentence[5] != 'V') {
+    return -1;
+  }
+  const char first = sentence[1];
+  const char second = sentence[2];
+  if (first == 'G' && second == 'P') return 0; // GPS
+  if (first == 'G' && second == 'L') return 1; // GLONASS
+  if (first == 'G' && second == 'A') return 2; // Galileo
+  if ((first == 'G' && second == 'B') ||
+      (first == 'B' && second == 'D')) return 3; // BeiDou
+  if ((first == 'G' && second == 'Q') ||
+      (first == 'Q' && second == 'Z')) return 4; // QZSS
+  if (first == 'G' && second == 'I') return 5; // NavIC
+  if (first == 'G' && second == 'N') return 6; // Combined GNSS
+  return -1;
+}
+
+static int visible_satellites_now(int64_t now_us) {
+  const unsigned combined = GPS_GSV_TALKER_COUNT - 1U;
+  uint32_t total = 0;
+  for (unsigned i = 0; i < combined; ++i) {
+    if (s_gsv_seen_us[i] > 0 && now_us >= s_gsv_seen_us[i] &&
+        now_us - s_gsv_seen_us[i] <= GPS_GSV_FRESH_US) {
+      total += s_gsv_satellites[i];
+    }
+  }
+  if (s_gsv_seen_us[combined] > 0 && now_us >= s_gsv_seen_us[combined] &&
+      now_us - s_gsv_seen_us[combined] <= GPS_GSV_FRESH_US) {
+    // Some receivers emit both per-constellation and combined streams.
+    total = s_gsv_satellites[combined];
+  }
+  return total > UINT8_MAX ? UINT8_MAX : (int)total;
+}
+
+static void update_status_gsv(const char *line) {
+  if (!line) return;
+  char buf[GPS_LINE_MAX];
+  strncpy(buf, line, sizeof(buf) - 1);
+  buf[sizeof(buf) - 1] = '\0';
+
+  const char *fields[8] = {0};
+  const int field_count = split_csv(buf, fields, 8);
+  int total_messages = 0, message_number = 0, satellites = 0;
+  const int talker = gsv_talker_index(fields[0]);
+  if (talker < 0 || field_count < 4 ||
+      !parse_int_range(fields[1], 1, 9, &total_messages) ||
+      !parse_int_range(fields[2], 1, total_messages, &message_number) ||
+      !parse_int_range(fields[3], 0, 99, &satellites)) {
+    return;
+  }
+  if (xSemaphoreTake(s_fix_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    const int64_t sample_us = esp_timer_get_time();
+    s_gsv_satellites[talker] = (uint8_t)satellites;
+    s_gsv_seen_us[talker] = sample_us;
+    s_status.satellites_visible =
+        (uint8_t)visible_satellites_now(sample_us);
+    xSemaphoreGive(s_fix_mutex);
+  }
 }
 
 static void update_status_gga(const char *line) {
@@ -819,6 +930,9 @@ static void gps_task(void *arg) {
               strncmp(line_buf, "$GNGGA", 6) == 0) {
             update_status_gga(line_buf);
           }
+          if (gsv_talker_index(line_buf) >= 0) {
+            update_status_gsv(line_buf);
+          }
           gps_fix_t fix = {0};
           if (strncmp(line_buf, "$GPRMC", 6) == 0 ||
               strncmp(line_buf, "$GNRMC", 6) == 0) {
@@ -883,6 +997,9 @@ void gps_init(const gps_config_t *cfg) {
   }
   memset(&s_latest_fix, 0, sizeof(s_latest_fix));
   memset(&s_status, 0, sizeof(s_status));
+  s_status.search_state = GPS_SEARCH_ACTIVE;
+  memset(s_gsv_satellites, 0, sizeof(s_gsv_satellites));
+  memset(s_gsv_seen_us, 0, sizeof(s_gsv_seen_us));
   s_last_no_fix_log_us = 0;
 
 #if ALPHALOC_FAKE_GPS
@@ -913,6 +1030,7 @@ void gps_init(const gps_config_t *cfg) {
 #endif
     s_status.has_lock = s_latest_fix.valid;
     s_status.satellites = 8;
+    s_status.satellites_visible = 8;
     s_status.constellations = GPS_CONSTELLATION_GPS;
     xSemaphoreGive(s_fix_mutex);
   }
@@ -997,6 +1115,12 @@ bool gps_get_status(gps_status_t *out_status) {
     return false;
   }
   *out_status = s_status;
+#if ALPHALOC_FAKE_GPS
+  out_status->satellites_visible = s_status.satellites_visible;
+#else
+  out_status->satellites_visible =
+      (uint8_t)visible_satellites_now(esp_timer_get_time());
+#endif
   xSemaphoreGive(s_fix_mutex);
   return true;
 }

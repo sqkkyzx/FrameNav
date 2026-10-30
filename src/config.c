@@ -70,12 +70,6 @@ static void config_terminate_str(char *dst, size_t dst_len)
   }
 }
 
-static void config_reset_default_str(char *dst, size_t dst_len,
-                                     const char *src)
-{
-  config_set_str_default(dst, dst_len, src);
-}
-
 void config_set_defaults(app_config_t *cfg)
 {
   memset(cfg, 0, sizeof(*cfg));
@@ -99,6 +93,11 @@ void config_set_defaults(app_config_t *cfg)
   cfg->custom_ble_scan_window_ms = 100;
   cfg->wifi_idle_timeout_s = WIFI_IDLE_TIMEOUT_DEFAULT_S;
   cfg->phone_location_ttl_hours = PHONE_LOCATION_TTL_DEFAULT_HOURS;
+  cfg->fixed_location_priority = FIXED_LOCATION_GPS_PRIORITY;
+  cfg->fixed_location_delete_policy = FIXED_LOCATION_KEEP_UNTIL_EXPIRY;
+  cfg->gnss_without_camera = 0;
+  cfg->record_without_camera = 0;
+  cfg->track_interval_s = LOCATION_RECORD_INTERVAL_DEFAULT_S;
 #ifdef ALPHALOC_DEFAULT_CAMERA_NAME_PREFIX
   config_set_str_default(cfg->camera_name_prefix,
                          sizeof(cfg->camera_name_prefix),
@@ -114,20 +113,6 @@ void config_set_defaults(app_config_t *cfg)
                          ALPHALOC_DEFAULT_CAMERA_MAC_PREFIX);
 #else
   cfg->camera_mac_prefix[0] = '\0';
-#endif
-
-#ifdef ALPHALOC_DEFAULT_AP_SSID
-  config_set_str_default(cfg->ap_ssid, sizeof(cfg->ap_ssid),
-                         ALPHALOC_DEFAULT_AP_SSID);
-#else
-  config_set_str_default(cfg->ap_ssid, sizeof(cfg->ap_ssid), "FrameNav");
-#endif
-
-#ifdef ALPHALOC_DEFAULT_AP_PASS
-  config_set_str_default(cfg->ap_pass, sizeof(cfg->ap_pass),
-                         ALPHALOC_DEFAULT_AP_PASS);
-#else
-  config_set_str_default(cfg->ap_pass, sizeof(cfg->ap_pass), "framenav1234");
 #endif
 
 #ifdef ALPHALOC_DEFAULT_WIFI_SSID
@@ -250,25 +235,28 @@ void config_validate(app_config_t *cfg)
   config_terminate_str(cfg->camera_mac_prefix, sizeof(cfg->camera_mac_prefix));
   config_terminate_str(cfg->wifi_ssid, sizeof(cfg->wifi_ssid));
   config_terminate_str(cfg->wifi_pass, sizeof(cfg->wifi_pass));
-  config_terminate_str(cfg->ap_ssid, sizeof(cfg->ap_ssid));
-  config_terminate_str(cfg->ap_pass, sizeof(cfg->ap_pass));
   if (cfg->phone_location_ttl_hours < 1 ||
       cfg->phone_location_ttl_hours > PHONE_LOCATION_TTL_MAX_HOURS)
   {
     cfg->phone_location_ttl_hours = defaults.phone_location_ttl_hours;
   }
+  if (cfg->fixed_location_priority > FIXED_LOCATION_PRIORITY) {
+    cfg->fixed_location_priority = defaults.fixed_location_priority;
+  }
+  if (cfg->fixed_location_delete_policy > FIXED_LOCATION_KEEP_UNTIL_EXPIRY) {
+    cfg->fixed_location_delete_policy = defaults.fixed_location_delete_policy;
+  }
+  if (cfg->gnss_without_camera > 1) {
+    cfg->gnss_without_camera = defaults.gnss_without_camera;
+  }
+  if (cfg->record_without_camera > 1) {
+    cfg->record_without_camera = defaults.record_without_camera;
+  }
+  if (cfg->track_interval_s < LOCATION_RECORD_INTERVAL_MIN_S ||
+      cfg->track_interval_s > LOCATION_RECORD_INTERVAL_MAX_S) {
+    cfg->track_interval_s = defaults.track_interval_s;
+  }
 
-  if (cfg->ap_ssid[0] == '\0')
-  {
-    config_reset_default_str(cfg->ap_ssid, sizeof(cfg->ap_ssid),
-                             defaults.ap_ssid);
-  }
-  size_t ap_pass_len = strlen(cfg->ap_pass);
-  if (ap_pass_len > 0 && ap_pass_len < 8)
-  {
-    config_reset_default_str(cfg->ap_pass, sizeof(cfg->ap_pass),
-                             defaults.ap_pass);
-  }
 }
 
 static void config_read_str(nvs_handle_t nvs, const char *key, char *out,
@@ -315,6 +303,11 @@ bool config_load(app_config_t *cfg)
   nvs_get_u32(nvs, "ble_window", &cfg->custom_ble_scan_window_ms);
   nvs_get_u32(nvs, "wifi_idle_s", &cfg->wifi_idle_timeout_s);
   nvs_get_u32(nvs, "phone_ttl_h", &cfg->phone_location_ttl_hours);
+  nvs_get_u8(nvs, "fixed_prio", &cfg->fixed_location_priority);
+  nvs_get_u8(nvs, "fixed_delete", &cfg->fixed_location_delete_policy);
+  nvs_get_u8(nvs, "gnss_idle", &cfg->gnss_without_camera);
+  nvs_get_u8(nvs, "track_idle", &cfg->record_without_camera);
+  nvs_get_u32(nvs, "track_int_s", &cfg->track_interval_s);
   int16_t tz = cfg->tz_offset_min;
   int16_t dst = cfg->dst_offset_min;
   uint16_t old_tz = 0;
@@ -342,8 +335,6 @@ bool config_load(app_config_t *cfg)
                   sizeof(cfg->camera_mac_prefix));
   config_read_str(nvs, "wifi_ssid", cfg->wifi_ssid, sizeof(cfg->wifi_ssid));
   config_read_str(nvs, "wifi_pass", cfg->wifi_pass, sizeof(cfg->wifi_pass));
-  config_read_str(nvs, "ap_ssid", cfg->ap_ssid, sizeof(cfg->ap_ssid));
-  config_read_str(nvs, "ap_pass", cfg->ap_pass, sizeof(cfg->ap_pass));
 
   nvs_close(nvs);
   config_validate(cfg);
@@ -383,9 +374,12 @@ static bool config_save_unlocked(const app_config_t *cfg)
   if (err == ESP_OK) err = nvs_set_str(nvs, "cam_mac", cfg->camera_mac_prefix);
   if (err == ESP_OK) err = nvs_set_str(nvs, "wifi_ssid", cfg->wifi_ssid);
   if (err == ESP_OK) err = nvs_set_str(nvs, "wifi_pass", cfg->wifi_pass);
-  if (err == ESP_OK) err = nvs_set_str(nvs, "ap_ssid", cfg->ap_ssid);
-  if (err == ESP_OK) err = nvs_set_str(nvs, "ap_pass", cfg->ap_pass);
   if (err == ESP_OK) err = nvs_set_u32(nvs, "phone_ttl_h", cfg->phone_location_ttl_hours);
+  if (err == ESP_OK) err = nvs_set_u8(nvs, "fixed_prio", cfg->fixed_location_priority);
+  if (err == ESP_OK) err = nvs_set_u8(nvs, "fixed_delete", cfg->fixed_location_delete_policy);
+  if (err == ESP_OK) err = nvs_set_u8(nvs, "gnss_idle", cfg->gnss_without_camera);
+  if (err == ESP_OK) err = nvs_set_u8(nvs, "track_idle", cfg->record_without_camera);
+  if (err == ESP_OK) err = nvs_set_u32(nvs, "track_int_s", cfg->track_interval_s);
   if (err == ESP_OK) {
     err = nvs_commit(nvs);
   }
@@ -482,6 +476,7 @@ void config_resolve_location_power(const app_config_t *cfg,
   {
   case LOCATION_POWER_SAVING:
     *out = (location_power_policy_t){
+        .search_without_camera = cfg->gnss_without_camera,
         .boot_work_s = 45,
         .disconnect_grace_s = 10,
         .stationary_sleep_s = 300,
@@ -493,6 +488,7 @@ void config_resolve_location_power(const app_config_t *cfg,
     break;
   case LOCATION_POWER_TRACK:
     *out = (location_power_policy_t){
+        .search_without_camera = cfg->gnss_without_camera,
         .continuous = true,
         .boot_work_s = 45,
         .disconnect_grace_s = 20,
@@ -505,6 +501,7 @@ void config_resolve_location_power(const app_config_t *cfg,
     break;
   case LOCATION_POWER_CUSTOM:
     *out = (location_power_policy_t){
+        .search_without_camera = cfg->gnss_without_camera,
         .boot_work_s = cfg->custom_boot_work_s,
         .disconnect_grace_s = cfg->custom_disconnect_grace_s,
         .stationary_sleep_s = cfg->custom_stationary_sleep_s,
@@ -517,6 +514,7 @@ void config_resolve_location_power(const app_config_t *cfg,
   case LOCATION_POWER_BALANCED:
   default:
     *out = (location_power_policy_t){
+        .search_without_camera = cfg->gnss_without_camera,
         .boot_work_s = 45,
         .disconnect_grace_s = 20,
         .stationary_sleep_s = 90,

@@ -344,10 +344,12 @@ int main(void) {
                      "ALPHALOC_FAKE_GPS=0", "ALPHALOC_FAKE_GPS_USB_TIME=0",
                      "ALPHALOC_FAKE_GPS_STEPPING=0", "ALPHALOC_LOG_NMEA=0",
                      "ALPHALOC_VERBOSE=0", "ALPHALOC_LIGHT_SLEEP=0",
-                     "ALPHALOC_WIFI_WEB=1", "ALPHALOC_USB_HOST_WIFI=1",
+                     "ALPHALOC_WIFI_WEB=1",
                      "ALPHALOC_LOCATION_OBSERVER=1",
                      "GPS_UART_TX_PIN=19", "GPS_UART_RX_PIN=17", "GPS_UART_BAUD=115200"):
             self.assertIn(flag, flags)
+        self.assertNotIn("ALPHALOC_USB_HOST_WIFI=1", flags)
+        self.assertNotIn("ALPHALOC_USB_VBUS_GPIO=0", flags)
         self.assertEqual(env["build_type"], "release")
         self.assertIn("sdkconfig.xiao-c6.defaults;sdkconfig.xiao-c6-power.defaults",
                       env["board_build.cmake_extra_args"])

@@ -42,9 +42,6 @@
 #if ALPHALOC_POWER_SOURCE_PROBE
 #include "power_source_probe.h"
 #endif
-#if ALPHALOC_WIFI_WEB && ALPHALOC_BOARD_XIAO_ESP32C6
-#include "usb_config_gate.h"
-#endif
 #if ALPHALOC_FAKE_GPS_USB_TIME
 #include "fake_gps_usb_time.h"
 #endif
@@ -102,17 +99,8 @@
 #define ALPHALOC_LIGHT_SLEEP 0
 #endif
 
-#ifndef ALPHALOC_USB_HOST_WIFI
-#define ALPHALOC_USB_HOST_WIFI 0
-#endif
-
 #ifndef ALPHALOC_POWER_SOURCE_PROBE
 #define ALPHALOC_POWER_SOURCE_PROBE 0
-#endif
-
-#if ALPHALOC_USB_HOST_WIFI && \
-    (!ALPHALOC_WIFI_WEB || !ALPHALOC_BOARD_XIAO_ESP32C6)
-#error "USB-host-gated WiFi requires XIAO ESP32-C6 and ALPHALOC_WIFI_WEB"
 #endif
 
 #define FAKE_LAT_DEG 48.137154
@@ -126,9 +114,6 @@
 
 static const char *TAG = "main";
 static app_config_t s_cfg;
-#if !ALPHALOC_USB_HOST_WIFI
-static int64_t s_config_window_end_time_us = 0;
-#endif
 
 static bool get_location_for_send(gps_fix_t *out_fix) {
 #if ALPHALOC_PHASE2
@@ -219,7 +204,7 @@ static void location_publisher_task(void *arg) {
   }
 }
 
-#if !ALPHALOC_USB_HOST_WIFI
+#if ALPHALOC_WIFI_WEB
 static void config_window_task(void *arg) {
   app_config_t *cfg = (app_config_t *)arg;
   app_config_t cfg_snapshot;
@@ -236,8 +221,6 @@ static void config_window_task(void *arg) {
 #if ALPHALOC_WIFI_WEB
   (void)wifi_web_start(cfg);
 #endif
-  s_config_window_end_time_us =
-      esp_timer_get_time() + ((int64_t)cfg_snapshot.config_window_s * 1000000LL);
   vTaskDelay(pdMS_TO_TICKS(cfg_snapshot.config_window_s * 1000ULL));
 #if ALPHALOC_BLE_CONFIG
   ble_config_server_stop();
@@ -250,92 +233,105 @@ static void config_window_task(void *arg) {
 #endif
   vTaskDelete(NULL);
 }
+
+#define WIFI_START_RETRY_MS 5000U
+#define WIFI_IDLE_POLL_MS 1000U
+
+static bool usb_data_host_connected(void) {
+#if ALPHALOC_BOARD_XIAO_ESP32C6
+  return usb_serial_jtag_is_connected();
+#else
+  return false;
+#endif
+}
+
+static void wifi_web_task(void *arg) {
+  app_config_t *cfg = (app_config_t *)arg;
+  while (!wifi_web_start(cfg)) {
+    ESP_LOGW(TAG, "WiFi startup failed; retrying in %u seconds",
+             WIFI_START_RETRY_MS / 1000U);
+    vTaskDelay(pdMS_TO_TICKS(WIFI_START_RETRY_MS));
+  }
+#if ALPHALOC_BLE_LOCATION
+  ble_location_server_start();
 #endif
 
-#if ALPHALOC_USB_HOST_WIFI
-#define USB_CONFIG_POLL_MS 100U
-#define USB_CONFIG_START_RETRY_MS 5000U
-static void usb_host_wifi_task(void *arg) {
-  app_config_t *cfg = (app_config_t *)arg;
-  int64_t now_us = esp_timer_get_time();
-  uint32_t phy_test = USB_SERIAL_JTAG.test.val;
-  bool raw_host = usb_serial_jtag_is_connected();
-  bool raw_allowed = usb_config_source_allows_wifi(
-      raw_host, ((phy_test >> 5) & 1U) != 0, ((phy_test >> 6) & 1U) != 0);
-  usb_config_gate_t gate;
-  usb_config_gate_init(&gate, now_us, raw_allowed);
-  int64_t retry_after_us = 0;
-  bool previous_raw_allowed = raw_allowed;
-  bool replug_required = false;
+  bool previous_usb_host = usb_data_host_connected();
+  bool previous_wifi_client = false;
+  bool idle_shutdown = false;
   int64_t no_client_since_us = 0;
   while (true) {
-    now_us = esp_timer_get_time();
-    raw_host = usb_serial_jtag_is_connected();
-    phy_test = USB_SERIAL_JTAG.test.val;
-    bool dp = ((phy_test >> 5) & 1U) != 0;
-    bool dm = ((phy_test >> 6) & 1U) != 0;
-    raw_allowed = usb_config_source_allows_wifi(raw_host, dp, dm);
-    bool allowed = usb_config_gate_update(&gate, now_us, raw_allowed);
-    bool running = wifi_web_is_started();
-    if (raw_allowed != previous_raw_allowed) {
-      test_debug_event(DBG_SOURCE,raw_allowed,allowed,running,0);
-      ESP_LOGI(TAG, "USB cable candidate: data=%s D+/D-=%u%u connected=%s",
-               raw_host ? "yes" : "no", dp, dm,
-               raw_allowed ? "yes" : "no");
-      previous_raw_allowed = raw_allowed;
+    int64_t now_us = esp_timer_get_time();
+    bool usb_host = usb_data_host_connected();
+    bool usb_wake = usb_host && !previous_usb_host;
+    previous_usb_host = usb_host;
+    bool camera_wake = wifi_web_take_wake_request();
+    if (usb_wake || camera_wake) {
+      idle_shutdown = false;
+      no_client_since_us = now_us;
     }
-
     app_config_t cfg_snapshot;
     if (!config_get_snapshot(cfg, &cfg_snapshot)) {
       cfg_snapshot = *cfg;
       config_validate(&cfg_snapshot);
     }
 
-    if (!allowed) {
-      retry_after_us = 0;
-      replug_required = false;
-      no_client_since_us = 0;
-      if (running) {
-        ESP_LOGI(TAG, "USB cable absent for 5s: stopping WiFi web");
-        test_debug_event(DBG_WIFI_STOP,2,0,0,0);
-        wifi_web_stop();
-      }
-    } else if (allowed && !running && !replug_required && now_us >= retry_after_us) {
-      ESP_LOGI(TAG, "USB cable present for 2s: starting WiFi web");
-      test_debug_event(DBG_AP_START,0,0,0,0);
-      if (!wifi_web_start(cfg)) {
-        retry_after_us = now_us +
-                         (int64_t)USB_CONFIG_START_RETRY_MS * 1000LL;
-        ESP_LOGW(TAG, "WiFi web start failed; retry in 5s while USB cable remains");
-      }
-    }
-
-    running = wifi_web_is_started();
-#if ALPHALOC_BLE_LOCATION
-    if (running) {
-      ble_location_server_start();
-    } else {
-      ble_location_server_stop();
-    }
+    if (!wifi_web_is_started()) {
+      if (previous_wifi_client) {
+#if ALPHALOC_GNSS_STANDBY
+        gps_wifi_connection_changed(false);
 #endif
-    if (allowed && running && !replug_required) {
-      if (wifi_web_has_clients()) {
-        no_client_since_us = 0;
-      } else {
-        if (!no_client_since_us) no_client_since_us = now_us;
-        int64_t timeout_us = (int64_t)cfg_snapshot.wifi_idle_timeout_s * 1000000LL;
-        if (timeout_us > 0 && now_us >= no_client_since_us &&
-            now_us - no_client_since_us >= timeout_us) {
-          ESP_LOGI(TAG, "No WiFi clients for %us: stopping until USB replug",
-                   (unsigned)cfg_snapshot.wifi_idle_timeout_s);
-          test_debug_event(DBG_WIFI_STOP,3,0,0,0);
-          wifi_web_stop();
-          replug_required = true;
+        previous_wifi_client = false;
+      }
+      if (!idle_shutdown) {
+        if (wifi_web_start(cfg)) {
+          ESP_LOGI(TAG, "WiFi web started%s",
+                   usb_wake ? " after USB data-host wake" :
+                   camera_wake ? " after camera connection change" : "");
+          idle_shutdown = false;
           no_client_since_us = 0;
+#if ALPHALOC_BLE_LOCATION
+          ble_location_server_start();
+#endif
+        } else {
+          ESP_LOGW(TAG, "WiFi restart failed; retrying in %u seconds",
+                   WIFI_START_RETRY_MS / 1000U);
+          vTaskDelay(pdMS_TO_TICKS(WIFI_START_RETRY_MS));
         }
+      } else {
+        vTaskDelay(pdMS_TO_TICKS(WIFI_IDLE_POLL_MS));
+      }
+      continue;
+    }
+    bool wifi_client = wifi_web_has_clients();
+    if (wifi_client != previous_wifi_client) {
+#if ALPHALOC_GNSS_STANDBY
+      gps_wifi_connection_changed(wifi_client);
+#endif
+      ESP_LOGI(TAG, "GNSS Wi-Fi policy: client=%s",
+               wifi_client ? "connected" : "disconnected");
+      previous_wifi_client = wifi_client;
+    }
+    if (wifi_client) {
+      no_client_since_us = 0;
+    } else {
+      if (no_client_since_us == 0) no_client_since_us = now_us;
+      int64_t timeout_us =
+          (int64_t)cfg_snapshot.wifi_idle_timeout_s * 1000000LL;
+      if (timeout_us > 0 && now_us >= no_client_since_us &&
+          now_us - no_client_since_us >= timeout_us) {
+        ESP_LOGI(TAG, "No WiFi clients for %us: stopping until a wake source",
+                 (unsigned)cfg_snapshot.wifi_idle_timeout_s);
+        test_debug_event(DBG_WIFI_STOP, 3, 0, 0, 0);
+        wifi_web_stop();
+#if ALPHALOC_BLE_LOCATION
+        ble_location_server_stop();
+#endif
+        idle_shutdown = true;
+        no_client_since_us = 0;
       }
     }
-    vTaskDelay(pdMS_TO_TICKS(USB_CONFIG_POLL_MS));
+    vTaskDelay(pdMS_TO_TICKS(WIFI_IDLE_POLL_MS));
   }
 }
 #endif
@@ -414,13 +410,7 @@ static void status_led_task(void *arg) {
 
     // Wi-Fi status: blue if web server/AP active.
 #if ALPHALOC_WIFI_WEB
-#if ALPHALOC_USB_HOST_WIFI
     bool window_active = wifi_web_is_started();
-#else
-    int64_t now = esp_timer_get_time();
-    bool window_active =
-        (s_config_window_end_time_us == 0 || now < s_config_window_end_time_us);
-#endif
     if (window_active) {
       neopixel_set_rgb(0, 0, 255);
       vTaskDelay(on_ms);
@@ -616,14 +606,13 @@ void app_main(void) {
 #if ALPHALOC_PHASE2
   s_cfg.gps_interval_ms = ALPHALOC_LOCATION_INTERVAL_MS;
 #if ALPHALOC_POWER_SAVE
-  ESP_LOGW(TAG, "PHASE 2 POWER SAVE: continuous GNSS with phone-location fallback; "
+  ESP_LOGW(TAG, "PHASE 2 POWER SAVE: GNSS while camera/Wi-Fi connected; "
+               "persistent fixed location; "
                "Web BLE power profiles; no CPU light sleep; "
                "no battery protection in firmware");
-#if ALPHALOC_USB_HOST_WIFI
-  ESP_LOGW(TAG, "USB-cable-gated WiFi web: data host or asserted D+/D- "
-                "starts after 2s; cable loss stops after 5s; idle timeout is 5/15m");
-#endif
-#define PHASE2_BUILD_LABEL "v17"
+  ESP_LOGI(TAG, "WiFi web starts on power-up; idle timeout is %u seconds",
+           (unsigned)s_cfg.wifi_idle_timeout_s);
+#define PHASE2_BUILD_LABEL "v18"
 #else
 #define PHASE2_BUILD_LABEL "v8.1"
 #endif
@@ -631,8 +620,14 @@ void app_main(void) {
                "publish interval=%ums; no fake fallback, no USB host time",
            GPS_UART_TX_PIN, GPS_UART_RX_PIN, GPS_UART_BAUD,
            (unsigned)s_cfg.gps_interval_ms);
-  ESP_LOGI(TAG, "Location: fresh GNSS first, phone fallback TTL=%uh",
-           (unsigned)s_cfg.phone_location_ttl_hours);
+  ESP_LOGI(TAG, "Fixed location: TTL=%uh priority=%u delete_policy=%u",
+           (unsigned)s_cfg.phone_location_ttl_hours,
+           (unsigned)s_cfg.fixed_location_priority,
+           (unsigned)s_cfg.fixed_location_delete_policy);
+  ESP_LOGI(TAG, "No-camera GNSS=%s record=%s interval=%us",
+           s_cfg.gnss_without_camera ? "on" : "off",
+           s_cfg.record_without_camera ? "on" : "off",
+           (unsigned)s_cfg.track_interval_s);
 #else
   ESP_LOGW(TAG, "PHASE 1 FAKE GPS ONLY: lat=48.137154 lon=11.576124");
 #if ALPHALOC_FAKE_GPS_USB_TIME
@@ -694,7 +689,7 @@ void app_main(void) {
   BaseType_t ret;
 #if ALPHALOC_TRACK_STORE
   if (track_store_ready) {
-    ret = xTaskCreate(track_store_task, "track_store", 4096, NULL, 4, NULL);
+    ret = xTaskCreate(track_store_task, "track_store", 4096, &s_cfg, 4, NULL);
     if (ret != pdPASS) {
       ESP_LOGE(TAG, "Failed to create track_store_task");
     }
@@ -713,19 +708,18 @@ void app_main(void) {
     ESP_LOGE(TAG, "Failed to create location_publisher_task");
   }
 
-#if !ALPHALOC_USB_HOST_WIFI
+#if ALPHALOC_WIFI_WEB
   if (s_cfg.config_window_s > 0) {
     ret =
         xTaskCreate(config_window_task, "config_window", 4096, &s_cfg, 5, NULL);
     if (ret != pdPASS) {
       ESP_LOGE(TAG, "Failed to create config_window_task");
     }
-  }
-#endif
-#if ALPHALOC_USB_HOST_WIFI
-  ret = xTaskCreate(usb_host_wifi_task, "usb_wifi", 4096, &s_cfg, 4, NULL);
-  if (ret != pdPASS) {
-    ESP_LOGE(TAG, "Failed to create usb_host_wifi_task");
+  } else {
+    ret = xTaskCreate(wifi_web_task, "wifi_web", 4096, &s_cfg, 4, NULL);
+    if (ret != pdPASS) {
+      ESP_LOGE(TAG, "Failed to create wifi_web_task");
+    }
   }
 #endif
 #ifdef ALPHALOC_NEOPIXEL_PIN

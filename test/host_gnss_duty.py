@@ -382,6 +382,25 @@ assert(gnss_duty_poll(&state,1007*SEC-1)==GNSS_DUTY_NONE);
 assert(gnss_duty_poll(&state,1007*SEC)==GNSS_DUTY_SLEEP);
 """)
 
+    def test_camera_required_policy_skips_boot_search_and_only_restarts_on_link(self):
+        check("""
+gnss_duty_t state;
+gnss_duty_params_t params={.require_camera=true, .boot_work_s=45,
+  .disconnect_grace_s=0, .stationary_sleep_s=90, .moving_sleep_s=30,
+  .fast_sleep_s=15, .fix_timeout_s=45, .fast_speed_mps=8.0};
+gnss_duty_init_with_params(&state,0,&params);
+assert(gnss_duty_poll(&state,0)==GNSS_DUTY_SLEEP);
+assert(state.next_sleep_s==0);
+gnss_duty_sleep_committed(&state,0);
+assert(gnss_duty_poll(&state,24*60*60*SEC)==GNSS_DUTY_NONE);
+gnss_duty_camera_event(&state,true,24*60*60*SEC);
+assert(gnss_duty_poll(&state,24*60*60*SEC)==GNSS_DUTY_WAKE);
+gnss_duty_wake_committed(&state,24*60*60*SEC);
+assert(state.phase==GNSS_DUTY_WORKING);
+gnss_duty_camera_event(&state,false,24*60*60*SEC+SEC);
+assert(gnss_duty_poll(&state,24*60*60*SEC+SEC)==GNSS_DUTY_SLEEP);
+""")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

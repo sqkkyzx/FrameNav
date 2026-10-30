@@ -25,21 +25,18 @@ class WebStreamChecks(unittest.TestCase):
 #include <string.h>
 #include <time.h>
 #include "ble_client.h"
-#include "track_store.h"
 
 #define ALPHALOC_BATTERY_MONITOR 0
-#define FRAMENAV_EMBEDDED_TLS 1
-#define FRAMENAV_HOSTNAME "framenav.device.igp.wiki"
-#define ALPHALOC_AP_URL "https://" FRAMENAV_HOSTNAME "/"
-#define FRAMENAV_CONTACT_EMAIL "test@example.com"
-#define FRAMENAV_CERT_UPDATE_URL "https://example.com/certs.zip"
 #define ESP_OK 0
 #define ESP_FAIL -1
 #define HTTPD_500_INTERNAL_SERVER_ERROR 500
 #define ESP_LOGI(...) ((void)0)
 typedef int esp_err_t;
 typedef struct { int unused; } httpd_req_t;
-typedef struct { char version[32]; } esp_app_desc_t;
+typedef struct {
+  bool available;
+  uint32_t capacity_bytes, used_bytes, record_count;
+} track_store_status_t;
 
 static app_config_t cfg;
 static app_config_t *s_cfg = &cfg;
@@ -74,10 +71,9 @@ void config_resolve_bluetooth_power(const app_config_t *in,
   *out = (bluetooth_power_policy_t){30, 3000, 100};
 }
 bool gps_get_status(gps_status_t *out) {
-  *out = (gps_status_t){true, 12, GPS_CONSTELLATION_GPS}; return true;
-}
-static const char *constellation_to_str(gps_constellation_t mask) {
-  (void)mask; return "gps";
+  *out = (gps_status_t){.has_lock=true, .satellites=12,
+                        .constellations=GPS_CONSTELLATION_GPS,
+                        .satellites_visible=12}; return true;
 }
 bool ble_client_is_connected(void) { return true; }
 bool ble_client_is_bonded(void) { return true; }
@@ -92,18 +88,14 @@ int ble_client_get_bonds(ble_client_bond_t *out, size_t capacity) {
   }
   return 3;
 }
+bool track_store_get_status(track_store_status_t *out) {
+  *out = (track_store_status_t){true, 1536000, 65536, 4096};
+  return true;
+}
 static void wifi_page_state(char *dot, size_t dot_len, char *state,
-                            size_t state_len, char *address, size_t address_len) {
+                            size_t state_len) {
   snprintf(dot, dot_len, "dot-green");
   snprintf(state, state_len, "connected");
-  snprintf(address, address_len, "10.254.254.1");
-}
-static const esp_app_desc_t *esp_app_get_description(void) {
-  static const esp_app_desc_t desc = {"test-version"}; return &desc;
-}
-bool track_store_get_status(track_store_status_t *out) {
-  *out = (track_store_status_t){true, 1536000, 1600, 100, 1793400000, 1793400300};
-  return true;
 }
 static int httpd_resp_set_type(httpd_req_t *req, const char *type) {
   (void)req; assert(!strcmp(type, "text/html; charset=utf-8")); return ESP_OK;
@@ -130,7 +122,6 @@ static int httpd_resp_send_chunk(httpd_req_t *req, const char *data, int size) {
 '''
             + function_source("src/wifi_web.c", "html_escape_attr")
             + function_source("src/wifi_web.c", "page_send")
-            + function_source("src/wifi_web.c", "format_track_time")
             + root
             + r'''
 static void reset_response(void) {
@@ -144,7 +135,6 @@ int main(void) {
   memset(cfg.camera_name_prefix, '"', sizeof(cfg.camera_name_prefix) - 1);
   memset(cfg.camera_mac_prefix, '&', sizeof(cfg.camera_mac_prefix) - 1);
   memset(cfg.wifi_ssid, '"', sizeof(cfg.wifi_ssid) - 1);
-  memset(cfg.ap_ssid, '&', sizeof(cfg.ap_ssid) - 1);
   cfg.bluetooth_power_mode = BLUETOOTH_POWER_CUSTOM;
   cfg.wifi_idle_timeout_s = WIFI_IDLE_TIMEOUT_LONG_S;
   cfg.phone_location_ttl_hours = PHONE_LOCATION_TTL_MAX_HOURS;
@@ -155,12 +145,22 @@ int main(void) {
     assert(handle_root(&req) == ESP_OK);
     assert(!errors && !rejected && completed == 1 && chunks > 1);
     assert(live_bytes == 0 && peak_bytes <= 12288);
-    assert(strstr(response, "test-version"));
+    assert(!strstr(response, "固件版本"));
+    assert(!strstr(response, "轨迹数据"));
+    assert(!strstr(response, "10.254.254.1"));
     assert(strstr(response, "&quot;&quot;"));
-    assert(strstr(response, "navigator.geolocation.getCurrentPosition"));
-    assert(strstr(response, "action=\"/cert/update\""));
+    assert(!strstr(response, "navigator.geolocation"));
+    assert(!strstr(response, "action=\"/cert/update\""));
+    assert(strstr(response, "轨迹条数："));
+    assert(strstr(response, "存储占用："));
+    assert(!strstr(response, "ap_ssid"));
+    assert(strstr(response, "搜到卫星："));
+    assert(strstr(response, "loc-running-gnss-dot"));
+    assert(strstr(response, "loc-running-gnss\">"));
+    assert(strstr(response, "相机和手机都未连接时搜星"));
+    assert(strstr(response, "name=\"track_int_s\""));
     assert(strstr(response, "border-radius:50%"));
-    assert(response_used > 15000);
+    assert(response_used > 8000);
     assert(!strcmp(response + response_used - 14, "</body></html>"));
   }
   reset_response(); fail_chunk = 3;

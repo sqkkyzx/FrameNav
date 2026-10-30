@@ -16,6 +16,23 @@
 #define WIFI_IDLE_TIMEOUT_LONG_S 900U
 #define PHONE_LOCATION_TTL_DEFAULT_HOURS 6U
 #define PHONE_LOCATION_TTL_MAX_HOURS 720U
+#define LOCATION_RECORD_INTERVAL_DEFAULT_S 3U
+#define LOCATION_RECORD_INTERVAL_MIN_S 1U
+#define LOCATION_RECORD_INTERVAL_MAX_S 3600U
+
+typedef enum {
+  FIXED_LOCATION_GPS_PRIORITY = 0,
+  FIXED_LOCATION_PRIORITY = 1,
+} fixed_location_priority_t;
+
+typedef enum {
+  FIXED_LOCATION_DELETE_AFTER_1_MIN = 0,
+  FIXED_LOCATION_DELETE_AFTER_5_MIN = 1,
+  FIXED_LOCATION_DELETE_WHEN_FAR = 2,
+  FIXED_LOCATION_DELETE_AFTER_1_MIN_WHEN_FAR = 3,
+  FIXED_LOCATION_DELETE_AFTER_5_MIN_WHEN_FAR = 4,
+  FIXED_LOCATION_KEEP_UNTIL_EXPIRY = 5,
+} fixed_location_delete_policy_t;
 
 typedef enum
 {
@@ -35,6 +52,7 @@ typedef enum
 typedef struct
 {
   bool continuous;
+  bool search_without_camera;
   uint32_t boot_work_s;
   uint32_t disconnect_grace_s;
   uint32_t stationary_sleep_s;
@@ -75,10 +93,13 @@ typedef struct
   uint32_t custom_ble_scan_window_ms;
   char wifi_ssid[CONFIG_STR_MAX_32];
   char wifi_pass[CONFIG_STR_MAX_64];
-  char ap_ssid[CONFIG_STR_MAX_32];
-  char ap_pass[CONFIG_STR_MAX_64];
   uint32_t wifi_idle_timeout_s;
   uint32_t phone_location_ttl_hours;
+  uint8_t fixed_location_priority;
+  uint8_t fixed_location_delete_policy;
+  uint8_t gnss_without_camera;
+  uint8_t record_without_camera;
+  uint32_t track_interval_s;
 } app_config_t;
 
 void config_set_defaults(app_config_t *cfg);

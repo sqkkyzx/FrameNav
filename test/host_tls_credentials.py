@@ -417,107 +417,12 @@ class EmbeddedPemChecks(unittest.TestCase):
 
 
 class DownloadChecks(unittest.TestCase):
-    def test_http_status_cached_body_truncation_limits_and_cleanup(self):
+    def test_webui_no_longer_contains_tls_download_path(self):
         source = (ROOT / "src/wifi_web.c").read_text()
-        start = source.index("typedef struct {\n  uint8_t *buffer;\n  size_t length, capacity;")
-        end = source.index("} cert_download_ctx_t;", start) + len("} cert_download_ctx_t;")
-        run_c("""
-#include <assert.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include "tls_credentials.h"
-#define FRAMENAV_CERT_UPDATE_URL "https://framenav.igp.wiki/download/certs.zip"
-#define ESP_OK 0
-#define HTTP_METHOD_GET 0
-typedef void *esp_http_client_handle_t;
-typedef struct {
-  const char *url;
-  int method, timeout_ms, buffer_size, buffer_size_tx;
-  void (*crt_bundle_attach)(void);
-  bool disable_auto_redirect;
-} esp_http_client_config_t;
-static uint8_t body[65537];
-static size_t position, size;
-static int status, reads, writes, parses;
-static int64_t declared;
-static bool complete, headers_cached, open_fail, save_fail, connected;
-static int64_t esp_timer_get_time(void) { return 0; }
-static void esp_crt_bundle_attach(void) {}
-static esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *config) {
-  assert(!strcmp(config->url, FRAMENAV_CERT_UPDATE_URL));
-  assert(config->disable_auto_redirect && config->crt_bundle_attach == esp_crt_bundle_attach);
-  assert(config->method == HTTP_METHOD_GET);
-  connected = true; return (void *)1;
-}
-static int esp_http_client_open(void *client, int length) {
-  (void)client; assert(length == 0); return open_fail ? -1 : ESP_OK;
-}
-static int64_t esp_http_client_fetch_headers(void *client) { (void)client; return declared; }
-static int esp_http_client_get_status_code(void *client) { (void)client; return status; }
-static bool esp_http_client_is_complete_data_received(void *client) {
-  (void)client; return complete && (headers_cached || position == size);
-}
-static int esp_http_client_read(void *client, char *out, int capacity) {
-  (void)client; ++reads;
-  size_t count = size - position;
-  if (count > (size_t)capacity) count = capacity;
-  memcpy(out, body + position, count); position += count; return (int)count;
-}
-static void esp_http_client_cleanup(void *client) { (void)client; connected = false; }
-bool tls_credentials_from_zip(const uint8_t *zip, size_t length, tls_credentials_t *out) {
-  assert(!connected); ++parses;
-  if (!length || length != size || memcmp(zip, body, length)) return false;
-  out->cert = malloc(5); out->key = malloc(8);
-  memcpy(out->cert, "cert", 5); memcpy(out->key, "new-key", 8);
-  out->cert_len = 4; out->key_len = 7; return true;
-}
-void tls_credentials_free(tls_credentials_t *out) {
-  free(out->cert); free(out->key); *out = (tls_credentials_t){0};
-}
-bool cert_store_write(const uint8_t *cert, size_t cert_len,
-                       const uint8_t *key, size_t key_len) {
-  assert(!connected && cert_len == 4 && key_len == 7);
-  assert(!strcmp((const char *)cert, "cert") && !strcmp((const char *)key, "new-key"));
-  ++writes; return !save_fail;
-}
-""" + source[start:end] + "\n" +
-              function_source("src/wifi_web.c", "cert_download_free") + "\n" +
-              function_source("src/wifi_web.c", "cert_download_append") + "\n" +
-              function_source("src/wifi_web.c", "download_updated_tls_credentials") + """
-static void reset(void) {
-  memset(body, 'A', sizeof(body)); size = 6000; position = 0; status = 200;
-  declared = size; complete = true; headers_cached = open_fail = save_fail = false;
-  reads = writes = parses = 0;
-}
-int main(void) {
-  reset(); assert(download_updated_tls_credentials()); assert(writes == 1 && !connected);
-  reset(); headers_cached = true; // fetch_headers already received the body.
-  assert(download_updated_tls_credentials()); assert(reads > 0 && writes == 1);
-  reset(); declared = 0; // Chunked response, unknown length until complete.
-  assert(download_updated_tls_credentials()); assert(writes == 1);
-  reset(); size = declared = 65536;
-  assert(download_updated_tls_credentials()); assert(writes == 1);
-  reset(); size = declared = 65537;
-  assert(!download_updated_tls_credentials()); assert(!reads && !writes && !parses);
-  reset(); size = 65537; declared = 0;
-  assert(!download_updated_tls_credentials()); assert(!writes && !parses && !connected);
-  reset(); status = 302;
-  assert(!download_updated_tls_credentials()); assert(!reads && !writes);
-  reset(); complete = false;
-  assert(!download_updated_tls_credentials()); assert(!writes && !parses);
-  reset(); open_fail = true;
-  assert(!download_updated_tls_credentials()); assert(!reads && !writes && !connected);
-  reset(); declared = -1;
-  assert(!download_updated_tls_credentials()); assert(!reads && !writes);
-  reset(); size = declared = 0;
-  assert(!download_updated_tls_credentials()); assert(!writes);
-  reset(); save_fail = true;
-  assert(!download_updated_tls_credentials()); assert(writes == 1 && !connected);
-  return 0;
-}
-""")
+        self.assertNotIn("esp_http_client", source)
+        self.assertNotIn("cert_download_ctx_t", source)
+        self.assertNotIn("/cert/update", source)
+        self.assertNotIn("FRAMENAV_CERT_UPDATE_URL", source)
 
 
 if __name__ == "__main__":

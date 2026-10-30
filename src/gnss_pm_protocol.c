@@ -30,7 +30,7 @@ size_t gnss_pm_build_mon_ver(uint8_t *out, size_t cap) {
 }
 
 size_t gnss_pm_build_request(uint8_t *out, size_t cap, uint32_t sleep_ms) {
-  if (!out || cap < GNSS_PM_REQUEST_PACKET_SIZE || !sleep_ms ||
+  if (!out || cap < GNSS_PM_REQUEST_PACKET_SIZE ||
       sleep_ms > GNSS_PM_MAX_SLEEP_MS) return 0;
   memset(out, 0, GNSS_PM_REQUEST_PACKET_SIZE);
   out[0] = 0xb5;

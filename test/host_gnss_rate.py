@@ -201,6 +201,7 @@ assert(state.ubx_bad==1 && state.rx_state==0);
     def test_actual_gps_task_keeps_nmea_valid_across_interleaved_binary(self):
         good = nmea("GNRMC,120000.00,A,2234.5678,N,11345.1234,E,0,0,030926,,,A,V")
         gga = nmea("GNGGA,120000.00,2234.5678,N,11345.1234,E,1,08,0.9,1.0,M,0.0,M,,")
+        gsv = nmea("GPGSV,2,1,06,01,40,100,35,02,30,200,30")
         # Embed a valid fake-location NMEA line inside an unknown UBX payload.
         embedded = (nmea("GNRMC,120001.00,A,4808.22924,N,1134.56744,E,0,0,030926,,,A,V") + "\r\n").encode()
         ubx = bytearray([0xb5,0x62,1,7,len(embedded),0]) + embedded
@@ -209,10 +210,13 @@ assert(state.ubx_bad==1 && state.rx_state==0);
             a = (a + byte) & 255
             b = (b + a) & 255
         ubx += bytes([a,b])
-        data = (good+"\r\n").encode() + ubx + (gga+"\r\n"+good+"\r\n").encode()
+        data = (good+"\r\n").encode() + ubx + (
+            gga+"\r\n"+gsv+"\r\n"+good+"\r\n").encode()
         fixture = ','.join(str(b) for b in data)
         run_c(BASE + MODULE + RMC + STATE + source(
-            "hex_value", "nmea_checksum_valid", "parse_int_range", "update_status_gga", "parse_zda") + """
+            "hex_value", "nmea_checksum_valid", "parse_int_range",
+            "gsv_talker_index", "update_status_gsv", "update_status_gga",
+            "parse_zda") + """
 #include <setjmp.h>
 static jmp_buf stop;
 static gnss_rate_t s_rate;
@@ -236,9 +240,10 @@ static int uart_read_bytes(int uart, uint8_t *out,size_t max,int ticks) {
 """ + source("gps_task") + """
 int main(void) {
   if(setjmp(stop)==0) gps_task(NULL);
-  assert(s_nmea_ok==3 && s_nmea_bad==0 && s_rmc_count==2);
+  assert(s_nmea_ok==4 && s_nmea_bad==0 && s_rmc_count==2);
   assert(s_rate.ubx_ok==1 && s_rate.nmea_seen && s_rmc_sample_us>0);
   assert(s_latest_fix.valid && s_latest_fix.time_valid);
+  assert(s_status.satellites_visible==6);
   assert(fabs(s_latest_fix.lat_deg-(22+34.5678/60))<1e-9);
   assert(s_status.satellites==8 && s_uart_bytes==sizeof(fixture));
   return 0;

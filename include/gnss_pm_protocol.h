@@ -26,7 +26,7 @@ typedef struct {
 
 /* Return the complete UBX frame length, or zero without writing on failure. */
 size_t gnss_pm_build_mon_ver(uint8_t *out, size_t cap);
-/* Reject zero and durations above the documented maximum. */
+/* Zero sleeps until a UART wake edge; reject durations above the maximum. */
 size_t gnss_pm_build_request(uint8_t *out, size_t cap, uint32_t sleep_ms);
 
 /* Pass only a complete, checksum-verified MON-VER payload, not its UBX header.

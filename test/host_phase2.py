@@ -29,6 +29,8 @@ BASE = PRELUDE + """
 #define ALPHALOC_FAKE_GPS 0
 #define GPS_LINE_MAX 128
 #define GPS_UART_BUF_SIZE 2048
+#define GPS_GSV_TALKER_COUNT 7U
+#define GPS_GSV_FRESH_US 15000000LL
 #define pdTRUE 1
 #define pdMS_TO_TICKS(x) (x)
 #define xSemaphoreTake(m,t) (1)
@@ -43,9 +45,11 @@ RMC = source("parse_time_hms", "date_valid", "split_csv", "parse_deg_min", "pars
 STATE = """
 static gps_fix_t s_latest_fix;
 static gps_status_t s_status;
+static uint8_t s_gsv_satellites[GPS_GSV_TALKER_COUNT];
+static int64_t s_gsv_seen_us[GPS_GSV_TALKER_COUNT];
 static int s_fix_mutex=1;
 static int64_t s_last_no_fix_log_us;
-""" + source("update_fix", "gps_get_latest", "gps_get_status")
+""" + source("update_fix", "gps_get_latest", "visible_satellites_now", "gps_get_status")
 
 
 class Phase2Checks(unittest.TestCase):
@@ -160,6 +164,34 @@ int main(void) {
 }
 """)
 
+    def test_gsv_visible_satellites_sums_constellations_and_expires(self):
+        run_c(BASE + STATE + source(
+            "parse_int_range", "split_csv", "gsv_talker_index",
+            "update_status_gsv") + """
+int main(void) {
+  (void)update_fix;
+  gps_status_t status;
+  update_status_gsv("$GPGSV,2,1,08,01,40,100,35");
+  update_status_gsv("$GLGSV,1,1,07,65,35,120,32");
+  update_status_gsv("$GBGSV,1,1,04,201,25,090,28");
+  update_status_gsv("$BDGSV,1,1,06,211,20,080,30");
+  assert(gps_get_status(&status));
+  assert(status.satellites_visible == 21); // BeiDou aliases share one stream.
+
+  update_status_gsv("$GNGSV,1,1,17,01,40,100,35");
+  assert(gps_get_status(&status));
+  assert(status.satellites_visible == 17); // Prefer the combined stream.
+
+  now_us += GPS_GSV_FRESH_US + 1;
+  assert(gps_get_status(&status));
+  assert(status.satellites_visible == 0);
+  assert(gsv_talker_index("$GPGGA,anything") == -1);
+  update_status_gsv("$GPGSV,0,0,99");
+  assert(gps_get_status(&status) && status.satellites_visible == 0);
+  return 0;
+}
+""")
+
     def test_phase2_environment_and_uart_idle_polling(self):
         config=configparser.ConfigParser(interpolation=None)
         config.read(ROOT / "platformio.ini")
@@ -171,6 +203,7 @@ int main(void) {
         self.assertNotIn("ALPHALOC_FAKE_GPS=1",flags)
         self.assertIn("ALPHALOC_FAKE_GPS=1",config["env:xiao-c6-debug"]["build_flags"])
         task=function_source("src/gps.c","gps_task")
+        self.assertIn("update_status_gsv(line_buf)", task)
         self.assertIn("#if !ALPHALOC_PHASE2\n      vTaskDelay",task)
         self.assertIn("#if !ALPHALOC_PHASE2\n              update_time_date",task)
 

@@ -37,6 +37,7 @@ typedef enum {
 
 typedef struct {
   bool continuous;
+  bool require_camera;
   uint32_t boot_work_s;
   uint32_t disconnect_grace_s;
   uint32_t stationary_sleep_s;

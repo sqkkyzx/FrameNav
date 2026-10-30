@@ -27,8 +27,6 @@ typedef enum {
   FIELD_DST_OFF,
   FIELD_WIFI_SSID,
   FIELD_WIFI_PASS,
-  FIELD_AP_SSID,
-  FIELD_AP_PASS,
   FIELD_MAX_GPS_AGE,
   FIELD_STATUS_GPS_LOCK,
   FIELD_STATUS_GPS_SATS,
@@ -63,12 +61,6 @@ static const ble_uuid128_t k_chr_wifi_ssid_uuid =
 static const ble_uuid128_t k_chr_wifi_pass_uuid =
     BLE_UUID128_INIT(0xB1, 0xF0, 0xB4, 0xD5, 0x79, 0x7B, 0x5A, 0x9E,
                      0x5B, 0x4F, 0x4A, 0x1F, 0x08, 0x00, 0x7E, 0xA1);
-static const ble_uuid128_t k_chr_ap_ssid_uuid =
-    BLE_UUID128_INIT(0xB1, 0xF0, 0xB4, 0xD5, 0x79, 0x7B, 0x5A, 0x9E,
-                     0x5B, 0x4F, 0x4A, 0x1F, 0x09, 0x00, 0x7E, 0xA1);
-static const ble_uuid128_t k_chr_ap_pass_uuid =
-    BLE_UUID128_INIT(0xB1, 0xF0, 0xB4, 0xD5, 0x79, 0x7B, 0x5A, 0x9E,
-                     0x5B, 0x4F, 0x4A, 0x1F, 0x0A, 0x00, 0x7E, 0xA1);
 static const ble_uuid128_t k_chr_max_gps_age_uuid =
     BLE_UUID128_INIT(0xB1, 0xF0, 0xB4, 0xD5, 0x79, 0x7B, 0x5A, 0x9E,
                      0x5B, 0x4F, 0x4A, 0x1F, 0x0B, 0x00, 0x7E, 0xA1);
@@ -158,12 +150,6 @@ static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
       case FIELD_WIFI_PASS:
         value = cfg.wifi_pass;
         break;
-      case FIELD_AP_SSID:
-        value = cfg.ap_ssid;
-        break;
-      case FIELD_AP_PASS:
-        value = cfg.ap_pass;
-        break;
       case FIELD_MAX_GPS_AGE:
         snprintf(num_buf, sizeof(num_buf), "%u", (unsigned)cfg.max_gps_age_s);
         value = num_buf;
@@ -239,12 +225,6 @@ static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
       case FIELD_WIFI_PASS:
         copy_str_field(cfg.wifi_pass, sizeof(cfg.wifi_pass), buf, strlen(buf));
         break;
-      case FIELD_AP_SSID:
-        copy_str_field(cfg.ap_ssid, sizeof(cfg.ap_ssid), buf, strlen(buf));
-        break;
-      case FIELD_AP_PASS:
-        copy_str_field(cfg.ap_pass, sizeof(cfg.ap_pass), buf, strlen(buf));
-        break;
       case FIELD_MAX_GPS_AGE: {
         uint32_t max_age = 0;
         if (!parse_u32_field(buf, 86400, &max_age)) {
@@ -298,14 +278,6 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
              .access_cb = gatt_access_cb,
              .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
              .arg = (void *)FIELD_WIFI_PASS},
-            {.uuid = &k_chr_ap_ssid_uuid.u,
-             .access_cb = gatt_access_cb,
-             .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
-             .arg = (void *)FIELD_AP_SSID},
-            {.uuid = &k_chr_ap_pass_uuid.u,
-             .access_cb = gatt_access_cb,
-             .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
-             .arg = (void *)FIELD_AP_PASS},
             {.uuid = &k_chr_max_gps_age_uuid.u,
              .access_cb = gatt_access_cb,
              .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
