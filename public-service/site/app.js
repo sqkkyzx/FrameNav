@@ -45,9 +45,9 @@ function secureContextReady() {
 }
 
 function bluetoothReady() {
-  if (!navigator.bluetooth) {
-    setStatus("device-state", "浏览器不支持", "error");
-    setMessage("请使用 Android Chrome，并从 HTTPS 页面打开。", true);
+  if (!navigator.bluetooth || typeof navigator.bluetooth.requestDevice !== "function") {
+    setStatus("device-state", "未提供 Web Bluetooth", "warn");
+    setMessage("当前浏览器未提供 Web Bluetooth，网页无法直接连接设备。连接按钮仍可点击，支持该 API 的浏览器会直接打开设备选择器。", true);
     return false;
   }
   return true;
@@ -259,4 +259,3 @@ $("clear-location").addEventListener("click", async () => {
 });
 
 secureContextReady();
-if (!navigator.bluetooth) setStatus("device-state", "需 Android Chrome", "warn");

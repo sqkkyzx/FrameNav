@@ -1,6 +1,6 @@
 # FrameNav 公网定位页
 
-这是一个只提供 HTTP 源站的静态页面。CDN 在公网边缘终止 HTTPS，并把请求回源到 Compose 暴露的端口。页面使用 Android Chrome 的 Web Bluetooth 连接 FrameNav，只写入手机位置，不访问设备的 HTTPS 证书。
+这是一个只提供 HTTP 源站的静态页面。CDN 在公网边缘终止 HTTPS，并把请求回源到 Compose 暴露的端口。页面使用浏览器提供的 Web Bluetooth 连接 FrameNav，只写入手机位置，不访问设备的 HTTPS 证书。
 
 ## 发布
 
@@ -23,5 +23,5 @@ docker compose ps
 ## 使用条件
 
 - 页面必须通过 CDN 的 HTTPS 地址打开，HTTP 源站不直接用于手机浏览器。
-- Android Chrome 需要用户点击“连接设备”并选择 FrameNav；蓝牙连接期间设备需要处于 USB 唤醒窗口。
+- 支持 Web Bluetooth 的浏览器需要用户点击“连接设备”并选择 FrameNav；蓝牙连接期间设备需要处于 USB 唤醒窗口。Android Chrome 是当前已验证的路径，其他浏览器由自身平台决定是否提供 Web Bluetooth。
 - 固件需要包含位置 BLE 服务：`b1f0b4d5-797b-5a9e-5b4f-4a1f02007ea1`。

@@ -101,12 +101,17 @@ vm.createContext(context);
   assert.equal(geo.length, 8);
   assert.equal(node('latitude').textContent, '31.2000000');
   assert.equal(node('write-location').disabled, false);
+  context.navigator = {};
+  await node('connect').events.click();
+  assert.match(node('message').textContent, /未提供 Web Bluetooth/);
 })().catch(error=>{console.error(error);process.exitCode=1;});
 """
         result = subprocess.run(
             [shutil.which("node"), "-e", harness], capture_output=True, text=True
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("请使用 Android Chrome", app)
+        self.assertNotIn("需 Android Chrome", app)
 
 
 if __name__ == "__main__":
