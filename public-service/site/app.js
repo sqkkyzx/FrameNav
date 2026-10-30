@@ -1,9 +1,18 @@
 const SERVICE_UUID = "b1f0b4d5-797b-5a9e-5b4f-4a1f02007ea1";
 const WRITE_UUID = "b1f0b4d5-797b-5a9e-5b4f-4a1f02107ea1";
 const CLEAR_UUID = "b1f0b4d5-797b-5a9e-5b4f-4a1f02117ea1";
+const GATT_RETRY_DELAYS_MS = [0, 300, 700, 1500, 3000, 5000];
 
 const $ = (id) => document.getElementById(id);
-const state = { device: null, characteristic: null, clearCharacteristic: null, position: null };
+const state = {
+  device: null,
+  characteristic: null,
+  clearCharacteristic: null,
+  position: null,
+  connecting: null,
+  gattQueue: Promise.resolve(),
+  gattQueueDepth: 0,
+};
 
 function setMessage(text, error = false) {
   const node = $("message");
@@ -15,6 +24,14 @@ function setStatus(id, text, kind = "neutral") {
   const node = $(id);
   node.textContent = text;
   node.className = `status status-${kind}`;
+}
+
+function updateActionButtons() {
+  const connected = Boolean(state.characteristic && state.device?.gatt?.connected);
+  const busy = state.gattQueueDepth > 0;
+  $("write-location").disabled = busy || !connected || !state.position;
+  $("write-manual").disabled = busy || !connected;
+  $("clear-location").disabled = busy || !connected || !state.clearCharacteristic;
 }
 
 function secureContextReady() {
@@ -41,9 +58,7 @@ function setConnected(device) {
   $("device-name").textContent = device.name || "FrameNav";
   $("device-detail").textContent = "蓝牙已连接，可以写入位置。";
   setStatus("device-state", "已连接", "ok");
-  $("write-location").disabled = !state.position;
-  $("write-manual").disabled = false;
-  $("clear-location").disabled = !state.clearCharacteristic;
+  updateActionButtons();
 }
 
 function disconnected() {
@@ -51,29 +66,67 @@ function disconnected() {
   state.clearCharacteristic = null;
   setStatus("device-state", "已断开", "warn");
   $("device-detail").textContent = "请重新连接设备。";
-  $("write-location").disabled = true;
-  $("write-manual").disabled = true;
-  $("clear-location").disabled = true;
+  updateActionButtons();
 }
 
 async function connectDevice() {
-  if (!secureContextReady() || !bluetoothReady()) return;
-  setMessage("请选择附近的 FrameNav…");
-  const device = await navigator.bluetooth.requestDevice({
-    filters: [{ services: [SERVICE_UUID] }],
-    optionalServices: [SERVICE_UUID],
-  });
-  device.addEventListener("gattserverdisconnected", disconnected);
-  const server = await device.gatt.connect();
-  const service = await server.getPrimaryService(SERVICE_UUID);
-  state.characteristic = await service.getCharacteristic(WRITE_UUID);
-  state.clearCharacteristic = await service.getCharacteristic(CLEAR_UUID);
-  setConnected(device);
-  setMessage("设备已连接。", false);
+  if (state.connecting) return state.connecting;
+  const run = (async () => {
+    if (!secureContextReady() || !bluetoothReady()) return;
+    $("connect").disabled = true;
+    setMessage("请选择附近的 FrameNav…");
+    try {
+      const device = await navigator.bluetooth.requestDevice({
+        filters: [{ services: [SERVICE_UUID] }],
+        optionalServices: [SERVICE_UUID],
+      });
+      device.addEventListener("gattserverdisconnected", disconnected);
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(SERVICE_UUID);
+      state.characteristic = await service.getCharacteristic(WRITE_UUID);
+      state.clearCharacteristic = await service.getCharacteristic(CLEAR_UUID);
+      setConnected(device);
+      setMessage("设备已连接。", false);
+    } finally {
+      $("connect").disabled = false;
+    }
+  })();
+  state.connecting = run;
+  try {
+    return await run;
+  } finally {
+    if (state.connecting === run) state.connecting = null;
+  }
 }
 
 function getPosition(options) {
   return new Promise((resolve, reject) => navigator.geolocation.getCurrentPosition(resolve, reject, options));
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientGattError(error) {
+  const text = `${error?.name || ""} ${error?.message || error || ""}`.toLowerCase();
+  return text.includes("already in progress") || text.includes("unknown reason");
+}
+
+function queueGattOperation(operation) {
+  state.gattQueueDepth += 1;
+  updateActionButtons();
+  const run = state.gattQueue.then(operation, operation);
+  state.gattQueue = run.then(
+    () => {
+      state.gattQueueDepth -= 1;
+      updateActionButtons();
+    },
+    () => {
+      state.gattQueueDepth -= 1;
+      updateActionButtons();
+    },
+  );
+  return run;
 }
 
 async function getPhonePosition() {
@@ -97,7 +150,7 @@ function showPosition(position) {
   $("longitude").textContent = longitude.toFixed(7);
   $("accuracy").textContent = `${Math.round(state.position.accuracy)} m`;
   setStatus("location-state", "已获取", "ok");
-  $("write-location").disabled = !state.characteristic;
+  updateActionButtons();
 }
 
 function encodePosition(position) {
@@ -114,9 +167,25 @@ function encodePosition(position) {
   return buffer;
 }
 
-async function writeValue(characteristic, value) {
-  if (characteristic.writeValueWithResponse) return characteristic.writeValueWithResponse(value);
-  return characteristic.writeValue(value);
+function writeValue(characteristic, value) {
+  return queueGattOperation(async () => {
+    let lastError;
+    for (let attempt = 0; attempt < GATT_RETRY_DELAYS_MS.length; attempt += 1) {
+      if (GATT_RETRY_DELAYS_MS[attempt]) await wait(GATT_RETRY_DELAYS_MS[attempt]);
+      try {
+        if (characteristic.writeValueWithResponse) {
+          return await characteristic.writeValueWithResponse(value);
+        }
+        return await characteristic.writeValue(value);
+      } catch (error) {
+        lastError = error;
+        if (!isTransientGattError(error) || attempt === GATT_RETRY_DELAYS_MS.length - 1) {
+          throw error;
+        }
+      }
+    }
+    throw lastError;
+  });
 }
 
 async function requireConnection() {
@@ -131,8 +200,16 @@ async function writeCurrentPosition(position, label = "手机位置") {
   if (!Number.isSafeInteger(capturedMs) || Date.now() < capturedMs || Date.now() - capturedMs > 60000) {
     throw new Error("定位数据已过期，请重新获取");
   }
+  setMessage("正在写入设备…");
   await writeValue(state.characteristic, encodePosition(position));
   setMessage(`${label}已写入设备。`);
+}
+
+function gattErrorMessage(error, fallback) {
+  if (isTransientGattError(error)) {
+    return "蓝牙操作仍在进行，请保持设备连接，稍后重试。";
+  }
+  return error?.message || fallback;
 }
 
 async function readAndShowPosition() {
@@ -167,14 +244,18 @@ $("connect").addEventListener("click", async () => {
 });
 $("get-location").addEventListener("click", readAndShowPosition);
 $("write-location").addEventListener("click", async () => {
-  try { await writeCurrentPosition(state.position); } catch (error) { setMessage(error.message || "写入失败。", true); }
+  try { await writeCurrentPosition(state.position); } catch (error) { setMessage(gattErrorMessage(error, "写入失败。"), true); }
 });
 $("write-manual").addEventListener("click", async () => {
-  try { await writeCurrentPosition(manualPosition(), "手动位置"); } catch (error) { setMessage(error.message || "写入失败。", true); }
+  try { await writeCurrentPosition(manualPosition(), "手动位置"); } catch (error) { setMessage(gattErrorMessage(error, "写入失败。"), true); }
 });
 $("clear-location").addEventListener("click", async () => {
-  try { await requireConnection(); await writeValue(state.clearCharacteristic, new Uint8Array([1])); setMessage("设备中的手机位置已清除。"); }
-  catch (error) { setMessage(error.message || "清除失败。", true); }
+  try {
+    await requireConnection();
+    setMessage("正在清除设备位置…");
+    await writeValue(state.clearCharacteristic, new Uint8Array([1]));
+    setMessage("设备中的手机位置已清除。");
+  } catch (error) { setMessage(gattErrorMessage(error, "清除失败。"), true); }
 });
 
 secureContextReady();

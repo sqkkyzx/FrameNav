@@ -23,13 +23,19 @@ const vm = require('node:vm'), assert = require('node:assert/strict');
 const SERVICE = 'b1f0b4d5-797b-5a9e-5b4f-4a1f02007ea1';
 const WRITE = 'b1f0b4d5-797b-5a9e-5b4f-4a1f02107ea1';
 const CLEAR = 'b1f0b4d5-797b-5a9e-5b4f-4a1f02117ea1';
-const nodes = new Map(), writes = [], geo = [], geoErrors = [], geoPositions = [];
+const nodes = new Map(), writes = [], geo = [], geoErrors = [], geoPositions = [], writeErrors = [];
+let activeWrites = 0, maxActiveWrites = 0;
 function node(id) {
   if (!nodes.has(id)) nodes.set(id, {id, value:'', textContent:'', className:'', disabled:false,
     events:{}, classList:{toggle(){}}, addEventListener(type, callback){this.events[type]=callback;}});
   return nodes.get(id);
 }
-const writeChar = {async writeValueWithResponse(value){writes.push([...new Uint8Array(value)]);}};
+const writeChar = {async writeValueWithResponse(value){
+  activeWrites += 1; maxActiveWrites = Math.max(maxActiveWrites, activeWrites);
+  await Promise.resolve();
+  if (writeErrors.length) { const error = writeErrors.shift(); activeWrites -= 1; throw error; }
+  writes.push([...new Uint8Array(value)]); activeWrites -= 1;
+}};
 const clearChar = {async writeValueWithResponse(value){writes.push([...new Uint8Array(value)]);}};
 const service = {async getCharacteristic(uuid){assert([WRITE,CLEAR].includes(uuid)); return uuid===WRITE ? writeChar : clearChar;}};
 const device = {name:'FrameNav-ABC123', addEventListener(){}, gatt:{connected:true,
@@ -45,7 +51,7 @@ const navigator = {bluetooth:{async requestDevice(options){
     if(geoPositions.length){ok(geoPositions.shift());return;}
     if(options.enableHighAccuracy) ok({coords:{latitude:23.5,longitude:114.5,accuracy:16.7},timestamp:Date.now()});
     else fail({code:3});}}};
-const context = {window:{isSecureContext:true},navigator,document:{getElementById:node},Date,Number,Math,BigInt,
+const context = {window:{isSecureContext:true},navigator,document:{getElementById:node},Date,Number,Math,BigInt,setTimeout,
   DataView,ArrayBuffer,Uint8Array,Promise};
 vm.createContext(context);
 """ + "vm.runInContext(" + __import__("json").dumps(app) + r""", context);
@@ -71,6 +77,14 @@ vm.createContext(context);
   assert.equal(new DataView(new Uint8Array(writes[1]).buffer).getInt32(0, true), 241000000);
   await node('clear-location').events.click();
   assert.deepEqual(writes[2], [1]);
+  writeErrors.push(new Error('GATT operation already in progress.'),
+                   new Error('GATT operation failed for unknown reason.'));
+  const firstWrite = node('write-location').events.click();
+  const secondWrite = node('write-location').events.click();
+  await Promise.all([firstWrite, secondWrite]);
+  assert.equal(maxActiveWrites, 1);
+  assert.equal(writes.length, 5);
+  assert.match(node('message').textContent, /已写入设备/);
   geoErrors.push({code:1});
   await node('get-location').events.click();
   assert.match(node('message').textContent, /Android 设置中允许 Chrome/);
