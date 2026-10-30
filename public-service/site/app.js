@@ -82,11 +82,11 @@ async function getPhonePosition() {
   setStatus("location-state", "定位中", "warn");
   setMessage("正在请求手机定位权限…");
   try {
-    return await getPosition({ enableHighAccuracy: false, maximumAge: 0, timeout: 15000 });
+    return await getPosition({ enableHighAccuracy: false, maximumAge: 60000, timeout: 15000 });
   } catch (error) {
     if (error.code !== 2 && error.code !== 3) throw error;
     setMessage("普通定位未完成，正在尝试高精度定位，最多等待 60 秒…");
-    return getPosition({ enableHighAccuracy: true, maximumAge: 0, timeout: 60000 });
+    return getPosition({ enableHighAccuracy: true, maximumAge: 60000, timeout: 60000 });
   }
 }
 
@@ -142,7 +142,12 @@ async function readAndShowPosition() {
     setMessage("手机定位已获取，可以写入设备。");
   } catch (error) {
     setStatus("location-state", "失败", "error");
-    setMessage(error.code === 1 ? "定位权限被拒绝，请在浏览器设置中允许定位。" : "手机定位失败，请稍后重试。", true);
+    const message = {
+      1: "Chrome 未获得定位权限（错误 1）。请在 Android 设置中允许 Chrome 使用位置信息，并开启精准定位。",
+      2: "Android 定位服务暂不可用（错误 2）。请检查系统定位开关、Chrome 的系统定位权限和网络定位服务。",
+      3: "Chrome 定位超时（错误 3）。可先打开系统地图等应用完成定位，再回到此页重试；若仍超时，请检查 Chrome 的 Android 定位权限和精准定位设置。",
+    }[error.code] || "手机定位失败，请稍后重试。";
+    setMessage(message, true);
   }
 }
 
