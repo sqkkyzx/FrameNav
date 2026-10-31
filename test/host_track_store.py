@@ -70,6 +70,10 @@ int main(void) {
         self.assertIn("track_store_init()", main)
         self.assertIn("track_store_task", main)
         self.assertIn("TRACK_STORE_INTERVAL_S", store)
+        task = function_source("src/track_store.c", "track_store_task")
+        self.assertIn("snapshot.track_interval_s * 1000U", task)
+        self.assertIn("snapshot.track_enabled", task)
+        self.assertIn("poll_ms > 5000U", task)
         self.assertIn("offsetof(track_record_t, timestamp_utc)", store)
 
 

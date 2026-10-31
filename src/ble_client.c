@@ -1810,7 +1810,7 @@ static bool scan_has_saved_bonds(void) {
     return true;
   }
   ESP_LOGI(TAG, "Scan policy: saved_bonds=%d; %s", num,
-           num > 0 ? "duty-cycled" : "continuous pairing discovery");
+           num > 0 ? "duty-cycled" : "low-duty discovery; pair window is continuous");
   return num > 0;
 }
 
@@ -1838,6 +1838,10 @@ static void configure_scan_params(struct ble_gap_disc_params *params,
   }
 #if ALPHALOC_POWER_SAVE
   if (!scan_has_saved_bonds()) {
+    // Continuous discovery is reserved for an explicit pairing window.
+    // Keep reconnect discovery available without scanning at 100% duty.
+    params->itvl = ALPHALOC_SCAN_BONDED_IDLE_INTERVAL;
+    params->window = ALPHALOC_SCAN_BONDED_IDLE_WINDOW;
     return;
   }
   app_config_t cfg;

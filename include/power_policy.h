@@ -24,11 +24,11 @@
 
 // BLE scan units are 0.625 ms, independent of the location publisher interval.
 #define ALPHALOC_SCAN_BOOT_PERIOD_US 30000000LL // Since MCU boot, not disconnect.
-#define ALPHALOC_SCAN_PAIRING_INTERVAL 0x0010   // 10 ms: no stored bonds only.
+#define ALPHALOC_SCAN_PAIRING_INTERVAL 0x0010   // 10 ms: explicit pairing window.
 #define ALPHALOC_SCAN_PAIRING_WINDOW 0x0010     // 10 ms: continuous discovery.
 #define ALPHALOC_SCAN_BONDED_BOOT_INTERVAL 0x0640 // 1000 ms, first 30 seconds.
 #define ALPHALOC_SCAN_BONDED_BOOT_WINDOW 0x01E0   // 300 ms during boot grace.
-#define ALPHALOC_SCAN_BONDED_IDLE_INTERVAL 0x12C0 // 3000 ms, thereafter.
+#define ALPHALOC_SCAN_BONDED_IDLE_INTERVAL 0x12C0 // 3000 ms, idle scan.
 #define ALPHALOC_SCAN_BONDED_IDLE_WINDOW 0x00A0   // 100 ms: 1/30 scheduled RX duty.
 
 #endif

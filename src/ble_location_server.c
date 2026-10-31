@@ -120,11 +120,11 @@ static const struct ble_gatt_svc_def k_services[] = {
         .characteristics = (struct ble_gatt_chr_def[]){
             {.uuid = &k_write_uuid.u,
              .access_cb = location_access_cb,
-             .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC,
+             .flags = BLE_GATT_CHR_F_WRITE,
              .arg = (void *)(uintptr_t)false},
             {.uuid = &k_clear_uuid.u,
              .access_cb = location_access_cb,
-             .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC,
+             .flags = BLE_GATT_CHR_F_WRITE,
              .arg = (void *)(uintptr_t)true},
             {0},
         },
@@ -142,10 +142,6 @@ static int location_gap_event_cb(struct ble_gap_event *event, void *arg) {
         s_conn_handle = event->connect.conn_handle;
         s_advertising = false;
         ESP_LOGI(TAG, "Phone BLE connected");
-        int rc = ble_gap_security_initiate(s_conn_handle);
-        if (rc != 0 && rc != BLE_HS_EALREADY) {
-          ESP_LOGW(TAG, "BLE security start failed: %d", rc);
-        }
       } else {
         s_advertising = false;
         ESP_LOGW(TAG, "Phone BLE connection failed: %d", event->connect.status);

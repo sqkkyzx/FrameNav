@@ -31,9 +31,10 @@
 #define FRAMENAV_HTTP_MAX_CLIENTS 2
 #define FRAMENAV_WEB_RESERVED_SOCKETS 8
 #define FRAMENAV_HTTP_MAX_REQ_HDR_LEN 2048U
-// ESP-IDF uses quarter-dBm units. 66 maps to 16.5 dBm, approximately half
-// the linear transmit power of the usual 20 dBm default.
-#define FRAMENAV_WIFI_MAX_TX_POWER_QDBM 66
+// ESP-IDF uses quarter-dBm units. 52 maps to 13 dBm (20 mW), the nearest
+// supported setting that keeps the AP at or below half of the current
+// 16.5 dBm / 44.7 mW cap.
+#define FRAMENAV_WIFI_MAX_TX_POWER_QDBM 52
 
 #if ALPHALOC_WIFI_WEB
 _Static_assert(CONFIG_LWIP_MAX_SOCKETS >= FRAMENAV_HTTP_MAX_CLIENTS +
@@ -809,6 +810,18 @@ static double compact_coord(double value) {
   return round(value * 1000000.0) / 1000000.0;
 }
 
+static bool ble_telemetry_add(cJSON *array, cJSON *item) {
+  if (!array || !item) {
+    cJSON_Delete(item);
+    return false;
+  }
+  if (!cJSON_AddItemToArray(array, item)) {
+    cJSON_Delete(item);
+    return false;
+  }
+  return true;
+}
+
 static cJSON *build_ble_telemetry_json(void) {
   app_config_t cfg;
   if (!s_cfg || !config_get_snapshot(s_cfg, &cfg)) return NULL;
@@ -855,54 +868,73 @@ static cJSON *build_ble_telemetry_json(void) {
     cJSON_Delete(root); cJSON_Delete(g); cJSON_Delete(p);
     cJSON_Delete(m); cJSON_Delete(s); return NULL;
   }
-  cJSON_AddItemToArray(g, cJSON_CreateBool(gnss_present));
-  cJSON_AddItemToArray(g, cJSON_CreateBool(gnss_valid));
+  bool ok = ble_telemetry_add(g, cJSON_CreateBool(gnss_present)) &&
+            ble_telemetry_add(g, cJSON_CreateBool(gnss_valid));
   if (gnss_present) {
-    cJSON_AddItemToArray(g, cJSON_CreateNumber(compact_coord(gnss.lat_deg)));
-    cJSON_AddItemToArray(g, cJSON_CreateNumber(compact_coord(gnss.lon_deg)));
+    ok = ok && ble_telemetry_add(
+                   g, cJSON_CreateNumber(compact_coord(gnss.lat_deg))) &&
+         ble_telemetry_add(g, cJSON_CreateNumber(compact_coord(gnss.lon_deg)));
   } else {
-    cJSON_AddItemToArray(g, cJSON_CreateNull());
-    cJSON_AddItemToArray(g, cJSON_CreateNull());
+    ok = ok && ble_telemetry_add(g, cJSON_CreateNull()) &&
+         ble_telemetry_add(g, cJSON_CreateNull());
   }
-  cJSON_AddItemToArray(g, cJSON_CreateNumber(gps_status.satellites_visible));
-  cJSON_AddItemToArray(g, cJSON_CreateNumber(gps_status.satellites));
-  cJSON_AddItemToArray(g, cJSON_CreateNumber(search_code));
+  ok = ok && ble_telemetry_add(
+                   g, cJSON_CreateNumber(gps_status.satellites_visible)) &&
+       ble_telemetry_add(g, cJSON_CreateNumber(gps_status.satellites)) &&
+       ble_telemetry_add(g, cJSON_CreateNumber(search_code));
 
-  cJSON_AddItemToArray(p, cJSON_CreateBool(phone.present));
-  cJSON_AddItemToArray(p, cJSON_CreateBool(phone.available));
+  ok = ok && ble_telemetry_add(p, cJSON_CreateBool(phone.present)) &&
+       ble_telemetry_add(p, cJSON_CreateBool(phone.available));
   if (phone.present) {
-    cJSON_AddItemToArray(p, cJSON_CreateNumber(compact_coord(phone.latitude)));
-    cJSON_AddItemToArray(p, cJSON_CreateNumber(compact_coord(phone.longitude)));
+    ok = ok && ble_telemetry_add(
+                   p, cJSON_CreateNumber(compact_coord(phone.latitude))) &&
+         ble_telemetry_add(p, cJSON_CreateNumber(compact_coord(phone.longitude)));
   } else {
-    cJSON_AddItemToArray(p, cJSON_CreateNull());
-    cJSON_AddItemToArray(p, cJSON_CreateNull());
+    ok = ok && ble_telemetry_add(p, cJSON_CreateNull()) &&
+         ble_telemetry_add(p, cJSON_CreateNull());
   }
-  cJSON_AddItemToArray(p, cJSON_CreateNumber(phone.present ? round(phone.accuracy_m) : 0));
-  cJSON_AddItemToArray(p, cJSON_CreateBool(cfg.phone_push_enabled != 0));
-  cJSON_AddItemToArray(p, cJSON_CreateNumber(phone.captured_ms));
-  cJSON_AddItemToArray(p, cJSON_CreateNumber(phone.remaining_s));
+  ok = ok && ble_telemetry_add(
+                   p, cJSON_CreateNumber(phone.present ? round(phone.accuracy_m) : 0)) &&
+       ble_telemetry_add(p, cJSON_CreateBool(cfg.phone_push_enabled != 0)) &&
+       ble_telemetry_add(p, cJSON_CreateNumber(phone.captured_ms)) &&
+       ble_telemetry_add(p, cJSON_CreateNumber(phone.remaining_s));
 
-  cJSON_AddItemToArray(m, cJSON_CreateBool(manual.present));
-  cJSON_AddItemToArray(m, cJSON_CreateBool(manual.available));
+  ok = ok && ble_telemetry_add(m, cJSON_CreateBool(manual.present)) &&
+       ble_telemetry_add(m, cJSON_CreateBool(manual.available)) &&
+       ble_telemetry_add(m, cJSON_CreateBool(manual.clock_pending));
   if (manual.present) {
-    cJSON_AddItemToArray(m, cJSON_CreateNumber(compact_coord(manual.latitude)));
-    cJSON_AddItemToArray(m, cJSON_CreateNumber(compact_coord(manual.longitude)));
+    ok = ok && ble_telemetry_add(
+                   m, cJSON_CreateNumber(compact_coord(manual.latitude))) &&
+         ble_telemetry_add(m, cJSON_CreateNumber(compact_coord(manual.longitude)));
   } else {
-    cJSON_AddItemToArray(m, cJSON_CreateNull());
-    cJSON_AddItemToArray(m, cJSON_CreateNull());
+    ok = ok && ble_telemetry_add(m, cJSON_CreateNull()) &&
+         ble_telemetry_add(m, cJSON_CreateNull());
   }
-  cJSON_AddItemToArray(m, cJSON_CreateNumber((double)manual.captured_utc * 1000.0));
-  cJSON_AddItemToArray(m, cJSON_CreateNumber(manual.remaining_s));
+  ok = ok && ble_telemetry_add(
+                   m, cJSON_CreateNumber((double)manual.captured_utc * 1000.0)) &&
+       ble_telemetry_add(m, cJSON_CreateNumber(manual.remaining_s));
 
-  cJSON_AddItemToArray(s, cJSON_CreateBool(storage.available));
-  cJSON_AddItemToArray(s, cJSON_CreateNumber(storage.record_count));
-  cJSON_AddItemToArray(s, cJSON_CreateNumber(storage.used_bytes));
-  cJSON_AddItemToArray(s, cJSON_CreateNumber(storage.capacity_bytes));
-  cJSON_AddItemToObject(root, "g", g);
-  cJSON_AddItemToObject(root, "p", p);
-  cJSON_AddItemToObject(root, "m", m);
-  cJSON_AddItemToObject(root, "s", s);
+  ok = ok && ble_telemetry_add(s, cJSON_CreateBool(storage.available)) &&
+       ble_telemetry_add(s, cJSON_CreateNumber(storage.record_count)) &&
+       ble_telemetry_add(s, cJSON_CreateNumber(storage.used_bytes)) &&
+       ble_telemetry_add(s, cJSON_CreateNumber(storage.capacity_bytes));
+  if (!ok || !cJSON_AddItemToObject(root, "g", g)) goto telemetry_fail;
+  g = NULL;
+  if (!cJSON_AddItemToObject(root, "p", p)) goto telemetry_fail;
+  p = NULL;
+  if (!cJSON_AddItemToObject(root, "m", m)) goto telemetry_fail;
+  m = NULL;
+  if (!cJSON_AddItemToObject(root, "s", s)) goto telemetry_fail;
+  s = NULL;
   return root;
+
+telemetry_fail:
+  cJSON_Delete(root);
+  cJSON_Delete(g);
+  cJSON_Delete(p);
+  cJSON_Delete(m);
+  cJSON_Delete(s);
+  return NULL;
 }
 
 char *wifi_web_get_ble_telemetry_json(void) {

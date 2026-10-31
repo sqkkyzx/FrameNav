@@ -36,7 +36,6 @@ import android.widget.Spinner;
 import android.widget.ArrayAdapter;
 import android.widget.Switch;
 import android.widget.TextView;
-import android.widget.Toast;
 import android.widget.FrameLayout;
 
 import org.json.JSONObject;
@@ -76,6 +75,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     private boolean bleReady;
     private boolean bleLocationAvailable;
     private boolean bleConfigAvailable;
+    private boolean deviceTelemetryAvailable;
     private Location currentLocation;
     private String devicePhoneRemainingText = "等待蓝牙遥测";
     private PhoneLocationService phoneLocationService;
@@ -88,16 +88,18 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     private TextView pairedDevices;
     private LinearLayout pairedPhoneRows;
     private LinearLayout pairedDeviceRows;
-    private TextView deviceStatus;
-    private TextView deviceLocation;
     private TextView storageStatus;
-    private TextView gnssSourceStatus;
-    private TextView phoneSourceStatus;
-    private TextView manualSourceStatus;
-    private TextView activeSourceBadge;
-    private TextView locationStatus;
-    private TextView coordinates;
-    private TextView accuracy;
+    private TextView gnssCoordinates;
+    private TextView gnssSatellites;
+    private TextView gnssSearch;
+    private TextView phoneCoordinates;
+    private TextView phonePushStatus;
+    private TextView phoneRemaining;
+    private TextView manualCoordinates;
+    private TextView manualExpiry;
+    private TextView gnssActiveBadge;
+    private TextView phoneActiveBadge;
+    private TextView manualActiveBadge;
     private TextView message;
     private EditText cameraName;
     private EditText cameraMac;
@@ -132,6 +134,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     private boolean updatingConfigControls;
     private int phoneLocationIntervalSeconds = 5;
     private boolean startupLocationRequested;
+    private boolean activityResumed;
     private boolean configEditable;
     private boolean pendingHotspotWorkflow;
     private boolean hotspotVerificationInProgress;
@@ -168,14 +171,14 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             };
     private final Runnable configPoll = new Runnable() {
         @Override public void run() {
-            if (!bleReady) return;
+            if (!activityResumed || !bleReady) return;
             if (!configEditable) readConfigOverBle();
             refreshPairedDevices();
             bleManager.readTelemetry(new BleManager.TelemetryCallback() {
                 @Override public void onSuccess(JSONObject value) { applyTelemetry(value); }
                 @Override public void onError(String error) { setMessage(error, true); }
             });
-            main.postDelayed(this, 30_000L);
+            if (activityResumed && bleReady) main.postDelayed(this, 30_000L);
         }
     };
     private LinearLayout tabContent;
@@ -191,6 +194,8 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     private Button saveManualButton;
     private Button clearManualButton;
     private Runnable bleReconnect;
+    private boolean manualBleDisconnect;
+    private int bleReconnectAttempt;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -202,6 +207,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         wifiClient = new WifiClient();
         bleManager = new BleManager(this, this);
         buildUi();
+        activityResumed = true;
         connectivityManager = (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
         if (connectivityManager != null) {
             android.net.NetworkRequest request = new android.net.NetworkRequest.Builder()
@@ -221,13 +227,19 @@ public final class MainActivity extends Activity implements BleManager.Listener 
 
     @Override
     protected void onDestroy() {
+        activityResumed = false;
         main.removeCallbacks(configPoll);
-        stopLocationRequest();
-        if (bleManager != null && !phoneLocationStarting) {
-            bleManager.close();
+        if (bleReconnect != null) {
+            main.removeCallbacks(bleReconnect);
+            bleReconnect = null;
         }
-        if (wifiClient != null) {
-            wifiClient.close();
+        stopLocationRequest();
+        // The foreground service's location writer uses these app-scoped transports.
+        // Keep them alive while tracking remains enabled so background delivery and
+        // automatic Bluetooth reconnection can continue after the Activity leaves.
+        if (!phoneLocationStarting) {
+            if (bleManager != null) bleManager.close();
+            if (wifiClient != null) wifiClient.close();
         }
         if (connectivityManager != null) {
             try { connectivityManager.unregisterNetworkCallback(wifiNetworkCallback); }
@@ -243,8 +255,13 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     @Override
     protected void onResume() {
         super.onResume();
+        activityResumed = true;
         checkCurrentWifi();
         updateLocalPhoneStatus();
+        if (bleReady) {
+            main.removeCallbacks(configPoll);
+            main.post(configPoll);
+        }
         boolean frameNavWifi = isFrameNavWifi(connectivityManager == null || currentWifiNetwork == null
                 ? null : connectivityManager.getNetworkCapabilities(currentWifiNetwork));
         if ((frameNavWifi || pendingHotspotWorkflow || afterHotspotConnected != null)
@@ -254,6 +271,13 @@ public final class MainActivity extends Activity implements BleManager.Listener 
                 && wifiClientHasNetwork() && !deviceHotspotVerified) {
             main.postDelayed(this::verifyDeviceHotspot, 700L);
         }
+    }
+
+    @Override
+    protected void onPause() {
+        activityResumed = false;
+        main.removeCallbacks(configPoll);
+        super.onPause();
     }
 
     private void buildUi() {
@@ -320,32 +344,47 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         connectionButtons.addView(connectBleButton, weighted());
         Button disconnect = button("断开", 0xFF34463B);
         disconnect.setOnClickListener(view -> {
+            manualBleDisconnect = true;
+            if (bleReconnect != null) {
+                main.removeCallbacks(bleReconnect);
+                bleReconnect = null;
+            }
             bleManager.disconnect();
             setMessage("蓝牙已断开。", false);
         });
         connectionButtons.addView(disconnect, weighted());
         LinearLayout locationCard = card(statusPage, "定位信息");
-        LinearLayout activeRow = row(locationCard);
-        activeSourceBadge = text("当前使用：—", 12, 0xFFFFFFFF, true);
-        activeSourceBadge.setPadding(dp(8), dp(5), dp(8), dp(5));
-        activeSourceBadge.setBackgroundColor(0xFF257149);
-        activeRow.addView(activeSourceBadge, matchWrap());
-        deviceStatus = text("设备定位：—", 13, 0xFF66736B, false);
-        locationCard.addView(deviceStatus, matchWrap());
-        gnssSourceStatus = text("GNSS 定位：—", 13, 0xFF66736B, false);
-        gnssSourceStatus.setPadding(0, dp(8), 0, dp(2));
-        locationCard.addView(gnssSourceStatus, matchWrap());
-        phoneSourceStatus = text("手机定位：—", 13, 0xFF66736B, false);
-        phoneSourceStatus.setPadding(0, dp(8), 0, dp(2));
-        locationCard.addView(phoneSourceStatus, matchWrap());
-        manualSourceStatus = text("手动设置：—", 13, 0xFF66736B, false);
-        manualSourceStatus.setPadding(0, dp(8), 0, dp(2));
-        locationCard.addView(manualSourceStatus, matchWrap());
-        deviceLocation = text("—", 12, 0xFF66736B, false);
-        locationCard.addView(deviceLocation, matchWrap());
-        locationStatus = text("手机位置尚未获取", 12, 0xFF66736B, false);
-        coordinates = text("—", 12, 0xFF66736B, false);
-        accuracy = text("精度 —", 12, 0xFF66736B, false);
+        LinearLayout gnssHeader = row(locationCard);
+        TextView gnssTitle = text("GNSS 定位", 17, 0xFF17231C, true);
+        gnssHeader.addView(gnssTitle, new LinearLayout.LayoutParams(0, dp(32), 1f));
+        gnssActiveBadge = sourceBadge();
+        gnssHeader.addView(gnssActiveBadge, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(30)));
+        gnssCoordinates = addSourceValue(locationCard, "坐标：—");
+        gnssSatellites = addSourceValue(locationCard, "搜到卫星：— · 使用：—");
+        gnssSearch = addSourceValue(locationCard, "搜索状态：—");
+        addSourceDivider(locationCard);
+
+        LinearLayout phoneHeader = row(locationCard);
+        TextView phoneTitle = text("手机定位", 17, 0xFF17231C, true);
+        phoneHeader.addView(phoneTitle, new LinearLayout.LayoutParams(0, dp(32), 1f));
+        phoneActiveBadge = sourceBadge();
+        phoneHeader.addView(phoneActiveBadge, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(30)));
+        phoneCoordinates = addSourceValue(locationCard, "坐标：— · 精度：—");
+        phonePushStatus = addSourceValue(locationCard, "持续推送：— · 获取时间：—");
+        phoneRemaining = addSourceValue(locationCard, "剩余有效期：—");
+        addSourceDivider(locationCard);
+
+        LinearLayout manualHeader = row(locationCard);
+        TextView manualTitle = text("手动设置", 17, 0xFF17231C, true);
+        manualHeader.addView(manualTitle, new LinearLayout.LayoutParams(0, dp(32), 1f));
+        manualActiveBadge = sourceBadge();
+        manualHeader.addView(manualActiveBadge, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(30)));
+        manualCoordinates = addSourceValue(locationCard, "坐标：—");
+        manualExpiry = addSourceValue(locationCard, "设置时间：— · 剩余有效期：—");
+
         storageStatus = text("轨迹存储：—", 13, 0xFF66736B, false);
         LinearLayout storageCard = card(statusPage, "存储轨迹");
         storageCard.addView(storageStatus, matchWrap());
@@ -719,6 +758,35 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         return row;
     }
 
+    private TextView sourceBadge() {
+        TextView badge = text("", 12, 0xFF1B7137, true);
+        badge.setGravity(Gravity.CENTER);
+        badge.setPadding(dp(9), 0, dp(9), 0);
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(0xFFE2F4E7);
+        background.setCornerRadius(dp(16));
+        badge.setBackground(background);
+        badge.setVisibility(View.GONE);
+        return badge;
+    }
+
+    private void addSourceDivider(LinearLayout parent) {
+        View divider = new View(this);
+        divider.setBackgroundColor(0xFFE2E8E4);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(1));
+        params.setMargins(0, dp(3), 0, dp(7));
+        parent.addView(divider, params);
+    }
+
+    private TextView addSourceValue(LinearLayout parent, String value) {
+        TextView line = text(value, 14, 0xFF17231C, false);
+        LinearLayout.LayoutParams params = matchWrap();
+        params.setMargins(0, dp(3), 0, dp(3));
+        parent.addView(line, params);
+        return line;
+    }
+
     private LinearLayout.LayoutParams matchWrap() {
         return new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -735,6 +803,12 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     }
 
     private void requestBlePermissionsThenConnect() {
+        manualBleDisconnect = false;
+        bleReconnectAttempt = 0;
+        requestBleConnection();
+    }
+
+    private void requestBleConnection() {
         List<String> needed = new ArrayList<>();
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             if (checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
@@ -1060,7 +1134,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
 
                 @Override
                 public void onServiceState(String state, boolean error) {
-                    setMessage(state, error);
+                    setMessageInline(state, error);
                     if (state.contains("已停止") || state.contains("未启动")) phoneLocationStarting = false;
                 }
             });
@@ -1201,7 +1275,6 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         }
         locationBusy = true;
         bestLocation = cached;
-        locationStatus.setText("正在通过 Android 定位服务获取…");
         locationTimeout = () -> finishLocationRequest();
         main.postDelayed(locationTimeout, LOCATION_TIMEOUT_MS);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -1338,7 +1411,6 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             showLocation(currentLocation, "已获取手机位置");
             refreshControls();
         } else {
-            locationStatus.setText("没有获取到位置");
             setMessage("未获取到手机位置。请确认系统定位已开启并允许精确位置。", true);
             if (phoneContinuous || phonePush) updateLocationService();
         }
@@ -1375,10 +1447,6 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         if (location == null) {
             return;
         }
-        locationStatus.setText(status);
-        coordinates.setText(String.format(java.util.Locale.US, "%.7f, %.7f",
-                location.getLatitude(), location.getLongitude()));
-        accuracy.setText("精度 " + (location.hasAccuracy() ? Math.round(location.getAccuracy()) + " m" : "未知"));
         currentLocation = new Location(location);
         if (phoneLocationService != null) {
             phoneLocationService.setLatestLocation(currentLocation);
@@ -1463,11 +1531,15 @@ public final class MainActivity extends Activity implements BleManager.Listener 
 
     private void applyTelemetry(JSONObject json) {
         json = expandBleTelemetry(json);
+        if (json == null || json.optJSONObject("gnss") == null
+                || json.optJSONObject("phone") == null
+                || json.optJSONObject("manual") == null
+                || json.optJSONObject("storage") == null) {
+            clearDeviceTelemetry();
+            return;
+        }
+        deviceTelemetryAvailable = true;
         String active = json.optString("activeSource", json.optString("active_source", "none"));
-        String activeLabel = "gnss".equals(active) ? "GNSS 定位" : "phone".equals(active)
-                ? "手机定位" : "manual".equals(active) ? "手动设置" : "无有效来源";
-        activeSourceBadge.setText("当前使用：" + activeLabel);
-        deviceStatus.setText("设备状态：" + json.optString("status", "蓝牙实时遥测"));
         JSONObject gnss = json.optJSONObject("gnss");
         JSONObject phone = json.optJSONObject("phone");
         JSONObject manual = json.optJSONObject("manual");
@@ -1479,21 +1551,27 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         }
         devicePhoneRemainingText = phone == null ? "无设备定位遥测"
                 : formatRemaining(phone, "remainingSeconds", "remaining_seconds");
-        gnssSourceStatus.setText("GNSS 定位  " + sourceCoordinates(gnss)
-                + "\n搜星 " + numberField(gnss, "satellitesVisible", "satellites_visible")
-                + " · 使用 " + numberField(gnss, "satellitesUsed", "satellites_used")
-                + " · " + stringField(gnss, "searchState", "search_state", "—"));
-        phoneSourceStatus.setText("手机定位  " + sourceCoordinates(phone)
-                + "\n精度 " + (phone != null && phone.has("accuracy") ? phone.optString("accuracy") + " m" : "—")
-                + " · 推送 " + (phonePush ? "已开启" : "已关闭")
-                + "\n获取时间 " + formatTimestamp(phone, "updatedAt", "updated_at")
-                + " · 剩余有效期 " + formatRemaining(phone, "remainingSeconds", "remaining_seconds"));
-        manualSourceStatus.setText("手动设置  " + sourceCoordinates(manual)
-                + "\n设置时间 " + formatTimestamp(manual, "updatedAt", "updated_at")
-                + " · 剩余有效期 " + formatRemaining(manual, "remainingSeconds", "remaining_seconds"));
-        tintSource(gnssSourceStatus, "gnss".equals(active));
-        tintSource(phoneSourceStatus, "phone".equals(active));
-        tintSource(manualSourceStatus, "manual".equals(active));
+        gnssCoordinates.setText("坐标：" + sourceCoordinates(gnss));
+        gnssSatellites.setText("搜到卫星：" + numberField(gnss, "satellitesVisible", "satellites_visible")
+                + " · 使用：" + numberField(gnss, "satellitesUsed", "satellites_used"));
+        gnssSearch.setText("搜索状态：" + searchStateText(stringField(gnss, "searchState", "search_state", "—")));
+        String phoneAccuracy = phone != null && phone.has("accuracy")
+                ? phone.optString("accuracy") + " m" : "—";
+        String phoneRemainingText = !phone.optBoolean("present", false) ? "未获取"
+                : formatRemaining(phone, "remainingSeconds", "remaining_seconds");
+        phoneCoordinates.setText("坐标：" + sourceCoordinates(phone) + " · 精度：" + phoneAccuracy);
+        phonePushStatus.setText("持续推送：" + (phonePush ? "已开启" : "已关闭")
+                + " · 获取时间：" + formatTimestamp(phone, "updatedAt", "updated_at"));
+        phoneRemaining.setText("剩余有效期：" + phoneRemainingText);
+        String manualRemaining = manual.optBoolean("clockPending", false) ? "等待校时"
+                : !manual.optBoolean("present", false) ? "未设置"
+                : formatRemaining(manual, "remainingSeconds", "remaining_seconds");
+        manualCoordinates.setText("坐标：" + sourceCoordinates(manual));
+        manualExpiry.setText("设置时间：" + formatTimestamp(manual, "updatedAt", "updated_at")
+                + " · 剩余有效期：" + manualRemaining);
+        setSourceBadge(gnssActiveBadge, "gnss".equals(active));
+        setSourceBadge(phoneActiveBadge, "phone".equals(active));
+        setSourceBadge(manualActiveBadge, "manual".equals(active));
         if (phone != null && phone.optBoolean("valid", false)) {
             currentLocation = new Location("device");
             currentLocation.setLatitude(phone.optDouble("latitude"));
@@ -1524,8 +1602,8 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             if (g != null) {
                 gnss.put("present", g.optBoolean(0));
                 gnss.put("valid", g.optBoolean(1));
-                gnss.put("latitude", g.optDouble(2));
-                gnss.put("longitude", g.optDouble(3));
+                putNullableNumber(gnss, "latitude", g, 2);
+                putNullableNumber(gnss, "longitude", g, 3);
                 gnss.put("satellitesVisible", g.optInt(4));
                 gnss.put("satellitesUsed", g.optInt(5));
                 gnss.put("searchState", searchStateLabel(g.optInt(6)));
@@ -1536,8 +1614,8 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             if (p != null) {
                 phone.put("present", p.optBoolean(0));
                 phone.put("valid", p.optBoolean(1));
-                phone.put("latitude", p.optDouble(2));
-                phone.put("longitude", p.optDouble(3));
+                putNullableNumber(phone, "latitude", p, 2);
+                putNullableNumber(phone, "longitude", p, 3);
                 phone.put("accuracy", p.optDouble(4));
                 phone.put("enabled", p.optBoolean(5));
                 phone.put("updatedAt", p.optLong(6));
@@ -1549,10 +1627,11 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             if (m != null) {
                 manual.put("present", m.optBoolean(0));
                 manual.put("valid", m.optBoolean(1));
-                manual.put("latitude", m.optDouble(2));
-                manual.put("longitude", m.optDouble(3));
-                manual.put("updatedAt", m.optLong(4));
-                manual.put("remainingSeconds", m.optLong(5));
+                manual.put("clockPending", m.optBoolean(2));
+                putNullableNumber(manual, "latitude", m, 3);
+                putNullableNumber(manual, "longitude", m, 4);
+                manual.put("updatedAt", m.optLong(5));
+                manual.put("remainingSeconds", m.optLong(6));
             }
             expanded.put("manual", manual);
             JSONArray s = compact.optJSONArray("s");
@@ -1570,6 +1649,12 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         }
     }
 
+    private void putNullableNumber(JSONObject target, String key, JSONArray values, int index)
+            throws org.json.JSONException {
+        Object value = values.opt(index);
+        target.put(key, value instanceof Number ? value : JSONObject.NULL);
+    }
+
     private String searchStateLabel(int code) {
         switch (code) {
             case 1: return "searching";
@@ -1578,6 +1663,14 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             case 4: return "locked";
             default: return "unknown";
         }
+    }
+
+    private String searchStateText(String state) {
+        if ("searching".equals(state)) return "搜索中";
+        if ("paused".equals(state)) return "已暂停搜星";
+        if ("waking".equals(state)) return "正在恢复";
+        if ("locked".equals(state)) return "已定位";
+        return "状态未知";
     }
 
     private String sourceCoordinates(JSONObject source) {
@@ -1618,11 +1711,6 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         if (seconds < 60) return seconds + " 秒";
         if (seconds < 3600) return ((seconds + 59) / 60) + " 分钟";
         return (seconds / 3600) + " 小时 " + ((seconds / 60) % 60) + " 分钟";
-    }
-
-    private void tintSource(TextView view, boolean active) {
-        view.setTextColor(active ? 0xFF257149 : 0xFF66736B);
-        view.setTypeface(Typeface.DEFAULT, active ? Typeface.BOLD : Typeface.NORMAL);
     }
 
     private void applyDeviceConfig(Map<String, String> values) {
@@ -1838,20 +1926,33 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     }
 
     private void updateLocalPhoneStatus() {
-        if (phoneSourceStatus == null) return;
-        if (currentLocation == null) {
-            phoneSourceStatus.setText("手机定位  等待获取");
-            return;
-        }
-        String coordinates = String.format(java.util.Locale.US, "%.6f, %.6f",
-                currentLocation.getLatitude(), currentLocation.getLongitude());
-        String accuracyText = currentLocation.hasAccuracy()
-                ? Math.round(currentLocation.getAccuracy()) + " m" : "未知";
-        String timeText = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss",
-                java.util.Locale.getDefault()).format(new java.util.Date(currentLocation.getTime()));
-        phoneSourceStatus.setText("手机定位  " + coordinates + "\n精度 " + accuracyText
-                + " · 推送 " + (phonePush ? "已开启" : "已关闭")
-                + "\n获取时间 " + timeText + " · 设备有效期 " + devicePhoneRemainingText);
+        // The status page mirrors the device telemetry. The local fix is used by write actions.
+    }
+
+    private void setSourceBadge(TextView badge, boolean active) {
+        if (badge == null) return;
+        badge.setText(active ? "正在使用" : "");
+        badge.setVisibility(active ? View.VISIBLE : View.GONE);
+    }
+
+    /** Clears device-originated telemetry while retaining the phone's local fix. */
+    private void clearDeviceTelemetry() {
+        deviceTelemetryAvailable = false;
+        devicePhoneRemainingText = "等待蓝牙遥测";
+        if (gnssCoordinates != null) gnssCoordinates.setText("坐标：—");
+        if (gnssSatellites != null) gnssSatellites.setText("搜到卫星：— · 使用：—");
+        if (gnssSearch != null) gnssSearch.setText("搜索状态：—");
+        if (phoneCoordinates != null) phoneCoordinates.setText("坐标：— · 精度：—");
+        if (phonePushStatus != null) phonePushStatus.setText("持续推送：" + (phonePush ? "已开启" : "已关闭")
+                + " · 获取时间：—");
+        if (phoneRemaining != null) phoneRemaining.setText("剩余有效期：等待蓝牙遥测");
+        if (manualCoordinates != null) manualCoordinates.setText("坐标：—");
+        if (manualExpiry != null) manualExpiry.setText("设置时间：— · 剩余有效期：—");
+        setSourceBadge(gnssActiveBadge, false);
+        setSourceBadge(phoneActiveBadge, false);
+        setSourceBadge(manualActiveBadge, false);
+        if (storageStatus != null) storageStatus.setText("等待蓝牙设备遥测");
+        if (currentLocation != null) updateLocalPhoneStatus();
     }
 
     private String number(EditText field, String label, int min, int max) {
@@ -1921,8 +2022,12 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             message.setText(value);
             message.setTextColor(error ? 0xFFBD3E3E : 0xFF66736B);
         }
-        if (error && !isFinishing()) {
-            Toast.makeText(this, value, Toast.LENGTH_LONG).show();
+    }
+
+    private void setMessageInline(String value, boolean error) {
+        if (message != null) {
+            message.setText(value);
+            message.setTextColor(error ? 0xFFBD3E3E : 0xFF66736B);
         }
     }
 
@@ -1934,6 +2039,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
 
     @Override
     public void onBleReady(boolean locationAvailable, boolean configAvailable) {
+        bleReconnectAttempt = 0;
         if (bleReconnect != null) {
             main.removeCallbacks(bleReconnect);
             bleReconnect = null;
@@ -1951,7 +2057,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             main.removeCallbacks(configPoll);
             pairedDevices.setText("正在读取蓝牙设备信息…");
             readDeviceInfoOverBle();
-            main.postDelayed(configPoll, 30_000L);
+            if (activityResumed) main.postDelayed(configPoll, 30_000L);
             if (pendingHotspotWorkflow) wakeDeviceWifi();
         }
         refreshControls();
@@ -1976,13 +2082,19 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         bleLocationAvailable = false;
         bleConfigAvailable = false;
         connectionStatus.setText("未连接");
+        clearDeviceTelemetry();
         if (phoneLocationService != null) phoneLocationService.setBleConnected(false);
-        if (phoneLocationStarting) {
+        if (phoneLocationStarting && !manualBleDisconnect) {
+            if (bleReconnect != null) main.removeCallbacks(bleReconnect);
+            long delayMs = Math.min(60_000L, 5_000L << Math.min(bleReconnectAttempt, 4));
+            bleReconnectAttempt++;
             bleReconnect = () -> {
                 bleReconnect = null;
-                if (phoneLocationStarting && !bleReady) requestBlePermissionsThenConnect();
+                if (phoneLocationStarting && !manualBleDisconnect && !bleReady) {
+                    requestBleConnection();
+                }
             };
-            main.postDelayed(bleReconnect, 5_000L);
+            main.postDelayed(bleReconnect, delayMs);
         }
         refreshControls();
     }

@@ -235,7 +235,8 @@ static void config_window_task(void *arg) {
 }
 
 #define WIFI_START_RETRY_MS 5000U
-#define WIFI_IDLE_POLL_MS 1000U
+#define WIFI_IDLE_POLL_MS 2000U
+#define WIFI_STOPPED_POLL_MS 5000U
 
 static bool usb_data_host_connected(void) {
 #if ALPHALOC_BOARD_XIAO_ESP32C6
@@ -299,7 +300,7 @@ static void wifi_web_task(void *arg) {
           vTaskDelay(pdMS_TO_TICKS(WIFI_START_RETRY_MS));
         }
       } else {
-        vTaskDelay(pdMS_TO_TICKS(WIFI_IDLE_POLL_MS));
+        vTaskDelay(pdMS_TO_TICKS(WIFI_STOPPED_POLL_MS));
       }
       continue;
     }

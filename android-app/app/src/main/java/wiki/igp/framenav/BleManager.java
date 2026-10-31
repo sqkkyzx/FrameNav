@@ -93,6 +93,7 @@ public final class BleManager {
     }
 
     private static final long SCAN_TIMEOUT_MS = 15_000L;
+    private static final long CONNECTION_TIMEOUT_MS = 25_000L;
     private static final long OP_TIMEOUT_MS = 8_000L;
     private static final long BOND_TIMEOUT_MS = 45_000L;
 
@@ -109,6 +110,8 @@ public final class BleManager {
     private GattOperation inFlight;
     private Runnable operationTimeout;
     private Runnable scanTimeout;
+    private Runnable connectionTimeout;
+    private Runnable authenticatedRetry;
     private boolean scanning;
     private boolean ready;
     private boolean waitingForBond;
@@ -152,6 +155,7 @@ public final class BleManager {
             scanner = adapter.getBluetoothLeScanner();
             if (scanner == null) {
                 listener.onBleError("无法启动蓝牙扫描");
+                listener.onBleDisconnected();
                 return;
             }
             try {
@@ -162,11 +166,13 @@ public final class BleManager {
                     if (scanning) {
                         stopScan();
                         listener.onBleError("未找到 FrameNav。请确认设备处于 Wi-Fi/USB 唤醒窗口内");
+                        listener.onBleDisconnected();
                     }
                 };
                 main.postDelayed(scanTimeout, SCAN_TIMEOUT_MS);
             } catch (SecurityException error) {
                 listener.onBleError("缺少蓝牙权限，请允许附近设备权限");
+                listener.onBleDisconnected();
             }
         });
     }
@@ -489,7 +495,7 @@ public final class BleManager {
     @SuppressLint("MissingPermission")
     private void beginBonding(BluetoothGatt bluetoothGatt) {
         if (authRetryCount > 1) {
-            failConnection("蓝牙加密配对后写入仍被拒绝，请在系统蓝牙设置中移除并重新配对");
+            failConnection("蓝牙加密操作在配对后仍被拒绝，请在系统蓝牙设置中移除并重新配对");
             return;
         }
         if (waitingForBond) {
@@ -508,7 +514,12 @@ public final class BleManager {
             return;
         }
         if (bondState == BluetoothDevice.BOND_BONDED) {
-            failConnection("设备已配对但拒绝加密写入，请在系统蓝牙设置中重新配对");
+            if (inFlight != null && authRetryCount <= 1) {
+                scheduleAuthenticatedRetry(bluetoothGatt, inFlight);
+                armOperationTimeout(OP_TIMEOUT_MS, "蓝牙加密操作超时，请重新连接");
+                return;
+            }
+            failConnection("设备已配对但拒绝加密操作，请在系统蓝牙设置中重新配对");
             return;
         }
         waitingForBond = true;
@@ -550,6 +561,37 @@ public final class BleManager {
         }
     }
 
+    @SuppressLint("MissingPermission")
+    private void retryAuthenticatedOperation() {
+        if (inFlight == null || gatt == null || waitingForBond) return;
+        if (inFlight.value != null) {
+            retryAuthenticatedWrite();
+            return;
+        }
+        try {
+            if (!gatt.readCharacteristic(inFlight.characteristic)) {
+                failConnection("蓝牙配对完成，但重试读取未能启动，请重新连接");
+                return;
+            }
+            authRetryCount++;
+            armOperationTimeout(OP_TIMEOUT_MS, "蓝牙读取超时，已重置连接，请重新连接");
+            listener.onBleState("蓝牙已配对，正在重试读取…");
+        } catch (SecurityException error) {
+            failConnection("缺少蓝牙连接权限");
+        }
+    }
+
+    private void scheduleAuthenticatedRetry(BluetoothGatt bluetoothGatt, GattOperation operation) {
+        clearAuthenticatedRetry();
+        authenticatedRetry = () -> {
+            authenticatedRetry = null;
+            if (gatt == bluetoothGatt && inFlight == operation && !waitingForBond) {
+                retryAuthenticatedOperation();
+            }
+        };
+        main.postDelayed(authenticatedRetry, 500L);
+    }
+
     private final BroadcastReceiver bondReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context receiverContext, Intent intent) {
@@ -571,7 +613,7 @@ public final class BleManager {
                     BluetoothDevice.ERROR);
             if (state == BluetoothDevice.BOND_BONDED) {
                 waitingForBond = false;
-                retryAuthenticatedWrite();
+                retryAuthenticatedOperation();
             } else if (state == BluetoothDevice.BOND_NONE
                     && previous == BluetoothDevice.BOND_BONDING) {
                 waitingForBond = false;
@@ -586,6 +628,7 @@ public final class BleManager {
             return;
         }
         inFlight = null;
+        clearAuthenticatedRetry();
         if (operationTimeout != null) {
             main.removeCallbacks(operationTimeout);
             operationTimeout = null;
@@ -673,6 +716,7 @@ public final class BleManager {
                 if (bluetoothGatt != gatt) {
                     return;
                 }
+                clearConnectionTimeout();
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     failConnection("蓝牙服务读取失败，状态码 " + status);
                     return;
@@ -708,6 +752,9 @@ public final class BleManager {
                 if (isCurrentOperation(bluetoothGatt, characteristic)) {
                     if (status == BluetoothGatt.GATT_SUCCESS) {
                         completeOperation(true, value, "");
+                    } else if (status == BluetoothGatt.GATT_INSUFFICIENT_AUTHENTICATION
+                            || status == BluetoothGatt.GATT_INSUFFICIENT_ENCRYPTION) {
+                        beginBonding(bluetoothGatt);
                     } else {
                         // A single optional telemetry/config characteristic may be
                         // unavailable (or transiently rejected) while the GATT
@@ -728,6 +775,9 @@ public final class BleManager {
                 if (isCurrentOperation(bluetoothGatt, characteristic)) {
                     if (status == BluetoothGatt.GATT_SUCCESS) {
                         completeOperation(true, value, "");
+                    } else if (status == BluetoothGatt.GATT_INSUFFICIENT_AUTHENTICATION
+                            || status == BluetoothGatt.GATT_INSUFFICIENT_ENCRYPTION) {
+                        beginBonding(bluetoothGatt);
                     } else {
                         completeOperation(false, value, gattStatus(status));
                     }
@@ -782,6 +832,7 @@ public final class BleManager {
     @SuppressLint("MissingPermission")
     private void failConnection(String message) {
         BluetoothGatt failedGatt = gatt;
+        clearConnectionTimeout();
         ready = false;
         waitingForBond = false;
         mtuRequested = false;
@@ -792,6 +843,7 @@ public final class BleManager {
             operationTimeout = null;
         }
         List<GattOperation> failedOperations = new ArrayList<>();
+        clearAuthenticatedRetry();
         if (inFlight != null) {
             failedOperations.add(inFlight);
             inFlight = null;
@@ -844,6 +896,7 @@ public final class BleManager {
             main.post(() -> {
                 stopScan();
                 listener.onBleError("蓝牙扫描失败，状态码 " + errorCode);
+                listener.onBleDisconnected();
             });
         }
     };
@@ -887,9 +940,22 @@ public final class BleManager {
             gatt = found.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE);
             if (gatt == null) {
                 listener.onBleError("无法创建蓝牙连接");
+                listener.onBleDisconnected();
+                return;
             }
+            clearConnectionTimeout();
+            connectionTimeout = () -> {
+                if (gatt != null && !ready) {
+                    failConnection("蓝牙连接或服务读取超时");
+                }
+            };
+            main.postDelayed(connectionTimeout, CONNECTION_TIMEOUT_MS);
         } catch (SecurityException error) {
             listener.onBleError("缺少蓝牙连接权限");
+            listener.onBleDisconnected();
+        } catch (RuntimeException error) {
+            listener.onBleError(error.getMessage() == null ? "无法创建蓝牙连接" : error.getMessage());
+            listener.onBleDisconnected();
         }
     }
 
@@ -924,6 +990,8 @@ public final class BleManager {
     @SuppressLint("MissingPermission")
     private void disconnectInternal(boolean notify) {
         stopScan();
+        clearConnectionTimeout();
+        clearAuthenticatedRetry();
         List<GattOperation> cancelledOperations = new ArrayList<>();
         if (inFlight != null) {
             cancelledOperations.add(inFlight);
@@ -958,6 +1026,20 @@ public final class BleManager {
             } else if (operation.writeCallback != null) {
                 operation.writeCallback.onError("蓝牙已断开");
             }
+        }
+    }
+
+    private void clearConnectionTimeout() {
+        if (connectionTimeout != null) {
+            main.removeCallbacks(connectionTimeout);
+            connectionTimeout = null;
+        }
+    }
+
+    private void clearAuthenticatedRetry() {
+        if (authenticatedRetry != null) {
+            main.removeCallbacks(authenticatedRetry);
+            authenticatedRetry = null;
         }
     }
 

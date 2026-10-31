@@ -25,12 +25,13 @@ public final class PhoneLocationService extends Service {
     public static final String ACTION_START = "wiki.igp.framenav.action.START_PHONE_LOCATION";
     public static final String ACTION_STOP = "wiki.igp.framenav.action.STOP_PHONE_LOCATION";
 
-    private static final String CHANNEL_ID = "phone_location";
+    // Keep a new channel id so devices that persisted the old channel's
+    // importance do not bring back audible or heads-up alerts.
+    private static final String CHANNEL_ID = "phone_location_silent_v2";
     private static final int NOTIFICATION_ID = 4101;
     private long locationIntervalMs = 5_000L;
     private long minPushIntervalMs = 5_000L;
     private static final long BLE_WARNING_DELAY_MS = 30_000L;
-    private static final long BLE_STOP_DELAY_MS = 120_000L;
 
     public interface LocationWriter {
         boolean isReady();
@@ -69,6 +70,10 @@ public final class PhoneLocationService extends Service {
     private boolean warningShown;
     private boolean pushEnabled = true;
     private boolean forwardToCamera = true;
+    private String notificationText;
+    private String lastServiceState;
+    private Boolean bleConnected;
+    private boolean lastServiceStateError;
 
     private final Runnable pushLocation = new Runnable() {
         @Override
@@ -92,12 +97,7 @@ public final class PhoneLocationService extends Service {
             long disconnectedFor = now - disconnectedSinceMs;
             if (!warningShown && disconnectedFor >= BLE_WARNING_DELAY_MS) {
                 warningShown = true;
-                notifyState("设备连接已断开，正在等待重新连接", true);
-            }
-            if (disconnectedFor >= BLE_STOP_DELAY_MS) {
-                notifyState("设备长时间不可达，持续定位已停止", true);
-                stopSelf();
-                return;
+                notifyState("设备连接已断开，正在等待重新连接", false);
             }
             main.postDelayed(this, 5_000L);
         }
@@ -109,10 +109,6 @@ public final class PhoneLocationService extends Service {
             if (location == null) return;
             latestLocation = new Location(location);
             if (listener != null) listener.onLocation(new Location(location));
-            updateNotification(isBleReady()
-                    ? "正在获取位置并通过蓝牙推送"
-                    : isReady() ? "正在获取位置并通过设备 AP 回退"
-                    : "正在获取位置，等待设备连接");
         }
 
         @Override
@@ -141,10 +137,13 @@ public final class PhoneLocationService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && ACTION_STOP.equals(intent.getAction())) {
+            stopLocationUpdates();
+            stopForegroundService();
             stopSelf();
             return START_NOT_STICKY;
         }
         Notification notification = buildNotification("正在启动持续定位");
+        notificationText = "正在启动持续定位";
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(NOTIFICATION_ID, notification,
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
@@ -163,19 +162,10 @@ public final class PhoneLocationService extends Service {
     @Override
     public void onDestroy() {
         stopLocationUpdates();
-        if (locationManager != null) {
-            try {
-                locationManager.removeUpdates(locationListener);
-            } catch (SecurityException ignored) {
-                // Location permission may have been revoked while the service was active.
-            }
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            stopForeground(STOP_FOREGROUND_REMOVE);
-        } else {
-            stopForeground(true);
-        }
+        stopForegroundService();
+        writer = null;
         if (listener != null) listener.onServiceState("持续定位已停止", false);
+        listener = null;
         super.onDestroy();
     }
 
@@ -194,14 +184,12 @@ public final class PhoneLocationService extends Service {
     public void setLatestLocation(Location location) {
         if (location == null) return;
         latestLocation = new Location(location);
-        updateNotification(isBleReady()
-                ? "正在获取位置并通过蓝牙推送"
-                : isReady() ? "正在获取位置并通过设备 AP 回退"
-                : "正在获取位置，等待设备连接");
         pushLatestLocation();
     }
 
     public void setBleConnected(boolean connected) {
+        if (bleConnected != null && bleConnected == connected) return;
+        bleConnected = connected;
         if (connected) {
             disconnectedSinceMs = 0;
             warningShown = false;
@@ -223,7 +211,10 @@ public final class PhoneLocationService extends Service {
         minPushIntervalMs = safeInterval;
         if (!continuous) {
             stopLocationUpdates();
-            if (!sendToDevice) stopSelf();
+            if (!sendToDevice) {
+                stopForegroundService();
+                stopSelf();
+            }
             else updateNotification("单次手机定位已获取；持续采集已关闭");
             return;
         }
@@ -328,7 +319,7 @@ public final class PhoneLocationService extends Service {
                 if (success) {
                     lastPushMs = System.currentTimeMillis();
                     String destination = forwardToCamera ? "手机定位已推送" : "手动兜底位置已更新";
-                    updateNotification(destination + " · " + formatCoordinates(sample));
+                    updateNotification(destination);
                     if (listener != null) listener.onServiceState(destination, false);
                 } else {
                     updateNotification("设备位置写入失败，等待重试");
@@ -356,6 +347,22 @@ public final class PhoneLocationService extends Service {
         locationUpdatesStarted = false;
         main.removeCallbacks(pushLocation);
         main.removeCallbacks(connectionWatch);
+        if (locationManager != null) {
+            try {
+                locationManager.removeUpdates(locationListener);
+            } catch (SecurityException | IllegalArgumentException ignored) {
+                // The listener may already be unregistered or permission revoked.
+            }
+        }
+    }
+
+    private void stopForegroundService() {
+        notificationText = null;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE);
+        } else {
+            stopForeground(true);
+        }
     }
 
     private void restartLocationUpdates() {
@@ -368,6 +375,9 @@ public final class PhoneLocationService extends Service {
     }
 
     private void notifyState(String message, boolean error) {
+        if (message.equals(lastServiceState) && error == lastServiceStateError) return;
+        lastServiceState = message;
+        lastServiceStateError = error;
         updateNotification(message);
         if (listener != null) listener.onServiceState(message, error);
     }
@@ -377,6 +387,9 @@ public final class PhoneLocationService extends Service {
         NotificationChannel channel = new NotificationChannel(CHANNEL_ID,
                 "持续手机定位", NotificationManager.IMPORTANCE_LOW);
         channel.setDescription("持续获取手机位置并通过蓝牙发送到 FrameNav");
+        channel.setSound(null, null);
+        channel.enableVibration(false);
+        channel.setShowBadge(false);
         NotificationManager manager = getSystemService(NotificationManager.class);
         if (manager != null) manager.createNotificationChannel(channel);
     }
@@ -393,21 +406,20 @@ public final class PhoneLocationService extends Service {
                 .setContentText(text)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
+                .setDefaults(0)
+                .setPriority(Notification.PRIORITY_LOW)
                 .addAction(new Notification.Action.Builder(
                         android.R.drawable.ic_media_pause, "停止", stopIntent).build())
                 .build();
     }
 
     private void updateNotification(String text) {
+        if (text == null || text.equals(notificationText)) return;
         NotificationManager manager = (NotificationManager) getSystemService(
                 Context.NOTIFICATION_SERVICE);
         if (manager != null && locationUpdatesStarted) {
+            notificationText = text;
             manager.notify(NOTIFICATION_ID, buildNotification(text));
         }
-    }
-
-    private static String formatCoordinates(Location location) {
-        return String.format(java.util.Locale.US, "%.5f, %.5f",
-                location.getLatitude(), location.getLongitude());
     }
 }

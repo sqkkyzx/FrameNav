@@ -27,6 +27,7 @@ class WifiWebChecks(unittest.TestCase):
 
     def test_wifi_starts_on_boot_and_usb_data_host_wakes_after_idle(self):
         task = function_source("src/main.c", "wifi_web_task")
+        main_source = (ROOT / "src/main.c").read_text()
         self.assertIn("wifi_web_start(cfg)", task)
         self.assertIn("wifi_web_stop()", task)
         self.assertIn("wifi_web_has_clients()", task)
@@ -39,6 +40,9 @@ class WifiWebChecks(unittest.TestCase):
         self.assertIn("wifi_web_take_wake_request()", task)
         self.assertIn("camera_wake", task)
         self.assertIn("idle_shutdown", task)
+        self.assertIn("#define WIFI_IDLE_POLL_MS 2000U", main_source)
+        self.assertIn("#define WIFI_STOPPED_POLL_MS 5000U", main_source)
+        self.assertIn("WIFI_STOPPED_POLL_MS", task)
         self.assertIn("USB data-host wake", task)
         self.assertNotIn("USB_SERIAL_JTAG", task)
         ble = (ROOT / "src/ble_client.c").read_text()
@@ -150,25 +154,39 @@ class WifiWebChecks(unittest.TestCase):
         self.assertIn("wifi_web_get_ble_config_json()", source)
         self.assertIn('cJSON_AddItemToObject(root, "c", camera)', web)
         self.assertIn('cJSON_AddItemToObject(root, "l", location)', web)
-        self.assertIn("strlen(json) > 220U", web)
+        self.assertIn("strlen(json) > 240U", web)
+        for characteristic in ("settings_json", "telemetry_json", "bonds_json"):
+            self.assertIn(f".uuid = &k_chr_{characteristic}_uuid.u,\n"
+                          "             .access_cb = gatt_access_cb,\n"
+                          "             .flags = BLE_GATT_CHR_F_READ,", source)
         self.assertNotIn("FIELD_WIFI_SSID", source)
         self.assertNotIn("FIELD_WIFI_PASS", source)
         self.assertIn("wifi_web_get_ble_telemetry_json()", source)
+
+    def test_phone_ble_location_does_not_force_android_pairing(self):
+        config = (ROOT / "src/ble_config_server.c").read_text()
+        location = (ROOT / "src/ble_location_server.c").read_text()
+        self.assertNotIn("BLE_GATT_CHR_F_READ_ENC", config)
+        self.assertNotIn("BLE_GATT_CHR_F_WRITE_ENC", location)
+        self.assertNotIn("ble_gap_security_initiate(s_conn_handle)", location)
 
     def test_ble_telemetry_has_a_mtu_sized_guard_and_keeps_verbose_http_shape(self):
         source = (ROOT / "src/wifi_web.c").read_text()
         self.assertIn('cJSON_AddStringToObject(root, "a", active)', source)
         for key in ('"g"', '"p"', '"m"', '"s"'):
             self.assertIn(key, source)
-        self.assertIn("strlen(json) > 220U", source)
+        self.assertIn("strlen(json) > 240U", source)
+        self.assertIn("ble_telemetry_add(m, cJSON_CreateBool(manual.clock_pending))", source)
+        self.assertIn("telemetry_fail:", source)
         self.assertIn("build_location_json()", source)
 
     def test_wifi_start_limits_fixed_ap_transmit_power(self):
         source = (ROOT / "src/wifi_web.c").read_text()
-        self.assertIn("FRAMENAV_WIFI_MAX_TX_POWER_QDBM 66", source)
+        self.assertIn("FRAMENAV_WIFI_MAX_TX_POWER_QDBM 52", source)
         power = function_source("src/wifi_web.c", "configure_wifi_tx_power")
         self.assertIn("esp_wifi_set_max_tx_power", power)
-        self.assertIn("16.5", source)
+        self.assertIn("13 dBm", source)
+        self.assertIn("FRAMENAV_WIFI_MAX_TX_POWER_QDBM 52", source)
         start = function_source("src/wifi_web.c", "wifi_web_start_unlocked")
         self.assertLess(start.index("esp_wifi_start()"),
                         start.index("configure_wifi_tx_power()"))

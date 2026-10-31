@@ -160,7 +160,7 @@ int main(void) {
 }
 """)
 
-    def test_no_bonds_means_continuous_scanning_even_long_after_boot(self):
+    def test_no_bonds_use_low_duty_scanning_until_pairing_window(self):
         run_c(scan_code() + """
 int main(void) {
     bond_count=0;
@@ -168,7 +168,7 @@ int main(void) {
     for (unsigned i=0; i<sizeof(times)/sizeof(times[0]); i++) {
         scan_active=false; now_us=times[i]; ble_start_scan();
         assert(last_duration==BLE_HS_FOREVER);
-        assert(last_params.itvl==16 && last_params.window==16);
+        assert(last_params.itvl==4800 && last_params.window==160);
         assert(!last_params.passive && last_params.filter_duplicates);
     }
     ble_scan_complete(0); // A stale completion must not duplicate the active scan.
@@ -199,7 +199,7 @@ int main(void) {
         run_c(scan_code() + """
 int main(void) {
     bond_count=0; now_us=2000000; ble_start_scan();
-    assert(last_params.itvl==16 && last_duration==BLE_HS_FOREVER);
+    assert(last_params.itvl==4800 && last_params.window==160 && last_duration==BLE_HS_FOREVER);
     // Discovery cancels scanning; pairing saves a bond while connected.
     scan_active=false; connected=true; bond_count=1; now_us=8000000;
     ble_start_scan(); assert(starts==1);
@@ -215,7 +215,7 @@ int main(void) {
 }
 """)
 
-    def test_clearing_last_bond_restores_continuous_pairing_discovery(self):
+    def test_clearing_last_bond_restores_low_duty_discovery(self):
         run_c(scan_code() + """
 int main(void) {
     now_us=60000000; ble_start_scan();
@@ -223,7 +223,7 @@ int main(void) {
     // Existing pairing-recovery code may remove an invalid bond.
     scan_active=false; bond_count=0; ble_start_scan();
     ble_scan_complete(0);
-    assert(starts==2 && last_params.itvl==16 && last_params.window==16);
+    assert(starts==2 && last_params.itvl==4800 && last_params.window==160);
     assert(last_duration==BLE_HS_FOREVER);
     return 0;
 }
@@ -237,10 +237,10 @@ int main(void) {
     scan_active=false; now_us=90000000; ble_start_scan();
     assert(last_params.itvl==4800 && last_params.window==160);
     assert(last_duration==BLE_HS_FOREVER);
-    // Only a successful empty-store lookup permits continuous discovery.
+    // Only an explicit pairing window permits continuous discovery.
     scan_active=false; bond_rc=0; ble_start_scan();
     ble_scan_complete(0);
-    assert(last_params.itvl==16 && last_params.window==16);
+    assert(last_params.itvl==4800 && last_params.window==160);
     return 0;
 }
 """)

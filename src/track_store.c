@@ -349,6 +349,11 @@ void track_store_task(void *arg) {
     if (record_allowed && location_service_get(&fix) && fix.valid && fix.time_valid) {
       (void)track_store_append_fix(&fix);
     }
-    vTaskDelay(pdMS_TO_TICKS(500));
+    uint32_t poll_ms = snapshot.track_enabled
+                           ? snapshot.track_interval_s * 1000U
+                           : 5000U;
+    if (poll_ms > 5000U) poll_ms = 5000U;
+    if (poll_ms < 1000U) poll_ms = 1000U;
+    vTaskDelay(pdMS_TO_TICKS(poll_ms));
   }
 }
