@@ -144,31 +144,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     private android.net.Network verifiedHotspotNetwork;
     private android.net.ConnectivityManager connectivityManager;
     private final android.net.ConnectivityManager.NetworkCallback wifiNetworkCallback =
-            new android.net.ConnectivityManager.NetworkCallback() {
-                @Override public void onAvailable(android.net.Network network) {
-                    runOnUiThread(() -> {
-                        main.removeCallbacks(wifiRouteRefresh);
-                        main.postDelayed(wifiRouteRefresh, 250L);
-                    });
-                }
-
-                @Override public void onLost(android.net.Network network) {
-                    runOnUiThread(() -> {
-                        if (network.equals(currentWifiNetwork)) {
-                            currentWifiNetwork = null;
-                            wifiClient.setNetwork(null);
-                            checkCurrentWifi();
-                        }
-                        if (network.equals(verifiedHotspotNetwork)) {
-                            verifiedHotspotNetwork = null;
-                            deviceHotspotVerified = false;
-                            if (phoneLocationService != null) {
-                                phoneLocationService.setBleConnected(bleReady && bleLocationAvailable);
-                            }
-                        }
-                    });
-                }
-            };
+            createWifiNetworkCallback();
     private final Runnable configPoll = new Runnable() {
         @Override public void run() {
             if (!activityResumed || !bleReady) return;
@@ -262,8 +238,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             main.removeCallbacks(configPoll);
             main.post(configPoll);
         }
-        boolean frameNavWifi = isFrameNavWifi(connectivityManager == null || currentWifiNetwork == null
-                ? null : connectivityManager.getNetworkCapabilities(currentWifiNetwork));
+        boolean frameNavWifi = isFrameNavWifi(connectivityManager, currentWifiNetwork);
         if ((frameNavWifi || pendingHotspotWorkflow || afterHotspotConnected != null)
                 && wifiClientHasNetwork()) {
             main.postDelayed(this::verifyDeviceHotspot, 700L);
@@ -910,7 +885,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             addWifiCandidate(manager, active, candidates, true);
             for (android.net.Network network : manager.getAllNetworks()) {
                 android.net.NetworkCapabilities caps = manager.getNetworkCapabilities(network);
-                addWifiCandidate(manager, network, candidates, isFrameNavWifi(caps));
+                addWifiCandidate(manager, network, candidates, isFrameNavWifi(manager, network));
             }
         }
         if (candidates.isEmpty()) {
@@ -976,6 +951,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             phoneLocationService.setBleConnected(bleReady && bleLocationAvailable);
         }
         if (success) {
+            wifiStatus.setText("已连接 FrameNav 热点 · 已验证");
             setMessage("已连接 FrameNav 设备热点。", false);
             Runnable action = afterHotspotConnected;
             afterHotspotConnected = null;
@@ -983,10 +959,10 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         } else if (bleReady && bleLocationAvailable) {
             setMessage("蓝牙已连接；设备热点暂未验证，定位仍通过蓝牙推送。", false);
         } else {
-            String prefix = isFrameNavWifi(connectivityManager == null || currentWifiNetwork == null
-                    ? null : connectivityManager.getNetworkCapabilities(currentWifiNetwork))
+            String prefix = isFrameNavWifi(connectivityManager, currentWifiNetwork)
                     ? "已检测到 FrameNav Wi-Fi，但设备 IP 校验失败"
                     : "已连接 Wi-Fi，但无法访问 FrameNav 设备 IP";
+            wifiStatus.setText(prefix);
             setMessage(prefix + (error == null || error.isEmpty() ? "。" : "：" + error), false);
         }
     }
@@ -1071,7 +1047,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
                 for (android.net.Network network : manager.getAllNetworks()) {
                     android.net.NetworkCapabilities caps = manager.getNetworkCapabilities(network);
                     if (caps != null && caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) {
-                        if (isFrameNavWifi(caps)) {
+                        if (isFrameNavWifi(manager, network)) {
                             wifi = network;
                             break;
                         }
@@ -1089,12 +1065,14 @@ public final class MainActivity extends Activity implements BleManager.Listener 
                         phoneLocationService.setBleConnected(bleReady && bleLocationAvailable);
                     }
                 }
-                wifiStatus.setText(isFrameNavWifi(manager == null ? null
-                        : manager.getNetworkCapabilities(wifi))
-                        ? "已连接 FrameNav Wi-Fi · 等待 IP 验证"
+                boolean frameNavWifi = isFrameNavWifi(manager, wifi);
+                wifiStatus.setText(frameNavWifi
+                        ? deviceHotspotVerified && wifi.equals(verifiedHotspotNetwork)
+                            ? "已连接 FrameNav Wi-Fi · 已验证"
+                            : "已连接 FrameNav Wi-Fi · 等待 IP 验证"
                         : "手机已连接 Wi-Fi · 设备热点尚未验证");
                 refreshControls();
-                if ((isFrameNavWifi(manager == null ? null : manager.getNetworkCapabilities(wifi))
+                if ((frameNavWifi
                         || pendingHotspotWorkflow || afterHotspotConnected != null
                         || (apFallback && !(bleReady && bleLocationAvailable)))
                         && !deviceHotspotVerified && !hotspotVerificationInProgress) {
@@ -1120,6 +1098,77 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         String ssid = ((android.net.wifi.WifiInfo) transportInfo).getSSID();
         return ssid != null && ssid.replace("\"", "").startsWith("FrameNav-");
     }
+
+    private boolean isFrameNavWifi(android.net.ConnectivityManager manager,
+                                   android.net.Network network) {
+        if (manager == null || network == null) return false;
+        if (isFrameNavWifi(manager.getNetworkCapabilities(network))) return true;
+        android.net.LinkProperties properties = manager.getLinkProperties(network);
+        if (properties == null) return false;
+        for (android.net.RouteInfo route : properties.getRoutes()) {
+            java.net.InetAddress gateway = route.getGateway();
+            if (gateway != null && isFrameNavGateway(gateway)) return true;
+        }
+        return false;
+    }
+
+    private static boolean isFrameNavGateway(java.net.InetAddress address) {
+        byte[] bytes = address == null ? null : address.getAddress();
+        return bytes != null && bytes.length == 4
+                && (bytes[0] & 0xFF) == 10
+                && (bytes[1] & 0xFF) == 254
+                && (bytes[2] & 0xFF) == 254
+                && (bytes[3] & 0xFF) == 1;
+    }
+
+    private android.net.ConnectivityManager.NetworkCallback createWifiNetworkCallback() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            return new android.net.ConnectivityManager.NetworkCallback(
+                    android.net.ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO) {
+                @Override public void onAvailable(android.net.Network network) {
+                    handleWifiAvailable();
+                }
+
+                @Override public void onLost(android.net.Network network) {
+                    handleWifiLost(network);
+                }
+            };
+        }
+        return new android.net.ConnectivityManager.NetworkCallback() {
+            @Override public void onAvailable(android.net.Network network) {
+                handleWifiAvailable();
+            }
+
+            @Override public void onLost(android.net.Network network) {
+                handleWifiLost(network);
+            }
+        };
+    }
+
+    private void handleWifiAvailable() {
+        runOnUiThread(() -> {
+            main.removeCallbacks(wifiRouteRefresh);
+            main.postDelayed(wifiRouteRefresh, 250L);
+        });
+    }
+
+    private void handleWifiLost(android.net.Network network) {
+        runOnUiThread(() -> {
+            if (network.equals(currentWifiNetwork)) {
+                currentWifiNetwork = null;
+                wifiClient.setNetwork(null);
+                checkCurrentWifi();
+            }
+            if (network.equals(verifiedHotspotNetwork)) {
+                verifiedHotspotNetwork = null;
+                deviceHotspotVerified = false;
+                if (phoneLocationService != null) {
+                    phoneLocationService.setBleConnected(bleReady && bleLocationAvailable);
+                }
+            }
+        });
+    }
+
 
     private final ServiceConnection phoneLocationConnection = new ServiceConnection() {
         @Override
