@@ -113,6 +113,8 @@ public final class BleManager {
     private boolean ready;
     private boolean waitingForBond;
     private boolean bondReceiverRegistered;
+    private boolean gattCacheRefreshAttempted;
+    private boolean gattCacheRefreshSucceeded;
     private int authRetryCount;
     private boolean mtuRequested;
     private int negotiatedMtu = 23;
@@ -266,9 +268,13 @@ public final class BleManager {
 
     public void requestWifiWake(Callback callback) {
         main.post(() -> {
+            if (!ready || gatt == null) {
+                callback.onError("设备 BLE 尚未连接或 GATT 服务尚未就绪");
+                return;
+            }
             BluetoothGattCharacteristic wake = characteristics.get(WIFI_WAKE);
-            if (!ready || wake == null) {
-                callback.onError("设备 BLE 尚未连接或不支持热点唤醒");
+            if (wake == null) {
+                callback.onError("已连接 BLE，但设备固件未提供热点唤醒特征，请刷入支持 BLE 配置的固件");
                 return;
             }
             enqueueWrite(wake, new byte[]{1}, callback);
@@ -627,6 +633,10 @@ public final class BleManager {
                 }
                 listener.onBleState("已连接，正在读取服务…");
                 try {
+                    if (!gattCacheRefreshAttempted) {
+                        gattCacheRefreshAttempted = true;
+                        gattCacheRefreshSucceeded = refreshGattCache(bluetoothGatt);
+                    }
                     negotiatedMtu = 23;
                     mtuRequested = bluetoothGatt.requestMtu(247);
                     if (!mtuRequested) {
@@ -675,6 +685,11 @@ public final class BleManager {
                 boolean config = characteristics.containsKey(CONFIG_CHARACTERISTICS.get("camera_name"));
                 ready = location || config;
                 listener.onBleReady(location, config);
+                if (locationService && !config) {
+                    listener.onBleState(gattCacheRefreshSucceeded
+                            ? "BLE 已连接·定位；设备未提供配置服务，请检查固件配置"
+                            : "BLE 已连接·定位；未能刷新 GATT 缓存，请关闭并重新连接设备");
+                }
                 if (locationService && !location) {
                     listener.onBleState("BLE 已连接；MTU 不足，位置请走 Wi-Fi");
                 } else if (!ready) {
@@ -743,6 +758,18 @@ public final class BleManager {
 
     private static String gattStatus(int status) {
         return status == BluetoothGatt.GATT_SUCCESS ? "" : "GATT 状态码 " + status;
+    }
+
+    @SuppressLint("MissingPermission")
+    private boolean refreshGattCache(BluetoothGatt bluetoothGatt) {
+        try {
+            java.lang.reflect.Method refresh = bluetoothGatt.getClass().getMethod("refresh");
+            Object result = refresh.invoke(bluetoothGatt);
+            return result instanceof Boolean && (Boolean) result;
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+            // Android exposes refresh() only as a hidden API on some releases.
+            return false;
+        }
     }
 
     private boolean isCurrentOperation(BluetoothGatt callbackGatt,
@@ -852,6 +879,8 @@ public final class BleManager {
         }
         stopScan();
         device = found;
+        gattCacheRefreshAttempted = false;
+        gattCacheRefreshSucceeded = false;
         listener.onBleState("正在连接 " + safeDeviceName(found) + "…");
         try {
             gatt = found.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE);

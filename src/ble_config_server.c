@@ -367,8 +367,14 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
 
 void ble_config_server_register(app_config_t *cfg) {
   s_cfg = cfg;
-  ble_gatts_count_cfg(gatt_svcs);
-  ble_gatts_add_svcs(gatt_svcs);
+  int count_rc = ble_gatts_count_cfg(gatt_svcs);
+  int add_rc = count_rc == 0 ? ble_gatts_add_svcs(gatt_svcs) : count_rc;
+  if (add_rc != 0) {
+    ESP_LOGE(TAG, "BLE config GATT registration failed: count=%d add=%d",
+             count_rc, add_rc);
+  } else {
+    ESP_LOGI(TAG, "BLE config GATT service registered");
+  }
 }
 
 void ble_config_server_on_sync(void) {
