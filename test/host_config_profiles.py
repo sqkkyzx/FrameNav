@@ -19,6 +19,32 @@ SOURCE = (
 
 
 class ConfigProfileChecks(unittest.TestCase):
+    def test_camera_name_prefix_keeps_valid_utf8_at_byte_limit(self):
+        setter = function_source("src/config.c", "utf8_sequence_length")
+        prefix = function_source("src/config.c", "utf8_prefix_length")
+        copy = function_source("src/config.c", "config_set_camera_name_prefix")
+        run_c('#include <assert.h>\n#include <stdbool.h>\n#include <stddef.h>\n'
+              '#include <stdint.h>\n#include <string.h>\n'
+              '#include "config.h"\n' + setter + prefix + copy + r"""
+int main(void) {
+  app_config_t cfg={0};
+  const char complete[] = "1234567890123456789012345678中X";
+  assert(config_set_camera_name_prefix(&cfg, complete, strlen(complete)));
+  assert(strlen(cfg.camera_name_prefix) == 31);
+  assert(memcmp(cfg.camera_name_prefix, "1234567890123456789012345678中", 31) == 0);
+
+  const char boundary[] = "12345678901234567890123456789中";
+  assert(config_set_camera_name_prefix(&cfg, boundary, strlen(boundary)));
+  assert(strlen(cfg.camera_name_prefix) == 29);
+  assert(memcmp(cfg.camera_name_prefix, "12345678901234567890123456789", 29) == 0);
+
+  const char invalid[] = { (char)0xe4, (char)0xb8, 'x', '\0' };
+  assert(!config_set_camera_name_prefix(&cfg, invalid, 3));
+  assert(strlen(cfg.camera_name_prefix) == 29);
+  return 0;
+}
+""")
+
     def test_location_presets_and_custom_values(self):
         run_c(SOURCE + r"""
 int main(void) {

@@ -419,7 +419,8 @@ int main(void) {
         defines = "\n".join(re.findall(r"^#define .+$", source, re.M))
         functions = "\n".join(function_source("src/config.c", name) for name in (
             "config_set_str_default", "source_order_is_valid", "config_terminate_str",
-            "config_set_defaults", "config_validate"))
+            "utf8_sequence_length", "utf8_prefix_length",
+            "config_set_camera_name_prefix", "config_set_defaults", "config_validate"))
         run_c('#include <assert.h>\n#include <string.h>\n#include "config.h"\n' +
               'static void config_set_str_default(char *, size_t, const char *);\n' +
               defines + "\n" + functions + r"""

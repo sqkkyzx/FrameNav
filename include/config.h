@@ -7,6 +7,7 @@
 #define ALPHALOC_CONFIG_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #define CONFIG_STR_MAX_32 32
@@ -114,6 +115,8 @@ bool config_load(app_config_t *cfg);
 bool config_save(const app_config_t *cfg);
 bool config_apply(app_config_t *cfg, const app_config_t *new_cfg);
 bool config_get_snapshot(const app_config_t *cfg, app_config_t *out);
+bool config_set_camera_name_prefix(app_config_t *cfg, const char *value,
+                                   size_t value_len);
 void config_resolve_location_power(const app_config_t *cfg,
                                    location_power_policy_t *out);
 void config_resolve_bluetooth_power(const app_config_t *cfg,

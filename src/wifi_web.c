@@ -637,7 +637,14 @@ char *wifi_web_get_ble_config_json(void) {
   if (!root) return NULL;
   char *json = cJSON_PrintUnformatted(root);
   cJSON_Delete(root);
-  if (!json || strlen(json) > 220U) {
+  /* The phone negotiates MTU 247, leaving 246 bytes for one ATT read. Keep
+   * the compact payload below that boundary so Android receives it in one
+   * read even when all configuration fields are populated. */
+  if (!json || strlen(json) > 240U) {
+    if (json) {
+      ESP_LOGW(TAG, "BLE config payload too large: %u bytes",
+               (unsigned)strlen(json));
+    }
     free(json);
     return NULL;
   }
@@ -903,7 +910,14 @@ char *wifi_web_get_ble_telemetry_json(void) {
   if (!root) return NULL;
   char *json = cJSON_PrintUnformatted(root);
   cJSON_Delete(root);
-  if (!json || strlen(json) > 220U) {
+  /* Keep the compact payload below the 246-byte ATT payload available after
+   * the app requests MTU 247. A larger payload would be truncated by some
+   * Android GATT stacks instead of being delivered as valid JSON. */
+  if (!json || strlen(json) > 240U) {
+    if (json) {
+      ESP_LOGW(TAG, "BLE telemetry payload too large: %u bytes",
+               (unsigned)strlen(json));
+    }
     free(json);
     return NULL;
   }
@@ -1286,8 +1300,10 @@ static esp_err_t handle_save(httpd_req_t *req) {
   char value[CONFIG_STR_MAX_64];
   form_get(body, "cam_name", value, sizeof(value));
   if (strstr(body, "cam_name=") != NULL) {
-    strncpy(next.camera_name_prefix, value, sizeof(next.camera_name_prefix) - 1);
-    next.camera_name_prefix[sizeof(next.camera_name_prefix) - 1] = '\0';
+    if (!config_set_camera_name_prefix(&next, value, strlen(value))) {
+      return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                 "相机名称前缀编码无效");
+    }
   }
 
   form_get(body, "cam_mac", value, sizeof(value));

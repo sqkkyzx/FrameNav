@@ -253,7 +253,9 @@ static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 #endif
         return 0;
       case FIELD_CAM_NAME:
-        copy_str_field(cfg.camera_name_prefix, sizeof(cfg.camera_name_prefix), buf, strlen(buf));
+        if (!config_set_camera_name_prefix(&cfg, buf, strlen(buf))) {
+          return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        }
         break;
       case FIELD_CAM_MAC:
         copy_str_field(cfg.camera_mac_prefix, sizeof(cfg.camera_mac_prefix), buf, strlen(buf));

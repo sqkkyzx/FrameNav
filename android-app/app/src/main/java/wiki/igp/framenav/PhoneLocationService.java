@@ -20,7 +20,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 
-/** Keeps phone location updates active while periodically sending them over the app's BLE link. */
+/** Keeps phone location updates active while periodically sending them over the app's Bluetooth link. */
 public final class PhoneLocationService extends Service {
     public static final String ACTION_START = "wiki.igp.framenav.action.START_PHONE_LOCATION";
     public static final String ACTION_STOP = "wiki.igp.framenav.action.STOP_PHONE_LOCATION";
@@ -110,7 +110,7 @@ public final class PhoneLocationService extends Service {
             latestLocation = new Location(location);
             if (listener != null) listener.onLocation(new Location(location));
             updateNotification(isBleReady()
-                    ? "正在获取位置并通过 BLE 推送"
+                    ? "正在获取位置并通过蓝牙推送"
                     : isReady() ? "正在获取位置并通过设备 AP 回退"
                     : "正在获取位置，等待设备连接");
         }
@@ -187,7 +187,7 @@ public final class PhoneLocationService extends Service {
         this.writer = writer;
         updateConnectionWatch();
         if (isReady()) {
-            notifyState(isBleReady() ? "BLE 定位推送已就绪" : "设备 AP 定位回退已就绪", false);
+            notifyState(isBleReady() ? "蓝牙定位推送已就绪" : "设备 AP 定位回退已就绪", false);
         }
     }
 
@@ -195,7 +195,7 @@ public final class PhoneLocationService extends Service {
         if (location == null) return;
         latestLocation = new Location(location);
         updateNotification(isBleReady()
-                ? "正在获取位置并通过 BLE 推送"
+                ? "正在获取位置并通过蓝牙推送"
                 : isReady() ? "正在获取位置并通过设备 AP 回退"
                 : "正在获取位置，等待设备连接");
         pushLatestLocation();
@@ -206,7 +206,7 @@ public final class PhoneLocationService extends Service {
             disconnectedSinceMs = 0;
             warningShown = false;
             main.removeCallbacks(connectionWatch);
-            notifyState("BLE 定位推送已就绪", false);
+            notifyState("蓝牙定位推送已就绪", false);
         } else {
             if (disconnectedSinceMs == 0) {
                 disconnectedSinceMs = android.os.SystemClock.elapsedRealtime();
@@ -339,7 +339,7 @@ public final class PhoneLocationService extends Service {
         } catch (RuntimeException error) {
             writeInFlight = false;
             String message = error.getMessage() == null
-                    ? "BLE 位置写入无法启动" : error.getMessage();
+                    ? "蓝牙位置写入无法启动" : error.getMessage();
             updateNotification("设备位置写入失败，等待重试");
             if (listener != null) listener.onServiceState(message, true);
         }

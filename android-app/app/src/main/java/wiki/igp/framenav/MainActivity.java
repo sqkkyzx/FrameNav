@@ -77,7 +77,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     private boolean bleLocationAvailable;
     private boolean bleConfigAvailable;
     private Location currentLocation;
-    private String devicePhoneRemainingText = "等待 BLE 遥测";
+    private String devicePhoneRemainingText = "等待蓝牙遥测";
     private PhoneLocationService phoneLocationService;
     private boolean phoneLocationBound;
     private boolean phoneLocationStarting;
@@ -195,8 +195,8 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        getWindow().setStatusBarColor(0xFF14231D);
-        getWindow().setNavigationBarColor(0xFF14231D);
+        getWindow().setStatusBarColor(0xFF17231C);
+        getWindow().setNavigationBarColor(0xFF17231C);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) getWindow().setDecorFitsSystemWindows(false);
         locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
         wifiClient = new WifiClient();
@@ -259,7 +259,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     private void buildUi() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(0xFFF5F7F5);
+        root.setBackgroundColor(0xFFEEF3EF);
         root.setPadding(dp(16), dp(12), dp(16), dp(6));
         root.setOnApplyWindowInsetsListener((view, insets) -> {
             int top = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
@@ -272,15 +272,15 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             return insets;
         });
         LinearLayout heading = row(root);
-        TextView brand = text("FrameNav", 24, 0xFF14231D, true);
+        TextView brand = text("FrameNav", 24, 0xFF17231C, true);
         heading.addView(brand, new LinearLayout.LayoutParams(0, dp(36), 1f));
-        TextView firmware = text("设备管理", 13, 0xFF68756D, false);
+        TextView firmware = text("设备管理", 13, 0xFF66736B, false);
         firmware.setGravity(Gravity.CENTER_VERTICAL | Gravity.RIGHT);
         heading.addView(firmware, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, dp(36)));
-        message = text("连接设备后读取状态和配置。", 13, 0xFF53625A, false);
+        message = text("连接设备后读取状态和配置。", 13, 0xFF66736B, false);
         message.setPadding(dp(10), dp(8), dp(10), dp(8));
-        message.setBackgroundColor(0xFFEAF0EB);
+        message.setBackgroundColor(0xFFE2F4E7);
         LinearLayout.LayoutParams messageParams = matchWrap();
         messageParams.bottomMargin = dp(8);
         root.addView(message, messageParams);
@@ -310,85 +310,85 @@ public final class MainActivity extends Activity implements BleManager.Listener 
 
         LinearLayout statusPage = newPage();
         LinearLayout connectionCard = card(statusPage, "连接信息");
-        connectionStatus = text("未连接", 14, 0xFF68756D, false);
+        connectionStatus = text("未连接", 14, 0xFF66736B, false);
         connectionCard.addView(connectionStatus, matchWrap());
-        wifiStatus = text("设备 IP 通道未连接", 13, 0xFF68756D, false);
+        wifiStatus = text("设备 IP 通道未连接", 13, 0xFF66736B, false);
         connectionCard.addView(wifiStatus, matchWrap());
         LinearLayout connectionButtons = row(connectionCard);
-        connectBleButton = button("扫描并连接 BLE", 0xFF28704A);
+        connectBleButton = button("扫描并连接蓝牙", 0xFF257149);
         connectBleButton.setOnClickListener(view -> requestBlePermissionsThenConnect());
         connectionButtons.addView(connectBleButton, weighted());
-        Button disconnect = button("断开", 0xFF53625A);
+        Button disconnect = button("断开", 0xFF34463B);
         disconnect.setOnClickListener(view -> {
             bleManager.disconnect();
-            setMessage("BLE 已断开。", false);
+            setMessage("蓝牙已断开。", false);
         });
         connectionButtons.addView(disconnect, weighted());
         LinearLayout locationCard = card(statusPage, "定位信息");
         LinearLayout activeRow = row(locationCard);
         activeSourceBadge = text("当前使用：—", 12, 0xFFFFFFFF, true);
         activeSourceBadge.setPadding(dp(8), dp(5), dp(8), dp(5));
-        activeSourceBadge.setBackgroundColor(0xFF28704A);
+        activeSourceBadge.setBackgroundColor(0xFF257149);
         activeRow.addView(activeSourceBadge, matchWrap());
-        deviceStatus = text("设备定位：—", 13, 0xFF68756D, false);
+        deviceStatus = text("设备定位：—", 13, 0xFF66736B, false);
         locationCard.addView(deviceStatus, matchWrap());
-        gnssSourceStatus = text("GNSS 定位：—", 13, 0xFF53625A, false);
+        gnssSourceStatus = text("GNSS 定位：—", 13, 0xFF66736B, false);
         gnssSourceStatus.setPadding(0, dp(8), 0, dp(2));
         locationCard.addView(gnssSourceStatus, matchWrap());
-        phoneSourceStatus = text("手机定位：—", 13, 0xFF53625A, false);
+        phoneSourceStatus = text("手机定位：—", 13, 0xFF66736B, false);
         phoneSourceStatus.setPadding(0, dp(8), 0, dp(2));
         locationCard.addView(phoneSourceStatus, matchWrap());
-        manualSourceStatus = text("手动设置：—", 13, 0xFF53625A, false);
+        manualSourceStatus = text("手动设置：—", 13, 0xFF66736B, false);
         manualSourceStatus.setPadding(0, dp(8), 0, dp(2));
         locationCard.addView(manualSourceStatus, matchWrap());
-        deviceLocation = text("—", 12, 0xFF68756D, false);
+        deviceLocation = text("—", 12, 0xFF66736B, false);
         locationCard.addView(deviceLocation, matchWrap());
-        locationStatus = text("手机位置尚未获取", 12, 0xFF68756D, false);
-        coordinates = text("—", 12, 0xFF68756D, false);
-        accuracy = text("精度 —", 12, 0xFF68756D, false);
-        storageStatus = text("轨迹存储：—", 13, 0xFF53625A, false);
+        locationStatus = text("手机位置尚未获取", 12, 0xFF66736B, false);
+        coordinates = text("—", 12, 0xFF66736B, false);
+        accuracy = text("精度 —", 12, 0xFF66736B, false);
+        storageStatus = text("轨迹存储：—", 13, 0xFF66736B, false);
         LinearLayout storageCard = card(statusPage, "存储轨迹");
         storageCard.addView(storageStatus, matchWrap());
         addPage(statusPage);
 
         LinearLayout connectionPage = newPage();
         LinearLayout ipCard = card(connectionPage, "设备 IP 连接");
-        TextView deviceAddress = text("固定地址  " + DEVICE_ADDRESS, 14, 0xFF14231D, true);
+        TextView deviceAddress = text("固定地址  " + DEVICE_ADDRESS, 14, 0xFF17231C, true);
         ipCard.addView(deviceAddress, matchWrap());
-        connectWifiButton = button("打开系统 Wi-Fi 设置", 0xFF28704A);
+        connectWifiButton = button("打开系统 Wi-Fi 设置", 0xFF257149);
         connectWifiButton.setOnClickListener(view -> openWifiSettings());
         ipCard.addView(connectWifiButton, matchWrap());
-        TextView wifiHint = text("连接设备热点 FrameNav-MAC 后六位，再返回应用。热点密码固定为 framenav。设置读取和保存使用 HTTP IP 直连。", 13, 0xFF68756D, false);
+        TextView wifiHint = text("连接设备热点 FrameNav-MAC 后六位，再返回应用。热点密码固定为 framenav。设置读取和保存使用 HTTP IP 直连。", 13, 0xFF66736B, false);
         wifiHint.setPadding(0, dp(6), 0, 0);
         ipCard.addView(wifiHint, matchWrap());
-        Button wakeWifi = button("通过蓝牙唤醒设备热点", 0xFF53625A);
+        Button wakeWifi = button("通过蓝牙唤醒设备热点", 0xFF34463B);
         wakeWifi.setOnClickListener(view -> wakeDeviceWifi());
         ipCard.addView(wakeWifi, matchWrap());
-        editConnectionButton = button("编辑连接配置", 0xFF53625A);
+        editConnectionButton = button("编辑连接配置", 0xFF34463B);
         editConnectionButton.setOnClickListener(v -> setConfigEditable(true));
         ipCard.addView(editConnectionButton, matchWrap());
-        Button pairCamera = button("打开相机配对窗口", 0xFF53625A);
+        Button pairCamera = button("打开相机配对窗口", 0xFF34463B);
         pairCamera.setOnClickListener(v -> startCameraPairing());
         ipCard.addView(pairCamera, matchWrap());
         LinearLayout bondsCard = card(connectionPage, "已配对设备");
-        pairedDevices = text("等待 BLE 设备信息", 13, 0xFF68756D, false);
+        pairedDevices = text("等待蓝牙设备信息", 13, 0xFF66736B, false);
         bondsCard.addView(pairedDevices, matchWrap());
-        TextView pairedPhonesHeading = text("管理手机", 14, 0xFF14231D, true);
+        TextView pairedPhonesHeading = text("管理手机", 14, 0xFF17231C, true);
         pairedPhonesHeading.setPadding(0, dp(8), 0, dp(3));
         bondsCard.addView(pairedPhonesHeading, matchWrap());
         pairedPhoneRows = new LinearLayout(this);
         pairedPhoneRows.setOrientation(LinearLayout.VERTICAL);
         bondsCard.addView(pairedPhoneRows, matchWrap());
-        Button managePhoneBond = button("在系统蓝牙设置中管理手机配对", 0xFF53625A);
+        Button managePhoneBond = button("在系统蓝牙设置中管理手机配对", 0xFF34463B);
         managePhoneBond.setOnClickListener(v -> startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS)));
         bondsCard.addView(managePhoneBond, matchWrap());
-        TextView pairedCamerasHeading = text("推送相机", 14, 0xFF14231D, true);
+        TextView pairedCamerasHeading = text("推送相机", 14, 0xFF17231C, true);
         pairedCamerasHeading.setPadding(0, dp(12), 0, dp(3));
         bondsCard.addView(pairedCamerasHeading, matchWrap());
         pairedDeviceRows = new LinearLayout(this);
         pairedDeviceRows.setOrientation(LinearLayout.VERTICAL);
         bondsCard.addView(pairedDeviceRows, matchWrap());
-        TextView bondsHint = text("连接 BLE 后自动读取管理手机和推送相机。", 12, 0xFF68756D, false);
+        TextView bondsHint = text("连接蓝牙后自动读取管理手机和推送相机。", 12, 0xFF66736B, false);
         bondsCard.addView(bondsHint, matchWrap());
         addPage(connectionPage);
 
@@ -396,7 +396,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         LinearLayout commonCard = card(locationPage, "通用");
         sourceOrderRows = new LinearLayout(this);
         sourceOrderRows.setOrientation(LinearLayout.VERTICAL);
-        commonCard.addView(text("定位来源和优先级 · 拖动排序", 12, 0xFF53625A, false), matchWrap());
+        commonCard.addView(text("定位来源和优先级 · 拖动排序", 12, 0xFF66736B, false), matchWrap());
         commonCard.addView(sourceOrderRows, matchWrap());
         rebuildSourceRows();
         trackEnabled = addSwitch(commonCard, "开启轨迹记录", true, null);
@@ -425,7 +425,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
                 checked -> { phonePush = checked; updateLocationService(); });
         phoneInterval = addField(phoneCard, "手机定位获取频率（秒）", "5", InputType.TYPE_CLASS_NUMBER);
         phoneInterval.setText("5");
-        apFallbackSwitch = addSwitch(phoneCard, "BLE 不可用时使用设备 AP 回退", false,
+        apFallbackSwitch = addSwitch(phoneCard, "蓝牙不可用时使用设备 AP 回退", false,
                 checked -> {
                     apFallback = checked;
                     getPreferences(MODE_PRIVATE).edit().putBoolean("ap_fallback", checked).apply();
@@ -446,24 +446,24 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         coordinateRow.addView(latitudeColumn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         manualLongitude = addField(longitudeColumn, "经度", "-180 至 180", InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_SIGNED | InputType.TYPE_NUMBER_FLAG_DECIMAL);
         manualLatitude = addField(latitudeColumn, "纬度", "-90 至 90", InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_SIGNED | InputType.TYPE_NUMBER_FLAG_DECIMAL);
-        usePhoneLocationButton = button("使用手机定位填入", 0xFF53625A);
+        usePhoneLocationButton = button("使用手机定位填入", 0xFF34463B);
         usePhoneLocationButton.setOnClickListener(v -> fillManualFromPhone());
         manualCard.addView(usePhoneLocationButton, matchWrap());
         manualEnabled = addSwitch(manualCard, "使用真实定位持续更新", true,
                 checked -> { manualLocationEnabled = checked; phoneContinuous = checked; updateLocationService(); });
-        saveManualButton = button("保存手动位置", 0xFF28704A);
+        saveManualButton = button("保存手动位置", 0xFF257149);
         saveManualButton.setOnClickListener(v -> saveManualLocation());
         manualCard.addView(saveManualButton, matchWrap());
-        clearManualButton = button("清除手动位置", 0xFF8B3D36);
+        clearManualButton = button("清除手动位置", 0xFFBD3E3E);
         clearManualButton.setOnClickListener(v -> clearManualLocation());
         manualCard.addView(clearManualButton, matchWrap());
-        saveLocationButton = button("保存定位配置", 0xFF28704A);
+        saveLocationButton = button("保存定位配置", 0xFF257149);
         saveLocationButton.setOnClickListener(v -> saveConfig());
         commonCard.addView(saveLocationButton, matchWrap());
-        editLocationButton = button("编辑定位配置", 0xFF53625A);
+        editLocationButton = button("编辑定位配置", 0xFF34463B);
         editLocationButton.setOnClickListener(v -> setConfigEditable(true));
         commonCard.addView(editLocationButton, matchWrap());
-        TextView locationNote = text("手机位置自动获取；持续采集与蓝牙推送分别控制。保存设备配置需要连接 FrameNav 热点。", 12, 0xFF68756D, false);
+        TextView locationNote = text("手机位置自动获取；持续采集与蓝牙推送分别控制。保存设备配置需要连接 FrameNav 热点。", 12, 0xFF66736B, false);
         locationNote.setPadding(0, dp(7), 0, 0);
         manualCard.addView(locationNote, matchWrap());
         addPage(locationPage);
@@ -487,12 +487,12 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             }
             @Override public void onNothingSelected(android.widget.AdapterView<?> parent) { }
         });
-        saveConnectionButton = button("保存连接配置", 0xFF28704A);
+        saveConnectionButton = button("保存连接配置", 0xFF257149);
         saveConnectionButton.setOnClickListener(v -> saveConfig());
         connectionPage.addView(saveConnectionButton, matchWrap());
         showTab(0);
         setContentView(root);
-        storageStatus.setText("等待 BLE 设备遥测");
+            storageStatus.setText("等待蓝牙设备遥测");
     }
 
     private LinearLayout newPage() {
@@ -517,14 +517,14 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         tabContent.addView(tabPages.get(index), new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         for (int i = 0; i < tabButtons.size(); i++) {
-            tabButtons.get(i).setTextColor(i == index ? 0xFF28704A : 0xFF68756D);
+            tabButtons.get(i).setTextColor(i == index ? 0xFF257149 : 0xFF66736B);
             tabButtons.get(i).setBackgroundTintList(android.content.res.ColorStateList.valueOf(
-                    i == index ? 0xFFEAF0EB : 0xFFFFFFFF));
+                    i == index ? 0xFFE2F4E7 : 0xFFFFFFFF));
         }
     }
 
     private Spinner addChoice(LinearLayout parent, String label, String[] options) {
-        TextView title = text(label, 12, 0xFF53625A, false);
+        TextView title = text(label, 12, 0xFF66736B, false);
         LinearLayout.LayoutParams labelParams = matchWrap();
         labelParams.topMargin = dp(7);
         parent.addView(title, labelParams);
@@ -542,7 +542,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     private Switch addSwitch(LinearLayout parent, String label, boolean initial, SwitchListener listener) {
         Switch control = new Switch(this);
         control.setText(label);
-        control.setTextColor(0xFF14231D);
+        control.setTextColor(0xFF17231C);
         control.setTextSize(14);
         control.setChecked(initial);
         parent.addView(control, matchWrap());
@@ -564,7 +564,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             LinearLayout line = new LinearLayout(this);
             line.setGravity(Gravity.CENTER_VERTICAL);
             line.setTag(id);
-            TextView drag = text("↕", 20, 0xFF53625A, true);
+            TextView drag = text("↕", 20, 0xFF66736B, true);
             drag.setGravity(Gravity.CENTER);
             drag.setOnTouchListener((view, event) -> {
                 if (event.getAction() == android.view.MotionEvent.ACTION_DOWN) {
@@ -577,7 +577,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             line.addView(drag, new LinearLayout.LayoutParams(dp(38), dp(48)));
             CheckBox check = new CheckBox(this);
             check.setText((locationOrder.indexOf(id) + 1) + ".  " + labels[index]);
-            check.setTextColor(0xFF14231D);
+            check.setTextColor(0xFF17231C);
             check.setTextSize(14);
             check.setChecked("gnss".equals(id) ? sourceGnss : "phone".equals(id) ? sourcePhone : sourceManual);
             sourceChecks.put(id, check);
@@ -636,31 +636,31 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     private LinearLayout card(LinearLayout parent, String title) {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(16), dp(15), dp(16), dp(15));
+        card.setPadding(dp(18), dp(16), dp(18), dp(16));
         GradientDrawable background = new GradientDrawable();
         background.setColor(0xFFFFFFFF);
-        background.setCornerRadius(dp(7));
-        background.setStroke(dp(1), 0xFFD6DED8);
+        background.setCornerRadius(dp(8));
+        background.setStroke(dp(1), 0xFFD7DFD9);
         card.setBackground(background);
         LinearLayout.LayoutParams params = matchWrap();
         params.bottomMargin = dp(12);
         parent.addView(card, params);
-        TextView heading = text(title, 17, 0xFF14231D, true);
+        TextView heading = text(title, 17, 0xFF17231C, true);
         heading.setPadding(0, 0, 0, dp(10));
         card.addView(heading, matchWrap());
         return card;
     }
 
     private EditText addField(LinearLayout parent, String label, String hint, int inputType) {
-        TextView text = text(label, 12, 0xFF53625A, false);
+        TextView text = text(label, 12, 0xFF66736B, false);
         LinearLayout.LayoutParams labelParams = matchWrap();
         labelParams.topMargin = dp(7);
         parent.addView(text, labelParams);
         EditText input = new EditText(this);
         input.setSingleLine(true);
         input.setTextSize(15);
-        input.setTextColor(0xFF14231D);
-        input.setHintTextColor(0xFF87928B);
+        input.setTextColor(0xFF17231C);
+        input.setHintTextColor(0xFF66736B);
         input.setHint(hint);
         input.setInputType(inputType);
         input.setPadding(dp(11), dp(8), dp(11), dp(8));
@@ -674,9 +674,9 @@ public final class MainActivity extends Activity implements BleManager.Listener 
 
     private GradientDrawable editBackground() {
         GradientDrawable background = new GradientDrawable();
-        background.setColor(0xFFF8FAF8);
-        background.setCornerRadius(dp(5));
-        background.setStroke(dp(1), 0xFFD6DED8);
+        background.setColor(0xFFFFFFFF);
+        background.setCornerRadius(dp(8));
+        background.setStroke(dp(1), 0xFFCBD6CE);
         return background;
     }
 
@@ -699,7 +699,11 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         button.setTextColor(0xFFFFFFFF);
         button.setMinHeight(dp(44));
         button.setMinimumHeight(dp(44));
-        button.setBackgroundTintList(android.content.res.ColorStateList.valueOf(color));
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(color);
+        background.setCornerRadius(dp(8));
+        button.setBackground(background);
+        button.setElevation(0);
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, dp(46));
         params.setMargins(dp(3), dp(7), dp(3), dp(7));
@@ -797,7 +801,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     private void wakeDeviceWifi() {
         pendingHotspotWorkflow = true;
         if (!bleReady) {
-            setMessage("先连接 BLE，再唤醒设备热点。", false);
+            setMessage("先连接蓝牙，再唤醒设备热点。", false);
             requestBlePermissionsThenConnect();
             return;
         }
@@ -903,7 +907,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             afterHotspotConnected = null;
             if (action != null) main.post(action);
         } else if (bleReady && bleLocationAvailable) {
-            setMessage("BLE 已连接；设备热点暂未验证，定位仍通过 BLE 推送。", false);
+            setMessage("蓝牙已连接；设备热点暂未验证，定位仍通过蓝牙推送。", false);
         } else {
             String prefix = isFrameNavWifi(connectivityManager == null || currentWifiNetwork == null
                     ? null : connectivityManager.getNetworkCapabilities(currentWifiNetwork))
@@ -931,7 +935,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
 
     private void refreshPairedDevices() {
         if (!bleReady) {
-            pairedDevices.setText("等待 BLE 设备信息");
+            pairedDevices.setText("等待蓝牙设备信息");
             return;
         }
         bleManager.readBonds(new BleManager.BondsCallback() {
@@ -943,10 +947,10 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     private void applyPairedBonds(JSONArray bonds) {
         pairedPhoneRows.removeAllViews();
         pairedDeviceRows.removeAllViews();
-        TextView localPhone = text("本机 · " + Build.MODEL + "\nBLE 管理连接 · 已连接",
-                13, 0xFF14231D, false);
+        TextView localPhone = text("本机 · " + Build.MODEL + "\n蓝牙管理连接 · 已连接",
+                13, 0xFF17231C, false);
         pairedPhoneRows.addView(localPhone, matchWrap());
-        pairedDevices.setText(bonds == null || bonds.length() == 0 ? "BLE 已读取" : "");
+        pairedDevices.setText(bonds == null || bonds.length() == 0 ? "蓝牙已读取" : "");
         if (bonds == null) return;
         for (int i = 0; i < bonds.length(); i++) {
             JSONObject bond = bonds.optJSONObject(i);
@@ -960,9 +964,9 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             String status = bond.optBoolean("connected", false) ? " · 已连接" : "";
             LinearLayout row = new LinearLayout(MainActivity.this);
             row.setGravity(Gravity.CENTER_VERTICAL);
-            TextView label = text(name + "\n" + mac + status, 13, 0xFF14231D, false);
+            TextView label = text(name + "\n" + mac + status, 13, 0xFF17231C, false);
             row.addView(label, new LinearLayout.LayoutParams(0, dp(56), 1f));
-            Button remove = button("移除", 0xFF8B3D36);
+            Button remove = button("移除", 0xFFBD3E3E);
             remove.setOnClickListener(v -> new AlertDialog.Builder(MainActivity.this)
                     .setTitle("移除已配对设备")
                     .setMessage("确定移除 " + name + "？")
@@ -1090,7 +1094,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
                         return;
                     }
                     if (!apFallback || !deviceHotspotVerified) {
-                        callback.onResult(false, "BLE 未连接且 AP 回退未启用");
+                        callback.onResult(false, "蓝牙未连接且 AP 回退未启用");
                         return;
                     }
                     postLiveLocationOverWifi(location, callback);
@@ -1390,11 +1394,11 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         bleManager.readConfig(new BleManager.ConfigCallback() {
             @Override public void onSuccess(Map<String, String> values) {
                 applyDeviceConfig(values);
-                setMessage("已通过 BLE 同步设备配置。", false);
+                setMessage("已通过蓝牙同步设备配置。", false);
             }
 
             @Override public void onError(String error) {
-                if (!configEditable) setMessage("BLE 配置读取失败：" + error, true);
+                if (!configEditable) setMessage("蓝牙配置读取失败：" + error, true);
             }
         });
     }
@@ -1410,9 +1414,9 @@ public final class MainActivity extends Activity implements BleManager.Listener 
                 connectionStatus.setText(bleLocationAvailable ? "已连接·定位"
                         : bleConfigAvailable ? "已连接·配置" : "已连接");
                 if (failedParts.isEmpty()) {
-                    setMessage("设备信息已通过 BLE 同步。", false);
+                    setMessage("设备信息已通过蓝牙同步。", false);
                 } else {
-                    setMessage("BLE 已连接；未读取到：" + String.join("、", failedParts) + "。", true);
+                    setMessage("蓝牙已连接；未读取到：" + String.join("、", failedParts) + "。", true);
                 }
             }
         };
@@ -1463,7 +1467,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         String activeLabel = "gnss".equals(active) ? "GNSS 定位" : "phone".equals(active)
                 ? "手机定位" : "manual".equals(active) ? "手动设置" : "无有效来源";
         activeSourceBadge.setText("当前使用：" + activeLabel);
-        deviceStatus.setText("设备状态：" + json.optString("status", "BLE 实时遥测"));
+        deviceStatus.setText("设备状态：" + json.optString("status", "蓝牙实时遥测"));
         JSONObject gnss = json.optJSONObject("gnss");
         JSONObject phone = json.optJSONObject("phone");
         JSONObject manual = json.optJSONObject("manual");
@@ -1504,10 +1508,10 @@ public final class MainActivity extends Activity implements BleManager.Listener 
                         + " 条 · 已用 " + formatBytes(storage.optLong("used_bytes", 0))
                         + " / " + formatBytes(storage.optLong("capacity_bytes", 0)));
             } else storageStatus.setText("轨迹存储不可用");
-        } else storageStatus.setText("设备 BLE 遥测未包含轨迹存储信息");
+        } else storageStatus.setText("设备蓝牙遥测未包含轨迹存储信息");
     }
 
-    /** Expands the compact BLE telemetry payload into the same shape used by the UI. */
+    /** Expands the compact Bluetooth telemetry payload into the same shape used by the UI. */
     private JSONObject expandBleTelemetry(JSONObject compact) {
         if (compact == null || !compact.has("a")) return compact;
         try {
@@ -1577,7 +1581,9 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     }
 
     private String sourceCoordinates(JSONObject source) {
-        if (source == null || !source.optBoolean("valid", false)) return "无有效定位";
+        // Keep showing the last coordinates when their validity window has
+        // expired; the adjacent validity/remaining fields explain the state.
+        if (source == null || !source.optBoolean("present", false)) return "无定位数据";
         return String.format(java.util.Locale.US, "%.6f, %.6f",
                 source.optDouble("latitude"), source.optDouble("longitude"));
     }
@@ -1615,7 +1621,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     }
 
     private void tintSource(TextView view, boolean active) {
-        view.setTextColor(active ? 0xFF28704A : 0xFF53625A);
+        view.setTextColor(active ? 0xFF257149 : 0xFF66736B);
         view.setTypeface(Typeface.DEFAULT, active ? Typeface.BOLD : Typeface.NORMAL);
     }
 
@@ -1913,7 +1919,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     private void setMessage(String value, boolean error) {
         if (message != null) {
             message.setText(value);
-            message.setTextColor(error ? 0xFFB42318 : 0xFF53625A);
+            message.setTextColor(error ? 0xFFBD3E3E : 0xFF66736B);
         }
         if (error && !isFinishing()) {
             Toast.makeText(this, value, Toast.LENGTH_LONG).show();
@@ -1937,13 +1943,13 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         bleConfigAvailable = configAvailable;
         connectionStatus.setText(locationAvailable ? "已连接·定位"
                 : configAvailable ? "已连接·配置" : "已连接");
-        if (locationAvailable) setMessage("BLE 定位已连接，正在读取设备信息。", false);
-        else setMessage("BLE 已连接，但定位写入服务不可用。", true);
+        if (locationAvailable) setMessage("蓝牙定位已连接，正在读取设备信息。", false);
+        else setMessage("蓝牙已连接，但定位写入服务不可用。", true);
         if (phoneLocationService != null) phoneLocationService.setBleConnected(locationAvailable);
         if ((phoneContinuous || phonePush) && phoneLocationService == null) startPhoneLocationService();
         if (bleReady) {
             main.removeCallbacks(configPoll);
-            pairedDevices.setText("正在读取 BLE 设备信息…");
+            pairedDevices.setText("正在读取蓝牙设备信息…");
             readDeviceInfoOverBle();
             main.postDelayed(configPoll, 30_000L);
             if (pendingHotspotWorkflow) wakeDeviceWifi();
@@ -1958,7 +1964,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
 
     @Override
     public void onBleError(String error) {
-        if (!bleReady) connectionStatus.setText("BLE 未就绪");
+        if (!bleReady) connectionStatus.setText("蓝牙未就绪");
         setMessage(error, true);
         refreshControls();
     }

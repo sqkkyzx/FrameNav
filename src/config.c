@@ -70,6 +70,93 @@ static void config_terminate_str(char *dst, size_t dst_len)
   }
 }
 
+static bool utf8_sequence_length(const unsigned char *src, size_t remaining,
+                                 size_t *sequence_len)
+{
+  if (!src || !remaining || !sequence_len) return false;
+  unsigned char first = src[0];
+  if (first <= 0x7f) {
+    *sequence_len = 1;
+    return true;
+  }
+  if (first >= 0xc2 && first <= 0xdf && remaining >= 2 &&
+      (src[1] & 0xc0) == 0x80) {
+    *sequence_len = 2;
+    return true;
+  }
+  if (remaining >= 3 && (src[2] & 0xc0) == 0x80) {
+    unsigned char second = src[1];
+    if (((first >= 0xe1 && first <= 0xec) ||
+         (first >= 0xee && first <= 0xef)) &&
+        (second & 0xc0) == 0x80) {
+      *sequence_len = 3;
+      return true;
+    }
+    if (first == 0xe0 && second >= 0xa0 && second <= 0xbf) {
+      *sequence_len = 3;
+      return true;
+    }
+    if (first == 0xed && second >= 0x80 && second <= 0x9f) {
+      *sequence_len = 3;
+      return true;
+    }
+  }
+  if (remaining >= 4 && (src[2] & 0xc0) == 0x80 &&
+      (src[3] & 0xc0) == 0x80) {
+    unsigned char second = src[1];
+    if (first >= 0xf1 && first <= 0xf3 && (second & 0xc0) == 0x80) {
+      *sequence_len = 4;
+      return true;
+    }
+    if (first == 0xf0 && second >= 0x90 && second <= 0xbf) {
+      *sequence_len = 4;
+      return true;
+    }
+    if (first == 0xf4 && second >= 0x80 && second <= 0x8f) {
+      *sequence_len = 4;
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool utf8_prefix_length(const char *value, size_t value_len,
+                               size_t max_len, size_t *prefix_len)
+{
+  if ((!value && value_len) || !prefix_len) return false;
+  size_t pos = 0;
+  size_t copied = 0;
+  while (pos < value_len) {
+    size_t sequence_len = 0;
+    if (!utf8_sequence_length((const unsigned char *)value + pos,
+                              value_len - pos, &sequence_len)) {
+      return false;
+    }
+    if (copied == pos && copied + sequence_len <= max_len) {
+      copied += sequence_len;
+    }
+    pos += sequence_len;
+  }
+  *prefix_len = copied;
+  return true;
+}
+
+bool config_set_camera_name_prefix(app_config_t *cfg, const char *value,
+                                   size_t value_len)
+{
+  if (!cfg || (!value && value_len)) return false;
+  size_t copy_len = 0;
+  if (!utf8_prefix_length(value, value_len,
+                          sizeof(cfg->camera_name_prefix) - 1, &copy_len)) {
+    return false;
+  }
+  if (copy_len) {
+    memmove(cfg->camera_name_prefix, value, copy_len);
+  }
+  cfg->camera_name_prefix[copy_len] = '\0';
+  return true;
+}
+
 static bool source_order_is_valid(const char *order)
 {
   if (!order || !order[0]) return false;
@@ -251,6 +338,12 @@ void config_validate(app_config_t *cfg)
 
   config_terminate_str(cfg->camera_name_prefix,
                        sizeof(cfg->camera_name_prefix));
+  if (!config_set_camera_name_prefix(cfg, cfg->camera_name_prefix,
+                                     strlen(cfg->camera_name_prefix))) {
+    config_set_str_default(cfg->camera_name_prefix,
+                           sizeof(cfg->camera_name_prefix),
+                           defaults.camera_name_prefix);
+  }
   config_terminate_str(cfg->camera_mac_prefix, sizeof(cfg->camera_mac_prefix));
   if (cfg->phone_location_ttl_hours < 1 ||
       cfg->phone_location_ttl_hours > PHONE_LOCATION_TTL_MAX_HOURS)

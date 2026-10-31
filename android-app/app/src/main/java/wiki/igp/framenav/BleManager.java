@@ -34,7 +34,7 @@ import org.json.JSONObject;
 import org.json.JSONArray;
 
 /**
- * BLE transport for FrameNav. All GATT operations are serialized because
+ * Bluetooth transport for FrameNav. All GATT operations are serialized because
  * Android accepts only one read/write request at a time per connection.
  */
 public final class BleManager {
@@ -151,7 +151,7 @@ public final class BleManager {
             disconnectInternal(false);
             scanner = adapter.getBluetoothLeScanner();
             if (scanner == null) {
-                listener.onBleError("无法启动 BLE 扫描");
+                listener.onBleError("无法启动蓝牙扫描");
                 return;
             }
             try {
@@ -193,7 +193,7 @@ public final class BleManager {
     public void readConfig(ConfigCallback callback) {
         main.post(() -> {
             if (!ready) {
-                callback.onError("BLE 尚未连接");
+                callback.onError("蓝牙尚未连接");
                 return;
             }
             BluetoothGattCharacteristic settings = characteristics.get(SETTINGS);
@@ -208,7 +208,7 @@ public final class BleManager {
                         Map<String, String> values = parseConfigJson(json);
                         callback.onSuccess(values);
                     } catch (Exception parseError) {
-                        callback.onError("BLE 配置数据无法解析");
+                        callback.onError("蓝牙配置数据无法解析");
                     }
                 });
                 return;
@@ -269,12 +269,12 @@ public final class BleManager {
     public void requestWifiWake(Callback callback) {
         main.post(() -> {
             if (!ready || gatt == null) {
-                callback.onError("设备 BLE 尚未连接或 GATT 服务尚未就绪");
+                callback.onError("设备蓝牙尚未连接或蓝牙服务尚未就绪");
                 return;
             }
             BluetoothGattCharacteristic wake = characteristics.get(WIFI_WAKE);
             if (wake == null) {
-                callback.onError("已连接 BLE，但设备固件未提供热点唤醒特征，请刷入支持 BLE 配置的固件");
+                callback.onError("已连接蓝牙，但设备固件未提供热点唤醒特征，请刷入支持蓝牙配置的固件");
                 return;
             }
             enqueueWrite(wake, new byte[]{1}, callback);
@@ -303,7 +303,7 @@ public final class BleManager {
         main.post(() -> {
             BluetoothGattCharacteristic telemetry = characteristics.get(TELEMETRY);
             if (!ready || telemetry == null) {
-                callback.onError("设备 BLE 遥测服务不可用");
+                callback.onError("设备蓝牙遥测服务不可用");
                 return;
             }
             enqueueRead(telemetry, (success, value, error) -> {
@@ -314,7 +314,8 @@ public final class BleManager {
                 try {
                     callback.onSuccess(new JSONObject(new String(value, StandardCharsets.UTF_8)));
                 } catch (Exception parseError) {
-                    callback.onError("设备 BLE 遥测数据无法解析");
+                    callback.onError("设备蓝牙遥测数据无法解析（" + value.length
+                            + " 字节）");
                 }
             });
         });
@@ -324,7 +325,7 @@ public final class BleManager {
         main.post(() -> {
             BluetoothGattCharacteristic bonds = characteristics.get(BONDS);
             if (!ready || bonds == null) {
-                callback.onError("设备 BLE 配对设备服务不可用");
+                callback.onError("设备蓝牙配对设备服务不可用");
                 return;
             }
             enqueueRead(bonds, (success, value, error) -> {
@@ -336,12 +337,12 @@ public final class BleManager {
                     JSONArray items = new JSONObject(new String(value, StandardCharsets.UTF_8))
                             .optJSONArray("bonds");
                     if (items == null) {
-                        callback.onError("BLE 配对设备数据缺少 bonds 列表");
+                        callback.onError("蓝牙配对设备数据缺少 bonds 列表");
                     } else {
                         callback.onSuccess(items);
                     }
                 } catch (Exception parseError) {
-                    callback.onError("BLE 配对设备数据无法解析");
+                    callback.onError("蓝牙配对设备数据无法解析");
                 }
             });
         });
@@ -350,7 +351,7 @@ public final class BleManager {
     public void writeConfig(Map<String, String> values, Callback callback) {
         main.post(() -> {
             if (!ready) {
-                callback.onError("BLE 尚未连接");
+                callback.onError("蓝牙尚未连接");
                 return;
             }
             final List<Map.Entry<String, String>> entries = new ArrayList<>();
@@ -366,7 +367,7 @@ public final class BleManager {
     public void writeLocation(Location location, Callback callback) {
         main.post(() -> {
             if (!ready || !characteristics.containsKey(LOCATION_WRITE)) {
-                callback.onError("当前 BLE 设备没有定位写入服务");
+                callback.onError("当前蓝牙设备没有定位写入服务");
                 return;
             }
             try {
@@ -381,7 +382,7 @@ public final class BleManager {
     public void clearLocation(Callback callback) {
         main.post(() -> {
             if (!ready || !characteristics.containsKey(LOCATION_CLEAR)) {
-                callback.onError("当前 BLE 设备没有定位清除服务");
+                callback.onError("当前蓝牙设备没有定位清除服务");
                 return;
             }
             enqueueWrite(characteristics.get(LOCATION_CLEAR), new byte[]{1}, callback);
@@ -468,13 +469,13 @@ public final class BleManager {
         }
         if (!started) {
             if (inFlight.value == null) {
-                completeOperation(false, null, "GATT 读取未能启动");
+                completeOperation(false, null, "蓝牙读取未能启动");
             } else {
-                failConnection("GATT 操作未能启动，已重置连接，请重新连接");
+                failConnection("蓝牙操作未能启动，已重置连接，请重新连接");
             }
             return;
         }
-        armOperationTimeout(OP_TIMEOUT_MS, "GATT 操作超时，已重置连接，请重新连接");
+        armOperationTimeout(OP_TIMEOUT_MS, "蓝牙操作超时，已重置连接，请重新连接");
     }
 
     private void armOperationTimeout(long delayMs, String message) {
@@ -542,7 +543,7 @@ public final class BleManager {
                 return;
             }
             authRetryCount++;
-            armOperationTimeout(OP_TIMEOUT_MS, "GATT 操作超时，已重置连接，请重新连接");
+            armOperationTimeout(OP_TIMEOUT_MS, "蓝牙操作超时，已重置连接，请重新连接");
             listener.onBleState("蓝牙已配对，正在重试写入…");
         } catch (SecurityException error) {
             failConnection("缺少蓝牙连接权限");
@@ -603,7 +604,7 @@ public final class BleManager {
     private void discoverServices(BluetoothGatt bluetoothGatt) {
         try {
             if (!bluetoothGatt.discoverServices()) {
-                failConnection("无法开始 GATT 服务发现");
+                failConnection("无法读取蓝牙服务");
             }
         } catch (SecurityException error) {
             failConnection("缺少蓝牙连接权限");
@@ -624,10 +625,10 @@ public final class BleManager {
                         if (status == BluetoothGatt.GATT_SUCCESS) {
                             disconnectInternal(true);
                         } else {
-                            failConnection("BLE 连接断开，状态码 " + status);
+                            failConnection("蓝牙连接断开，状态码 " + status);
                         }
                     } else {
-                        failConnection("BLE 连接失败，状态码 " + status);
+                        failConnection("蓝牙连接失败，状态码 " + status);
                     }
                     return;
                 }
@@ -660,7 +661,7 @@ public final class BleManager {
                 if (status == BluetoothGatt.GATT_SUCCESS && mtu >= 31) {
                     listener.onBleState("已连接，正在读取服务…");
                 } else if (mtu < 31) {
-                    listener.onBleState("设备只支持较小 BLE MTU，定位写入可能不可用…");
+                    listener.onBleState("设备只支持较小蓝牙数据包，定位写入可能不可用…");
                 }
                 discoverServices(bluetoothGatt);
             });
@@ -673,7 +674,7 @@ public final class BleManager {
                     return;
                 }
                 if (status != BluetoothGatt.GATT_SUCCESS) {
-                    failConnection("服务发现失败，状态码 " + status);
+                    failConnection("蓝牙服务读取失败，状态码 " + status);
                     return;
                 }
                 characteristics.clear();
@@ -687,11 +688,11 @@ public final class BleManager {
                 listener.onBleReady(location, config);
                 if (locationService && !config) {
                     listener.onBleState(gattCacheRefreshSucceeded
-                            ? "BLE 已连接·定位；设备未提供配置服务，请检查固件配置"
-                            : "BLE 已连接·定位；未能刷新 GATT 缓存，请关闭并重新连接设备");
+                            ? "蓝牙已连接·定位；设备未提供配置服务，请检查固件配置"
+                            : "蓝牙已连接·定位；未能刷新蓝牙服务缓存，请关闭并重新连接设备");
                 }
                 if (locationService && !location) {
-                    listener.onBleState("BLE 已连接；MTU 不足，位置请走 Wi-Fi");
+                    listener.onBleState("蓝牙已连接；数据包大小不足，位置请走 Wi-Fi");
                 } else if (!ready) {
                     listener.onBleError("已连接，但不是可用的 FrameNav 服务");
                 }
@@ -757,7 +758,7 @@ public final class BleManager {
     };
 
     private static String gattStatus(int status) {
-        return status == BluetoothGatt.GATT_SUCCESS ? "" : "GATT 状态码 " + status;
+        return status == BluetoothGatt.GATT_SUCCESS ? "" : "蓝牙状态码 " + status;
     }
 
     @SuppressLint("MissingPermission")
@@ -842,7 +843,7 @@ public final class BleManager {
         public void onScanFailed(int errorCode) {
             main.post(() -> {
                 stopScan();
-                listener.onBleError("BLE 扫描失败，状态码 " + errorCode);
+                listener.onBleError("蓝牙扫描失败，状态码 " + errorCode);
             });
         }
     };
@@ -885,7 +886,7 @@ public final class BleManager {
         try {
             gatt = found.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE);
             if (gatt == null) {
-                listener.onBleError("无法创建 GATT 连接");
+                listener.onBleError("无法创建蓝牙连接");
             }
         } catch (SecurityException error) {
             listener.onBleError("缺少蓝牙连接权限");
@@ -953,9 +954,9 @@ public final class BleManager {
         }
         for (GattOperation operation : cancelledOperations) {
             if (operation.readCallback != null) {
-                operation.readCallback.onComplete(false, new byte[0], "BLE 已断开");
+                operation.readCallback.onComplete(false, new byte[0], "蓝牙已断开");
             } else if (operation.writeCallback != null) {
-                operation.writeCallback.onError("BLE 已断开");
+                operation.writeCallback.onError("蓝牙已断开");
             }
         }
     }
