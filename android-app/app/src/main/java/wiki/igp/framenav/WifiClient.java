@@ -120,6 +120,11 @@ public final class WifiClient {
         run("GET", normalizeBaseUrl(baseUrl) + "/config", null, null, callback);
     }
 
+    /** Probe a specific Android network instead of whichever network is globally selected. */
+    public void getConfigurationPage(Network selectedNetwork, String baseUrl, Callback callback) {
+        run(selectedNetwork, "GET", normalizeBaseUrl(baseUrl) + "/config", null, null, callback);
+    }
+
     public void getStorage(String baseUrl, Callback callback) {
         run("GET", normalizeBaseUrl(baseUrl) + "/storage", null, null, callback);
     }
@@ -148,13 +153,18 @@ public final class WifiClient {
 
     private void run(String method, String url, String body, String contentType,
                      Callback callback) {
+        run(null, method, url, body, contentType, callback);
+    }
+
+    private void run(Network selectedNetwork, String method, String url, String body,
+                     String contentType, Callback callback) {
         executor.execute(() -> {
             HttpURLConnection connection = null;
             try {
-                Network selectedNetwork = network;
-                connection = (HttpURLConnection) (selectedNetwork == null
+                Network networkForRequest = selectedNetwork == null ? network : selectedNetwork;
+                connection = (HttpURLConnection) (networkForRequest == null
                         ? new URL(url).openConnection()
-                        : selectedNetwork.openConnection(new URL(url)));
+                        : networkForRequest.openConnection(new URL(url)));
                 connection.setRequestMethod(method);
                 connection.setConnectTimeout(8_000);
                 connection.setReadTimeout(8_000);

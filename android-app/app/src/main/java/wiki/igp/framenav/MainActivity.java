@@ -61,6 +61,8 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     private static final int[] DST_VALUES = {0, 30, 60, 120};
 
     private final Handler main = new Handler(Looper.getMainLooper());
+    private final Runnable wifiRouteRefresh = this::checkCurrentWifi;
+    private final Runnable wifiHotspotVerify = this::verifyDeviceHotspot;
     private BleManager bleManager;
     private WifiClient wifiClient;
     private LocationManager locationManager;
@@ -132,6 +134,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     private boolean startupLocationRequested;
     private boolean configEditable;
     private boolean pendingHotspotWorkflow;
+    private boolean hotspotVerificationInProgress;
     private boolean deviceHotspotVerified;
     private Runnable afterHotspotConnected;
     private android.net.Network currentWifiNetwork;
@@ -141,18 +144,8 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             new android.net.ConnectivityManager.NetworkCallback() {
                 @Override public void onAvailable(android.net.Network network) {
                     runOnUiThread(() -> {
-                        currentWifiNetwork = network;
-                        wifiClient.setNetwork(network);
-                        if (verifiedHotspotNetwork != null && !verifiedHotspotNetwork.equals(network)) {
-                            verifiedHotspotNetwork = null;
-                            deviceHotspotVerified = false;
-                            if (phoneLocationService != null) {
-                                phoneLocationService.setBleConnected(bleReady && bleLocationAvailable);
-                            }
-                        }
-                        if ((pendingHotspotWorkflow || apFallback) && !deviceHotspotVerified) {
-                            verifyDeviceHotspot();
-                        }
+                        main.removeCallbacks(wifiRouteRefresh);
+                        main.postDelayed(wifiRouteRefresh, 250L);
                     });
                 }
 
@@ -252,9 +245,13 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         super.onResume();
         checkCurrentWifi();
         updateLocalPhoneStatus();
-        if (pendingHotspotWorkflow && wifiClientHasNetwork()) {
+        boolean frameNavWifi = isFrameNavWifi(connectivityManager == null || currentWifiNetwork == null
+                ? null : connectivityManager.getNetworkCapabilities(currentWifiNetwork));
+        if ((frameNavWifi || pendingHotspotWorkflow || afterHotspotConnected != null)
+                && wifiClientHasNetwork()) {
             main.postDelayed(this::verifyDeviceHotspot, 700L);
-        } else if (apFallback && wifiClientHasNetwork() && !deviceHotspotVerified) {
+        } else if (apFallback && !(bleReady && bleLocationAvailable)
+                && wifiClientHasNetwork() && !deviceHotspotVerified) {
             main.postDelayed(this::verifyDeviceHotspot, 700L);
         }
     }
@@ -825,23 +822,95 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     }
 
     private void verifyDeviceHotspot() {
-        wifiClient.getConfigurationPage(DEVICE_ADDRESS, new WifiClient.Callback() {
-            @Override public void onSuccess(String response) {
-                pendingHotspotWorkflow = false;
-                deviceHotspotVerified = true;
-                verifiedHotspotNetwork = currentWifiNetwork;
-                if (phoneLocationService != null) phoneLocationService.setBleConnected(bleReady && bleLocationAvailable);
-                setMessage("已连接 FrameNav 设备热点。", false);
-                Runnable action = afterHotspotConnected;
-                afterHotspotConnected = null;
-                if (action != null) main.post(action);
+        if (hotspotVerificationInProgress || deviceHotspotVerified) return;
+        hotspotVerificationInProgress = true;
+        android.net.ConnectivityManager manager = (android.net.ConnectivityManager)
+                getSystemService(CONNECTIVITY_SERVICE);
+        List<android.net.Network> candidates = new ArrayList<>();
+        if (manager != null) {
+            android.net.Network active = manager.getActiveNetwork();
+            addWifiCandidate(manager, active, candidates, true);
+            for (android.net.Network network : manager.getAllNetworks()) {
+                android.net.NetworkCapabilities caps = manager.getNetworkCapabilities(network);
+                addWifiCandidate(manager, network, candidates, isFrameNavWifi(caps));
             }
+        }
+        if (candidates.isEmpty()) {
+            finishHotspotVerification(false, "当前没有可用的 Wi-Fi 网络");
+            return;
+        }
+        probeHotspotNetwork(candidates, 0, "无法访问设备配置");
+    }
+
+    private void addWifiCandidate(android.net.ConnectivityManager manager,
+                                  android.net.Network network,
+                                  List<android.net.Network> candidates,
+                                  boolean preferred) {
+        if (network == null || candidates.contains(network)) return;
+        android.net.NetworkCapabilities caps = manager.getNetworkCapabilities(network);
+        if (caps == null || !caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) return;
+        if (preferred) candidates.add(0, network);
+        else candidates.add(network);
+    }
+
+    private void probeHotspotNetwork(List<android.net.Network> candidates, int index,
+                                     String lastError) {
+        if (index >= candidates.size()) {
+            finishHotspotVerification(false, lastError);
+            return;
+        }
+        android.net.Network candidate = candidates.get(index);
+        wifiClient.getConfigurationPage(candidate, DEVICE_ADDRESS, new WifiClient.Callback() {
+            @Override public void onSuccess(String response) {
+                if (!isFrameNavConfig(response)) {
+                    probeHotspotNetwork(candidates, index + 1, "返回内容不是 FrameNav 配置");
+                    return;
+                }
+                currentWifiNetwork = candidate;
+                wifiClient.setNetwork(candidate);
+                finishHotspotVerification(true, "");
+            }
+
             @Override public void onError(String error, Throwable cause) {
-                deviceHotspotVerified = false;
-                if (phoneLocationService != null) phoneLocationService.setBleConnected(bleReady && bleLocationAvailable);
-                setMessage("当前 Wi-Fi 还不是 FrameNav 热点，请连接 FrameNav-MAC 后六位。", false);
+                probeHotspotNetwork(candidates, index + 1, error);
             }
         });
+    }
+
+    private boolean isFrameNavConfig(String response) {
+        if (response == null || response.trim().isEmpty()) return false;
+        try {
+            JSONObject json = new JSONObject(response);
+            return json.has("cam_name") && json.has("source_order")
+                    && json.has("track_enabled");
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private void finishHotspotVerification(boolean success, String error) {
+        hotspotVerificationInProgress = false;
+        pendingHotspotWorkflow = false;
+        deviceHotspotVerified = success;
+        if (success) verifiedHotspotNetwork = currentWifiNetwork;
+        else verifiedHotspotNetwork = null;
+        if (phoneLocationService != null) {
+            phoneLocationService.setBleConnected(bleReady && bleLocationAvailable);
+        }
+        if (success) {
+            setMessage("已连接 FrameNav 设备热点。", false);
+            Runnable action = afterHotspotConnected;
+            afterHotspotConnected = null;
+            if (action != null) main.post(action);
+        } else if (bleReady && bleLocationAvailable) {
+            setMessage("BLE 已连接；设备热点暂未验证，定位仍通过 BLE 推送。", false);
+        } else {
+            String prefix = isFrameNavWifi(connectivityManager == null || currentWifiNetwork == null
+                    ? null : connectivityManager.getNetworkCapabilities(currentWifiNetwork))
+                    ? "已检测到 FrameNav Wi-Fi，但设备 IP 校验失败"
+                    : "已连接 Wi-Fi，但无法访问 FrameNav 设备 IP";
+            setMessage(prefix + (error == null || error.isEmpty() ? "。" : "：" + error), false);
+        }
     }
 
     private void startCameraPairing() {
@@ -914,11 +983,21 @@ public final class MainActivity extends Activity implements BleManager.Listener 
                     (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
             android.net.Network wifi = null;
             if (manager != null) {
+                android.net.Network active = manager.getActiveNetwork();
+                android.net.NetworkCapabilities activeCaps = active == null
+                        ? null : manager.getNetworkCapabilities(active);
+                if (activeCaps != null && activeCaps.hasTransport(
+                        android.net.NetworkCapabilities.TRANSPORT_WIFI)) {
+                    wifi = active;
+                }
                 for (android.net.Network network : manager.getAllNetworks()) {
                     android.net.NetworkCapabilities caps = manager.getNetworkCapabilities(network);
                     if (caps != null && caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) {
-                        wifi = network;
-                        break;
+                        if (isFrameNavWifi(caps)) {
+                            wifi = network;
+                            break;
+                        }
+                        if (wifi == null) wifi = network;
                     }
                 }
             }
@@ -932,8 +1011,18 @@ public final class MainActivity extends Activity implements BleManager.Listener 
                         phoneLocationService.setBleConnected(bleReady && bleLocationAvailable);
                     }
                 }
-                wifiStatus.setText("手机已连接 Wi-Fi · HTTP IP 可用");
+                wifiStatus.setText(isFrameNavWifi(manager == null ? null
+                        : manager.getNetworkCapabilities(wifi))
+                        ? "已连接 FrameNav Wi-Fi · 等待 IP 验证"
+                        : "手机已连接 Wi-Fi · 设备热点尚未验证");
                 refreshControls();
+                if ((isFrameNavWifi(manager == null ? null : manager.getNetworkCapabilities(wifi))
+                        || pendingHotspotWorkflow || afterHotspotConnected != null
+                        || (apFallback && !(bleReady && bleLocationAvailable)))
+                        && !deviceHotspotVerified && !hotspotVerificationInProgress) {
+                    main.removeCallbacks(wifiHotspotVerify);
+                    main.postDelayed(wifiHotspotVerify, 150L);
+                }
             } else {
                 wifiClient.setNetwork(null);
                 currentWifiNetwork = null;
@@ -944,6 +1033,14 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         } catch (Exception ignored) {
             wifiStatus.setText("设备 IP 通道未连接");
         }
+    }
+
+    private boolean isFrameNavWifi(android.net.NetworkCapabilities capabilities) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || capabilities == null) return false;
+        Object transportInfo = capabilities.getTransportInfo();
+        if (!(transportInfo instanceof android.net.wifi.WifiInfo)) return false;
+        String ssid = ((android.net.wifi.WifiInfo) transportInfo).getSSID();
+        return ssid != null && ssid.replace("\"", "").startsWith("FrameNav-");
     }
 
     private final ServiceConnection phoneLocationConnection = new ServiceConnection() {
@@ -963,6 +1060,9 @@ public final class MainActivity extends Activity implements BleManager.Listener 
                     if (state.contains("已停止") || state.contains("未启动")) phoneLocationStarting = false;
                 }
             });
+            if (currentLocation != null) {
+                phoneLocationService.setLatestLocation(currentLocation);
+            }
             phoneLocationService.setLocationWriter(new PhoneLocationService.LocationWriter() {
                 @Override
                 public boolean isReady() {
@@ -997,7 +1097,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
                 }
             });
             phoneLocationService.setBleConnected(bleReady && bleLocationAvailable);
-            phoneLocationService.configure(phoneContinuous || phonePush, phoneContinuous || phonePush,
+            phoneLocationService.configure(phoneContinuous || phonePush, phonePush,
                     phonePush, phoneLocationIntervalSeconds);
         }
 
@@ -1062,7 +1162,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             else startService(intent);
             phoneLocationBound = bindService(intent, phoneLocationConnection, Context.BIND_AUTO_CREATE);
             if (phoneLocationBound && phoneLocationService != null) {
-                phoneLocationService.configure(phoneContinuous || phonePush, phoneContinuous || phonePush,
+                phoneLocationService.configure(phoneContinuous || phonePush, phonePush,
                         phonePush, phoneLocationIntervalSeconds);
             }
             phoneLocationStarting = true;
@@ -1276,6 +1376,9 @@ public final class MainActivity extends Activity implements BleManager.Listener 
                 location.getLatitude(), location.getLongitude()));
         accuracy.setText("精度 " + (location.hasAccuracy() ? Math.round(location.getAccuracy()) + " m" : "未知"));
         currentLocation = new Location(location);
+        if (phoneLocationService != null) {
+            phoneLocationService.setLatestLocation(currentLocation);
+        }
         updateLocalPhoneStatus();
         refreshControls();
         if (!startupLocationRequested) startupLocationRequested = true;
@@ -1299,15 +1402,18 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     private void readDeviceInfoOverBle() {
         connectionStatus.setText("已连接，正在读取设备信息…");
         int[] remaining = {3};
-        boolean[] failed = {false};
+        List<String> failedParts = new ArrayList<>();
         Runnable[] complete = new Runnable[1];
         complete[0] = () -> {
             remaining[0]--;
             if (remaining[0] == 0) {
                 connectionStatus.setText(bleLocationAvailable ? "已连接·定位"
                         : bleConfigAvailable ? "已连接·配置" : "已连接");
-                setMessage(failed[0] ? "BLE 已连接，部分设备信息读取失败。" : "设备信息已通过 BLE 同步。",
-                        failed[0]);
+                if (failedParts.isEmpty()) {
+                    setMessage("设备信息已通过 BLE 同步。", false);
+                } else {
+                    setMessage("BLE 已连接；未读取到：" + String.join("、", failedParts) + "。", true);
+                }
             }
         };
         if (bleConfigAvailable) {
@@ -1317,13 +1423,12 @@ public final class MainActivity extends Activity implements BleManager.Listener 
                     complete[0].run();
                 }
                 @Override public void onError(String error) {
-                    failed[0] = true;
-                    setMessage("BLE 配置读取失败：" + error, true);
+                    failedParts.add("设备配置");
                     complete[0].run();
                 }
             });
         } else {
-            failed[0] = true;
+            failedParts.add("设备配置服务");
             complete[0].run();
         }
         bleManager.readBonds(new BleManager.BondsCallback() {
@@ -1333,7 +1438,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             }
             @Override public void onError(String error) {
                 pairedDevices.setText(error);
-                failed[0] = true;
+                failedParts.add("已配对设备");
                 complete[0].run();
             }
         });
@@ -1346,7 +1451,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
                 storageStatus.setText(error);
                 devicePhoneRemainingText = error;
                 updateLocalPhoneStatus();
-                failed[0] = true;
+                failedParts.add("定位/存储遥测");
                 complete[0].run();
             }
         });

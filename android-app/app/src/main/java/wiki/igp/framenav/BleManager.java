@@ -461,7 +461,11 @@ public final class BleManager {
             return;
         }
         if (!started) {
-            failConnection("GATT 操作未能启动，已重置连接，请重新连接");
+            if (inFlight.value == null) {
+                completeOperation(false, null, "GATT 读取未能启动");
+            } else {
+                failConnection("GATT 操作未能启动，已重置连接，请重新连接");
+            }
             return;
         }
         armOperationTimeout(OP_TIMEOUT_MS, "GATT 操作超时，已重置连接，请重新连接");
@@ -689,7 +693,12 @@ public final class BleManager {
                     if (status == BluetoothGatt.GATT_SUCCESS) {
                         completeOperation(true, value, "");
                     } else {
-                        failConnection(gattStatus(status));
+                        // A single optional telemetry/config characteristic may be
+                        // unavailable (or transiently rejected) while the GATT
+                        // connection itself remains usable. Complete just this
+                        // queued read so the remaining device info requests can
+                        // continue instead of being cancelled together.
+                        completeOperation(false, value, gattStatus(status));
                     }
                 }
             });
@@ -704,7 +713,7 @@ public final class BleManager {
                     if (status == BluetoothGatt.GATT_SUCCESS) {
                         completeOperation(true, value, "");
                     } else {
-                        failConnection(gattStatus(status));
+                        completeOperation(false, value, gattStatus(status));
                     }
                 }
             });

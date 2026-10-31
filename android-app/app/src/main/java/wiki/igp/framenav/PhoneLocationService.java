@@ -191,6 +191,16 @@ public final class PhoneLocationService extends Service {
         }
     }
 
+    public void setLatestLocation(Location location) {
+        if (location == null) return;
+        latestLocation = new Location(location);
+        updateNotification(isBleReady()
+                ? "正在获取位置并通过 BLE 推送"
+                : isReady() ? "正在获取位置并通过设备 AP 回退"
+                : "正在获取位置，等待设备连接");
+        pushLatestLocation();
+    }
+
     public void setBleConnected(boolean connected) {
         if (connected) {
             disconnectedSinceMs = 0;
@@ -220,6 +230,7 @@ public final class PhoneLocationService extends Service {
         if (!locationUpdatesStarted) startLocationUpdates();
         else restartLocationUpdates();
         if (!forward) updateNotification("正在获取位置 · 仅更新手动兜底");
+        if (pushEnabled) pushLatestLocation();
     }
 
     public boolean isRunning() {
