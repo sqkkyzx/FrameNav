@@ -182,11 +182,11 @@ class WifiWebChecks(unittest.TestCase):
 
     def test_wifi_start_limits_fixed_ap_transmit_power(self):
         source = (ROOT / "src/wifi_web.c").read_text()
-        self.assertIn("FRAMENAV_WIFI_MAX_TX_POWER_QDBM 52", source)
+        self.assertIn("FRAMENAV_WIFI_MAX_TX_POWER_QDBM 40", source)
         power = function_source("src/wifi_web.c", "configure_wifi_tx_power")
         self.assertIn("esp_wifi_set_max_tx_power", power)
-        self.assertIn("13 dBm", source)
-        self.assertIn("FRAMENAV_WIFI_MAX_TX_POWER_QDBM 52", source)
+        self.assertIn("10 dBm", source)
+        self.assertIn("FRAMENAV_WIFI_MAX_TX_POWER_QDBM 40", source)
         start = function_source("src/wifi_web.c", "wifi_web_start_unlocked")
         self.assertLess(start.index("esp_wifi_start()"),
                         start.index("configure_wifi_tx_power()"))

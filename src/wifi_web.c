@@ -31,10 +31,9 @@
 #define FRAMENAV_HTTP_MAX_CLIENTS 2
 #define FRAMENAV_WEB_RESERVED_SOCKETS 8
 #define FRAMENAV_HTTP_MAX_REQ_HDR_LEN 2048U
-// ESP-IDF uses quarter-dBm units. 52 maps to 13 dBm (20 mW), the nearest
-// supported setting that keeps the AP at or below half of the current
-// 16.5 dBm / 44.7 mW cap.
-#define FRAMENAV_WIFI_MAX_TX_POWER_QDBM 52
+// ESP-IDF uses quarter-dBm units. 40 maps to 10 dBm (10 mW), which is
+// approximately half the linear power of the previous 13 dBm / 20 mW cap.
+#define FRAMENAV_WIFI_MAX_TX_POWER_QDBM 40
 
 #if ALPHALOC_WIFI_WEB
 _Static_assert(CONFIG_LWIP_MAX_SOCKETS >= FRAMENAV_HTTP_MAX_CLIENTS +
