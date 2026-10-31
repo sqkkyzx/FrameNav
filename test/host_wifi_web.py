@@ -18,7 +18,8 @@ class WifiWebChecks(unittest.TestCase):
         self.assertIn("ALPHALOC_WIFI_WEB=1", power)
         self.assertNotIn("ALPHALOC_USB_HOST_WIFI=1", power)
         self.assertNotIn("ALPHALOC_USB_VBUS_GPIO=0", power)
-        self.assertIn("ALPHALOC_BLE_CONFIG=0", power)
+        self.assertIn("ALPHALOC_BLE_CONFIG=1", power)
+        self.assertIn("ALPHALOC_BLE_LOCATION=1", power)
         for target in ("env:xiao-c6-debug", "env:xiao-c6-gnss-debug"):
             flags = config[target]["build_flags"]
             self.assertIn("ALPHALOC_WIFI_WEB=0", flags)
@@ -190,26 +191,30 @@ class WifiWebChecks(unittest.TestCase):
         self.assertIn("存储占用：", page)
         self.assertIn('id=\\"storage-record-count\\"', page)
         self.assertIn('id=\\"storage-space\\"', page)
-        self.assertIn("fetch('/storage'", page)
+        self.assertIn("fetch('/location'", page)
+        self.assertIn('"storage"', source)
 
     def test_live_selected_location_not_raw_gps_or_stepped_time(self):
         source = (ROOT / "src/wifi_web.c").read_text()
-        handler = source.split("static esp_err_t handle_location", 1)[1].split("static esp_err_t handle_root", 1)[0]
-        self.assertIn("location_service_details", handler)
-        self.assertIn("format_track_time(observed", handler)
-        self.assertIn("Cache-Control", handler)
-        self.assertNotIn("location_service_set_phone", handler)
+        location = source.split("static cJSON *build_location_json", 1)[1].split("static esp_err_t handle_location", 1)[0]
+        self.assertIn("location_service_details", location)
+        self.assertIn("location_service_live_status", location)
+        self.assertIn("location_service_manual_status", location)
+        self.assertIn('"activeSource"', location)
+        self.assertIn('"gnss"', location)
+        self.assertIn('"phone"', location)
+        self.assertIn('"manual"', location)
+        self.assertIn('"storage"', location)
+        self.assertNotIn("location_service_set_phone", location)
+        self.assertIn("Cache-Control", source)
         self.assertIn("setInterval(liveLocation,10000)", source)
-        self.assertIn("window.addEventListener('load',liveLocation,{once:true})", source)
+        self.assertIn("fetch('/location'", source)
         self.assertNotIn("fetch('/activity'", source)
-        self.assertIn("q('#loc-running-satellites').textContent=d.satellites", source)
-        self.assertIn("q('#loc-running-satellites-visible').textContent=d.satellitesVisible", source)
-        self.assertIn('id=\\"loc-running-satellites\\"', source)
-        self.assertIn('id=\\"loc-running-satellites-visible\\"', source)
-        self.assertNotIn("q('#loc-satellites')", source)
-        self.assertNotIn("q('#loc-satellitesVisible')", source)
-        self.assertIn("暂不可用", handler)
-        self.assertIn('source == LOCATION_GNSS ? "卫星" : "—"', handler)
+        self.assertIn("q('#loc-gnss-visible').textContent=d.gnss.satellitesVisible", source)
+        self.assertIn("q('#loc-gnss-used').textContent=d.gnss.satellitesUsed", source)
+        self.assertIn('id=\\"loc-gnss-visible\\"', source)
+        self.assertIn('id=\\"loc-gnss-used\\"', source)
+        self.assertIn("暂不可用", source)
         self.assertNotIn("（UTC%c", source)
 
     def test_no_camera_tracking_controls_and_visible_satellite_count(self):
@@ -217,29 +222,34 @@ class WifiWebChecks(unittest.TestCase):
         page = source.split("static esp_err_t handle_root", 1)[1].split(
             "static esp_err_t handle_save", 1
         )[0]
-        location = source.split("static esp_err_t handle_location", 1)[1].split(
-            "static void wifi_page_state", 1
+        location = source.split("static cJSON *build_location_json", 1)[1].split(
+            "static esp_err_t handle_location", 1
         )[0]
         self.assertIn("satellitesVisible", location)
-        self.assertIn("satellites_visible", location)
+        self.assertIn("satellitesUsed", location)
         self.assertIn("GPS_SEARCH_PAUSED", location)
         self.assertIn("GPS_SEARCH_WAKING", location)
-        self.assertIn("已暂停搜星", location)
         self.assertIn("搜到卫星：", page)
-        self.assertIn("loc-running-satellites-visible", page)
-        self.assertIn("loc-running-gnss-dot", page)
-        self.assertIn("q('#loc-running-gnss').textContent=d.gnss", page)
-        self.assertIn("相机和手机都未连接时搜星", page)
-        self.assertIn("相机或手机连接时会自动搜星", page)
+        self.assertIn("loc-gnss-visible", page)
+        self.assertIn("loc-gnss-search", page)
+        self.assertIn("GNSS 定位", page)
+        self.assertIn("手机定位", page)
+        self.assertIn("手动设置经纬度", page)
         self.assertIn('name=\\\"track_idle\\\"', page)
         self.assertIn('name=\\\"track_int_s\\\"', page)
-        self.assertIn('min=\\\"1\\\" max=\\\"3600\\\"', page)
+        self.assertIn('name=\\\"source_order\\\"', page)
+        self.assertIn('name=\\\"phone_push_enabled\\\"', page)
+        self.assertIn('name=\\\"phone_interval_s\\\"', page)
         save = source.split("static esp_err_t handle_save", 1)[1].split(
             "static cJSON *read_phone_json", 1
         )[0]
-        self.assertIn('form_get(body, "gnss_idle"', save)
-        self.assertIn('form_get(body, "track_idle"', save)
-        self.assertIn('form_get(body, "track_int_s"', save)
+        self.assertIn('source_gnss_enabled', save)
+        self.assertIn('source_phone_enabled', save)
+        self.assertIn('source_manual_enabled', save)
+        self.assertIn('form_get(body, "source_order"', save)
+        self.assertIn('track_enabled', save)
+        self.assertIn('phone_push_enabled', save)
+        self.assertIn('form_get(body, "phone_interval_s"', save)
 
     def test_idle_clients_distinguishes_ap_associations_from_sta_uplink(self):
         clients = function_source("src/wifi_web.c", "wifi_web_has_clients")
@@ -294,7 +304,8 @@ int main(void) {
 
         self.assertIn("BLE_CLIENT_CAMERA_NAME_MAX", header)
         self.assertIn("bonds[i].name", page)
-        self.assertIn("未命名设备", page)
+        self.assertIn("FrameNav 管理手机", page)
+        self.assertIn("推送相机", page)
         self.assertIn("<small>%s · MAC %s</small>", page)
         self.assertIn("camera_name_save", client)
         self.assertIn("camera_name_load", client)
@@ -433,6 +444,9 @@ int main(void) {
         self.assertIn("httpd_register_err_handler", routes)
         self.assertIn('"/config"', routes)
         self.assertIn('"/storage"', routes)
+        registered_routes = routes.count("httpd_register_uri_handler(server,")
+        self.assertGreaterEqual(registered_routes, 18)
+        self.assertIn("server_cfg.max_uri_handlers = 24;", source)
         self.assertNotIn("ALPHALOC_AP_URL", page)
         self.assertNotIn("10.254.254.1", page)
 
@@ -481,31 +495,29 @@ int main(void) {
             "static esp_err_t handle_pair_start", 1
         )[0]
 
-        self.assertLess(page.index("连接设置"), page.index("定位设置"))
-        self.assertLess(page.index("定位设置"), page.index("省电设置"))
+        self.assertLess(page.index("连接配置"), page.index("定位配置"))
         for text in (
-            "设备连接模式", "高级设置", "开机后查找设备", "再次查找间隔",
-            "每次查找时长", "固定位置", "直接填写",
-            "位置有效期", "GPS 定位优先级", "GPS 稳定后的固定位置处理",
-            "固定位置过期前不删除",
-            "照片时区", "夏令时",
+            "已配对设备", "管理手机", "推送相机", "Wi‑Fi", "蓝牙省电",
+            "定位来源和优先级", "GNSS 定位", "手机定位", "手动设置经纬度",
+            "轨迹记录开启", "在未连接相机时也记录轨迹", "轨迹记录频率",
+            "照片时区", "夏时令", "手机定位获取频率", "使用真实定位持续更新",
         ):
             self.assertIn(text, page)
-        self.assertNotIn("从手机获取", page)
-        self.assertNotIn("navigator.geolocation", page)
+        self.assertNotIn("设备 IP", page)
+        self.assertNotIn("设备地址", page)
         self.assertNotIn("更新本地证书", page)
         self.assertIn('<details id=\\"ble-advanced\\">', page)
         self.assertNotIn('name=\\"loc_mode\\"', page)
         self.assertIn("bi.forEach(e=>e.disabled=m!==2)", page)
         manual_row = page.split('class=\\"manual-location\\"', 1)[1].split(
-            "保存固定位置", 1
+            'id=\\"manual-dirty\\"', 1
         )[0]
         self.assertIn('id=\\"manual-lat\\"', manual_row)
         self.assertIn('id=\\"manual-lon\\"', manual_row)
         self.assertIn('form_get(body, "ble_mode"', save)
-        self.assertIn('form_get(body, "phone_ttl_h"', save)
-        self.assertIn('form_get(body, "fixed_prio"', save)
-        self.assertIn('form_get(body, "fixed_delete"', save)
+        self.assertIn('source_order', save)
+        self.assertIn('manual_dirty', save)
+        self.assertIn('phone_interval_s', save)
         self.assertIn('"/location/clock"', source)
         self.assertIn("ble_client_config_changed", save)
 
@@ -516,8 +528,10 @@ int main(void) {
         )[0]
         start = function_source("src/wifi_web.c", "wifi_web_start_unlocked")
         self.assertNotIn("char bonds_html[4096]", page)
-        self.assertIn("char *bonds_html = malloc(bonds_html_len)", page)
-        self.assertIn("free(bonds_html)", page)
+        self.assertIn("char *phone_bonds_html = malloc(bonds_html_len)", page)
+        self.assertIn("char *camera_bonds_html = malloc(bonds_html_len)", page)
+        self.assertIn("free(phone_bonds_html)", page)
+        self.assertIn("free(camera_bonds_html)", page)
         self.assertIn("server_cfg.stack_size = 16384", start)
 
 

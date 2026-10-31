@@ -25,6 +25,9 @@
 #include "location_service.h"
 #include "os/os_mbuf.h"
 #include "services/gap/ble_svc_gap.h"
+#if ALPHALOC_WIFI_WEB
+#include "wifi_web.h"
+#endif
 
 #define LOCATION_FRAME_LEN 28U
 #define LOCATION_CLEAR_LEN 1U
@@ -49,7 +52,6 @@ static const ble_uuid128_t k_write_uuid =
 static const ble_uuid128_t k_clear_uuid =
     BLE_UUID128_INIT(0xA1, 0x7E, 0x11, 0x02, 0x1F, 0x4A, 0x4F, 0x5B,
                      0x9E, 0x5A, 0x7B, 0x79, 0xD5, 0xB4, 0xF0, 0xB1);
-
 /* Keep a short name in the primary packet so scanners that omit scan
  * responses still show the device. The full identity remains in the response. */
 static const char k_short_name[] = "FrameNav";
@@ -88,8 +90,8 @@ static int location_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 
   if (clear) {
     if (payload[0] != 1U) return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
-    location_service_clear_phone();
-    ESP_LOGI(TAG, "Phone location cleared over BLE");
+    (void)location_service_clear_manual();
+    ESP_LOGI(TAG, "Manual fallback location cleared over BLE");
     return 0;
   }
 
@@ -102,11 +104,11 @@ static int location_access_cb(uint16_t conn_handle, uint16_t attr_handle,
   const double longitude = (double)lon_e7 / 10000000.0;
   const double accuracy_m = (double)accuracy_cm / 100.0;
   if (!isfinite(latitude) || !isfinite(longitude) ||
-      !location_service_set_phone(latitude, longitude, accuracy_m, captured_ms,
-                                  now_ms)) {
+      !location_service_set_live_phone(latitude, longitude, accuracy_m,
+                                       captured_ms, now_ms)) {
     return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
   }
-  ESP_LOGI(TAG, "Phone location saved over BLE: %.7f, %.7f", latitude,
+  ESP_LOGI(TAG, "Live phone location received over BLE: %.7f, %.7f", latitude,
            longitude);
   return 0;
 }
@@ -190,6 +192,8 @@ void ble_location_server_start(void) {
       s_conn_handle != BLE_HS_CONN_HANDLE_NONE) return;
 
   struct ble_hs_adv_fields fields = {0};
+  /* The legacy advertising payload is limited to 31 bytes. The config service
+   * is discoverable after connecting through the location service. */
   ble_uuid128_t service_uuid = k_service_uuid;
   fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
   fields.name = (const uint8_t *)k_short_name;

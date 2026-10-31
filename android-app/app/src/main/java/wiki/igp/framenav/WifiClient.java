@@ -74,6 +74,30 @@ public final class WifiClient {
                 });
     }
 
+    public void postLiveLocation(String baseUrl, double latitude, double longitude,
+                                 double accuracy, long timestampMs, long nowMs,
+                                 Callback callback) {
+        String json = "{\"latitude\":" + Double.toString(latitude)
+                + ",\"longitude\":" + Double.toString(longitude)
+                + ",\"accuracy\":" + Double.toString(Math.max(0.0, accuracy))
+                + ",\"timestamp_ms\":" + timestampMs
+                + ",\"now_ms\":" + nowMs + "}";
+        post(baseUrl, "/location/live", json, callback);
+    }
+
+    public void postManualLocation(String baseUrl, double latitude, double longitude,
+                                   long timestampMs, long nowMs, Callback callback) {
+        String json = "{\"latitude\":" + Double.toString(latitude)
+                + ",\"longitude\":" + Double.toString(longitude)
+                + ",\"timestamp_ms\":" + timestampMs
+                + ",\"now_ms\":" + nowMs + "}";
+        post(baseUrl, "/location/manual", json, callback);
+    }
+
+    public void clearManualLocation(String baseUrl, Callback callback) {
+        post(baseUrl, "/location/manual/clear", "{}", callback);
+    }
+
     public void clearLocation(String baseUrl, Callback callback) {
         post(baseUrl, "/location/phone/clear", "{}", callback);
     }

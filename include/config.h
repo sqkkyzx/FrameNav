@@ -16,7 +16,7 @@
 #define WIFI_IDLE_TIMEOUT_LONG_S 900U
 #define PHONE_LOCATION_TTL_DEFAULT_HOURS 6U
 #define PHONE_LOCATION_TTL_MAX_HOURS 720U
-#define LOCATION_RECORD_INTERVAL_DEFAULT_S 3U
+#define LOCATION_RECORD_INTERVAL_DEFAULT_S 15U
 #define LOCATION_RECORD_INTERVAL_MIN_S 1U
 #define LOCATION_RECORD_INTERVAL_MAX_S 3600U
 
@@ -100,6 +100,14 @@ typedef struct
   uint8_t gnss_without_camera;
   uint8_t record_without_camera;
   uint32_t track_interval_s;
+  uint8_t source_gnss_enabled;
+  uint8_t source_phone_enabled;
+  uint8_t source_manual_enabled;
+  char source_order[24];
+  uint8_t track_enabled;
+  uint8_t phone_push_enabled;
+  uint32_t phone_interval_s;
+  uint8_t manual_auto_update;
 } app_config_t;
 
 void config_set_defaults(app_config_t *cfg);

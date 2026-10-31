@@ -43,6 +43,7 @@ static SemaphoreHandle_t s_mutex;
 static uint8_t *s_sector_buffer;
 static track_store_status_t s_status;
 static uint32_t s_interval_s = TRACK_STORE_INTERVAL_S;
+static bool s_enabled = true;
 static uint32_t s_next_sector;
 static uint16_t s_next_record;
 static uint32_t s_next_sequence = 1;
@@ -258,13 +259,15 @@ void track_store_set_interval(uint32_t interval_s) {
   s_interval_s = interval_s;
 }
 
+void track_store_set_enabled(bool enabled) { s_enabled = enabled; }
+
 bool track_store_append_fix(const gps_fix_t *fix) {
 #if !ALPHALOC_TRACK_STORE
   (void)fix;
   return false;
 #else
   track_record_t record;
-  if (!track_record_from_fix(fix, &record) || !s_status.available || !s_mutex ||
+  if (!s_enabled || !track_record_from_fix(fix, &record) || !s_status.available || !s_mutex ||
       xSemaphoreTake(s_mutex, pdMS_TO_TICKS(250)) != pdTRUE) {
     return false;
   }
@@ -339,6 +342,7 @@ void track_store_task(void *arg) {
       config_validate(&snapshot);
     }
     track_store_set_interval(snapshot.track_interval_s);
+    track_store_set_enabled(snapshot.track_enabled != 0);
     gps_fix_t fix;
     bool record_allowed = ble_client_is_connected() ||
                           snapshot.record_without_camera;

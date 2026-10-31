@@ -17,4 +17,8 @@ int64_t wifi_web_last_activity_us(void);
 void wifi_web_request_wake(void);
 bool wifi_web_take_wake_request(void);
 
+/* Caller owns the returned cJSON-compatible allocation and must free it. */
+char *wifi_web_get_config_json(void);
+char *wifi_web_get_location_json(void);
+
 #endif

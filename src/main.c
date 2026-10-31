@@ -324,9 +324,6 @@ static void wifi_web_task(void *arg) {
                  (unsigned)cfg_snapshot.wifi_idle_timeout_s);
         test_debug_event(DBG_WIFI_STOP, 3, 0, 0, 0);
         wifi_web_stop();
-#if ALPHALOC_BLE_LOCATION
-        ble_location_server_stop();
-#endif
         idle_shutdown = true;
         no_client_since_us = 0;
       }

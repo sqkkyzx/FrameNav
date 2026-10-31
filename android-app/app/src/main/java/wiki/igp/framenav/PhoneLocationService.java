@@ -27,13 +27,15 @@ public final class PhoneLocationService extends Service {
 
     private static final String CHANNEL_ID = "phone_location";
     private static final int NOTIFICATION_ID = 4101;
-    private static final long LOCATION_INTERVAL_MS = 5_000L;
-    private static final long MIN_PUSH_INTERVAL_MS = 10_000L;
+    private long locationIntervalMs = 5_000L;
+    private long minPushIntervalMs = 5_000L;
     private static final long BLE_WARNING_DELAY_MS = 30_000L;
     private static final long BLE_STOP_DELAY_MS = 120_000L;
 
     public interface LocationWriter {
         boolean isReady();
+
+        boolean isBleReady();
 
         void write(Location location, ResultCallback callback);
     }
@@ -65,20 +67,22 @@ public final class PhoneLocationService extends Service {
     private boolean writeInFlight;
     private boolean locationUpdatesStarted;
     private boolean warningShown;
+    private boolean pushEnabled = true;
+    private boolean forwardToCamera = true;
 
     private final Runnable pushLocation = new Runnable() {
         @Override
         public void run() {
             if (!locationUpdatesStarted) return;
             pushLatestLocation();
-            main.postDelayed(this, MIN_PUSH_INTERVAL_MS);
+            main.postDelayed(this, minPushIntervalMs);
         }
     };
 
     private final Runnable connectionWatch = new Runnable() {
         @Override
         public void run() {
-            if (!locationUpdatesStarted || isBleReady()) {
+            if (!locationUpdatesStarted || isReady()) {
                 disconnectedSinceMs = 0;
                 warningShown = false;
                 return;
@@ -88,10 +92,10 @@ public final class PhoneLocationService extends Service {
             long disconnectedFor = now - disconnectedSinceMs;
             if (!warningShown && disconnectedFor >= BLE_WARNING_DELAY_MS) {
                 warningShown = true;
-                notifyState("BLE 已断开，正在等待重新连接", true);
+                notifyState("设备连接已断开，正在等待重新连接", true);
             }
             if (disconnectedFor >= BLE_STOP_DELAY_MS) {
-                notifyState("BLE 长时间未连接，持续定位已停止", true);
+                notifyState("设备长时间不可达，持续定位已停止", true);
                 stopSelf();
                 return;
             }
@@ -107,7 +111,8 @@ public final class PhoneLocationService extends Service {
             if (listener != null) listener.onLocation(new Location(location));
             updateNotification(isBleReady()
                     ? "正在获取位置并通过 BLE 推送"
-                    : "正在获取位置，等待 BLE 连接");
+                    : isReady() ? "正在获取位置并通过设备 AP 回退"
+                    : "正在获取位置，等待设备连接");
         }
 
         @Override
@@ -181,8 +186,8 @@ public final class PhoneLocationService extends Service {
     public void setLocationWriter(LocationWriter writer) {
         this.writer = writer;
         updateConnectionWatch();
-        if (isBleReady()) {
-            notifyState("BLE 已连接，持续位置推送已就绪", false);
+        if (isReady()) {
+            notifyState(isBleReady() ? "BLE 定位推送已就绪" : "设备 AP 定位回退已就绪", false);
         }
     }
 
@@ -191,7 +196,7 @@ public final class PhoneLocationService extends Service {
             disconnectedSinceMs = 0;
             warningShown = false;
             main.removeCallbacks(connectionWatch);
-            notifyState("BLE 已连接，持续位置推送已就绪", false);
+            notifyState("BLE 定位推送已就绪", false);
         } else {
             if (disconnectedSinceMs == 0) {
                 disconnectedSinceMs = android.os.SystemClock.elapsedRealtime();
@@ -200,11 +205,32 @@ public final class PhoneLocationService extends Service {
         }
     }
 
+    public void configure(boolean continuous, boolean sendToDevice, boolean forward, int intervalSeconds) {
+        pushEnabled = sendToDevice;
+        forwardToCamera = forward;
+        long safeInterval = Math.max(1, Math.min(3600, intervalSeconds)) * 1000L;
+        locationIntervalMs = safeInterval;
+        minPushIntervalMs = safeInterval;
+        if (!continuous) {
+            stopLocationUpdates();
+            if (!sendToDevice) stopSelf();
+            else updateNotification("单次手机定位已获取；持续采集已关闭");
+            return;
+        }
+        if (!locationUpdatesStarted) startLocationUpdates();
+        else restartLocationUpdates();
+        if (!forward) updateNotification("正在获取位置 · 仅更新手动兜底");
+    }
+
     public boolean isRunning() {
         return locationUpdatesStarted;
     }
 
     private boolean isBleReady() {
+        return writer != null && writer.isBleReady();
+    }
+
+    private boolean isReady() {
         return writer != null && writer.isReady();
     }
 
@@ -227,7 +253,7 @@ public final class PhoneLocationService extends Service {
         try {
             if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
                 locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER,
-                        LOCATION_INTERVAL_MS, 0, locationListener, Looper.getMainLooper());
+                        locationIntervalMs, 0, locationListener, Looper.getMainLooper());
                 registered = true;
             }
         } catch (SecurityException | IllegalArgumentException ignored) {
@@ -236,7 +262,7 @@ public final class PhoneLocationService extends Service {
         try {
             if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
                 locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER,
-                        LOCATION_INTERVAL_MS, 0, locationListener, Looper.getMainLooper());
+                        locationIntervalMs, 0, locationListener, Looper.getMainLooper());
                 registered = true;
             }
         } catch (SecurityException | IllegalArgumentException ignored) {
@@ -278,11 +304,11 @@ public final class PhoneLocationService extends Service {
     }
 
     private void pushLatestLocation() {
-        if (latestLocation == null || writeInFlight) return;
+        if (!pushEnabled || latestLocation == null || writeInFlight) return;
         long now = System.currentTimeMillis();
         long age = now - latestLocation.getTime();
         if (age < 0 || age > 60_000L) return;
-        if (now - lastPushMs < MIN_PUSH_INTERVAL_MS || !isBleReady()) return;
+        if (now - lastPushMs < minPushIntervalMs || !isReady()) return;
         writeInFlight = true;
         Location sample = new Location(latestLocation);
         try {
@@ -290,26 +316,27 @@ public final class PhoneLocationService extends Service {
                 writeInFlight = false;
                 if (success) {
                     lastPushMs = System.currentTimeMillis();
-                    updateNotification("位置已通过 BLE 更新 · " + formatCoordinates(sample));
-                    if (listener != null) listener.onServiceState("位置已通过 BLE 更新", false);
+                    String destination = forwardToCamera ? "手机定位已推送" : "手动兜底位置已更新";
+                    updateNotification(destination + " · " + formatCoordinates(sample));
+                    if (listener != null) listener.onServiceState(destination, false);
                 } else {
-                    updateNotification("BLE 写入失败，等待重试");
+                    updateNotification("设备位置写入失败，等待重试");
                     if (listener != null) listener.onServiceState(
-                            message == null ? "BLE 位置写入失败" : message, true);
+                            message == null ? "设备位置写入失败" : message, true);
                 }
             }));
         } catch (RuntimeException error) {
             writeInFlight = false;
             String message = error.getMessage() == null
                     ? "BLE 位置写入无法启动" : error.getMessage();
-            updateNotification("BLE 写入失败，等待重试");
+            updateNotification("设备位置写入失败，等待重试");
             if (listener != null) listener.onServiceState(message, true);
         }
     }
 
     private void updateConnectionWatch() {
         main.removeCallbacks(connectionWatch);
-        if (!locationUpdatesStarted || isBleReady()) return;
+        if (!locationUpdatesStarted || isReady()) return;
         if (disconnectedSinceMs == 0) disconnectedSinceMs = android.os.SystemClock.elapsedRealtime();
         main.post(connectionWatch);
     }
@@ -318,6 +345,15 @@ public final class PhoneLocationService extends Service {
         locationUpdatesStarted = false;
         main.removeCallbacks(pushLocation);
         main.removeCallbacks(connectionWatch);
+    }
+
+    private void restartLocationUpdates() {
+        if (locationManager != null) {
+            try { locationManager.removeUpdates(locationListener); }
+            catch (SecurityException ignored) { }
+        }
+        locationUpdatesStarted = false;
+        startLocationUpdates();
     }
 
     private void notifyState(String message, boolean error) {

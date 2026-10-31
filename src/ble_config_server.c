@@ -17,6 +17,9 @@
 
 #include "ble_client.h"
 #include "gps.h"
+#if ALPHALOC_WIFI_WEB
+#include "wifi_web.h"
+#endif
 
 static const char *TAG = "ble_cfg_srv";
 
@@ -33,11 +36,18 @@ typedef enum {
   FIELD_STATUS_GPS_CONST,
   FIELD_STATUS_CAM_CONN,
   FIELD_STATUS_CAM_BOND,
+  FIELD_WIFI_WAKE,
+  FIELD_SETTINGS_JSON,
+  FIELD_TELEMETRY_JSON,
 } field_id_t;
 
 static app_config_t *s_cfg;
 static bool s_synced;
 static bool s_adv_requested;
+
+#ifndef ALPHALOC_BLE_LOCATION
+#define ALPHALOC_BLE_LOCATION 0
+#endif
 
 static const ble_uuid128_t k_svc_uuid =
     BLE_UUID128_INIT(0xB1, 0xF0, 0xB4, 0xD5, 0x79, 0x7B, 0x5A, 0x9E,
@@ -79,6 +89,39 @@ static const ble_uuid128_t k_chr_status_cam_conn_uuid =
 static const ble_uuid128_t k_chr_status_cam_bond_uuid =
     BLE_UUID128_INIT(0xB1, 0xF0, 0xB4, 0xD5, 0x79, 0x7B, 0x5A, 0x9E,
                      0x5B, 0x4F, 0x4A, 0x1F, 0x10, 0x00, 0x7E, 0xA1);
+static const ble_uuid128_t k_chr_wifi_wake_uuid =
+    BLE_UUID128_INIT(0xB1, 0xF0, 0xB4, 0xD5, 0x79, 0x7B, 0x5A, 0x9E,
+                     0x5B, 0x4F, 0x4A, 0x1F, 0x11, 0x00, 0x7E, 0xA1);
+static const ble_uuid128_t k_chr_settings_json_uuid =
+    BLE_UUID128_INIT(0xB1, 0xF0, 0xB4, 0xD5, 0x79, 0x7B, 0x5A, 0x9E,
+                     0x5B, 0x4F, 0x4A, 0x1F, 0x12, 0x00, 0x7E, 0xA1);
+static const ble_uuid128_t k_chr_telemetry_json_uuid =
+    BLE_UUID128_INIT(0xB1, 0xF0, 0xB4, 0xD5, 0x79, 0x7B, 0x5A, 0x9E,
+                     0x5B, 0x4F, 0x4A, 0x1F, 0x13, 0x00, 0x7E, 0xA1);
+
+static char *s_settings_cache;
+static char *s_telemetry_cache;
+
+static int append_text_offset(uint16_t conn_handle,
+                              struct ble_gatt_access_ctxt *ctxt,
+                              char *json, char **cache) {
+  if (ctxt->offset == 0) {
+    free(*cache);
+    *cache = json;
+  } else {
+    free(json);
+  }
+  if (!*cache) return BLE_ATT_ERR_UNLIKELY;
+  size_t length = strlen(*cache);
+  if (ctxt->offset > length) return BLE_ATT_ERR_INVALID_OFFSET;
+  uint16_t mtu = ble_att_mtu(conn_handle);
+  size_t chunk = mtu > 1 ? (size_t)mtu - 1U : 22U;
+  size_t remaining = length - ctxt->offset;
+  if (remaining > chunk) remaining = chunk;
+  return os_mbuf_append(ctxt->om, *cache + ctxt->offset, remaining) == 0
+             ? 0
+             : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
 
 static void copy_str_field(char *dst, size_t dst_len, const char *src, size_t src_len) {
   size_t copy_len = src_len < dst_len - 1 ? src_len : dst_len - 1;
@@ -127,6 +170,14 @@ static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
   }
 
   if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+    if (field == FIELD_SETTINGS_JSON) {
+      char *json = wifi_web_get_config_json();
+      return append_text_offset(conn_handle, ctxt, json, &s_settings_cache);
+    }
+    if (field == FIELD_TELEMETRY_JSON) {
+      char *json = wifi_web_get_location_json();
+      return append_text_offset(conn_handle, ctxt, json, &s_telemetry_cache);
+    }
     const char *value = "";
     char num_buf[16];
     switch (field) {
@@ -197,6 +248,15 @@ static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     }
 
     switch (field) {
+      case FIELD_WIFI_WAKE:
+        if (buf[0] != 1 || ctxt->om->om_len != 1) {
+          return BLE_ATT_ERR_VALUE_NOT_ALLOWED;
+        }
+#if ALPHALOC_WIFI_WEB
+        wifi_web_request_wake();
+        ESP_LOGI(TAG, "Wi-Fi wake requested over BLE");
+#endif
+        return 0;
       case FIELD_CAM_NAME:
         copy_str_field(cfg.camera_name_prefix, sizeof(cfg.camera_name_prefix), buf, strlen(buf));
         break;
@@ -302,6 +362,18 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
              .access_cb = gatt_access_cb,
              .flags = BLE_GATT_CHR_F_READ,
              .arg = (void *)FIELD_STATUS_CAM_BOND},
+            {.uuid = &k_chr_wifi_wake_uuid.u,
+             .access_cb = gatt_access_cb,
+             .flags = BLE_GATT_CHR_F_WRITE,
+             .arg = (void *)FIELD_WIFI_WAKE},
+            {.uuid = &k_chr_settings_json_uuid.u,
+             .access_cb = gatt_access_cb,
+             .flags = BLE_GATT_CHR_F_READ,
+             .arg = (void *)FIELD_SETTINGS_JSON},
+            {.uuid = &k_chr_telemetry_json_uuid.u,
+             .access_cb = gatt_access_cb,
+             .flags = BLE_GATT_CHR_F_READ,
+             .arg = (void *)FIELD_TELEMETRY_JSON},
             {0},
         },
     },
@@ -316,13 +388,20 @@ void ble_config_server_register(app_config_t *cfg) {
 
 void ble_config_server_on_sync(void) {
   s_synced = true;
+#if !ALPHALOC_BLE_LOCATION
   if (s_adv_requested) {
     ble_config_server_start();
   }
+#endif
 }
 
 void ble_config_server_start(void) {
   s_adv_requested = true;
+#if ALPHALOC_BLE_LOCATION
+  // The location server owns the single advertising set and includes this
+  // service UUID in its advertisement.
+  return;
+#else
   if (!s_synced) {
     return;
   }
@@ -360,15 +439,18 @@ void ble_config_server_start(void) {
   } else {
     ESP_LOGI(TAG, "BLE config advertising");
   }
+#endif
 }
 
 void ble_config_server_stop(void) {
   s_adv_requested = false;
+#if !ALPHALOC_BLE_LOCATION
   if (s_synced) {
     int rc = ble_gap_adv_stop();
     if (rc != 0) {
       ESP_LOGW(TAG, "Adv stop failed: %d", rc);
     }
   }
+#endif
   ESP_LOGI(TAG, "BLE config stopped");
 }

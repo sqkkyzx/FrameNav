@@ -30,6 +30,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import org.json.JSONObject;
 
 /**
  * BLE transport for FrameNav. All GATT operations are serialized because
@@ -67,6 +68,9 @@ public final class BleManager {
 
     public static final UUID CONFIG_SERVICE = UUID.fromString(
             "b1f0b4d5-797b-5a9e-5b4f-4a1f01007ea1");
+    public static final UUID WIFI_WAKE = uuid("11007ea1");
+    public static final UUID SETTINGS = uuid("12007ea1");
+    public static final UUID TELEMETRY = uuid("13007ea1");
     private static final LinkedHashMap<String, UUID> CONFIG_CHARACTERISTICS = new LinkedHashMap<>();
 
     static {
@@ -190,6 +194,31 @@ public final class BleManager {
                 callback.onError("BLE 尚未连接");
                 return;
             }
+            BluetoothGattCharacteristic settings = characteristics.get(SETTINGS);
+            if (settings != null) {
+                enqueueRead(settings, (success, value, error) -> {
+                    if (!success) {
+                        callback.onError("读取设备配置失败：" + error);
+                        return;
+                    }
+                    try {
+                        JSONObject json = new JSONObject(new String(value, StandardCharsets.UTF_8));
+                        Map<String, String> values = new LinkedHashMap<>();
+                        java.util.Iterator<String> keys = json.keys();
+                        while (keys.hasNext()) {
+                            String key = keys.next();
+                            Object item = json.opt(key);
+                            if (item != null && item != JSONObject.NULL) {
+                                values.put(key, String.valueOf(item));
+                            }
+                        }
+                        callback.onSuccess(values);
+                    } catch (Exception parseError) {
+                        callback.onError("BLE 配置数据无法解析");
+                    }
+                });
+                return;
+            }
             final List<Map.Entry<String, UUID>> entries = new ArrayList<>(CONFIG_CHARACTERISTICS.entrySet());
             final Map<String, String> values = new LinkedHashMap<>();
             List<Map.Entry<String, UUID>> readableEntries = new ArrayList<>();
@@ -202,10 +231,35 @@ public final class BleManager {
         });
     }
 
+    public void requestWifiWake(Callback callback) {
+        main.post(() -> {
+            BluetoothGattCharacteristic wake = characteristics.get(WIFI_WAKE);
+            if (!ready || wake == null) {
+                callback.onError("设备 BLE 尚未连接或不支持热点唤醒");
+                return;
+            }
+            enqueueWrite(wake, new byte[]{1}, callback);
+        });
+    }
+
     public interface ConfigCallback {
         void onSuccess(Map<String, String> values);
 
         void onError(String message);
+    }
+
+    public interface TelemetryCallback { void onSuccess(JSONObject value); }
+
+    public void readTelemetry(TelemetryCallback callback) {
+        main.post(() -> {
+            BluetoothGattCharacteristic telemetry = characteristics.get(TELEMETRY);
+            if (!ready || telemetry == null) return;
+            enqueueRead(telemetry, (success, value, error) -> {
+                if (!success) return;
+                try { callback.onSuccess(new JSONObject(new String(value, StandardCharsets.UTF_8))); }
+                catch (Exception ignored) { }
+            });
+        });
     }
 
     public void writeConfig(Map<String, String> values, Callback callback) {
@@ -491,7 +545,7 @@ public final class BleManager {
                 listener.onBleState("已连接，正在读取服务…");
                 try {
                     negotiatedMtu = 23;
-                    mtuRequested = bluetoothGatt.requestMtu(64);
+                    mtuRequested = bluetoothGatt.requestMtu(247);
                     if (!mtuRequested) {
                         discoverServices(bluetoothGatt);
                     }

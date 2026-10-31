@@ -7,6 +7,7 @@ import android.app.AlertDialog;
 import android.content.Context;
 import android.content.ComponentName;
 import android.content.Intent;
+import android.content.ClipData;
 import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
 import android.graphics.Typeface;
@@ -25,7 +26,9 @@ import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.DragEvent;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -34,6 +37,7 @@ import android.widget.ArrayAdapter;
 import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.widget.FrameLayout;
 
 import org.json.JSONObject;
 import org.json.JSONArray;
@@ -42,6 +46,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Collections;
 
 public final class MainActivity extends Activity implements BleManager.Listener {
     private static final int REQUEST_BLE_PERMISSIONS = 501;
@@ -49,6 +54,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     private static final int REQUEST_CONTINUOUS_PERMISSIONS = 504;
     private static final long MAX_CACHED_LOCATION_AGE_MS = 60_000L;
     private static final long LOCATION_TIMEOUT_MS = 20_000L;
+    private static final String DEVICE_ADDRESS = "10.254.254.1";
     private static final int[] TIMEZONE_VALUES = {-720, -660, -600, -570, -540, -480, -420, -360,
             -300, -240, -210, -180, -120, -60, 0, 60, 120, 180, 210, 240, 270, 300,
             330, 345, 360, 390, 420, 480, 525, 540, 570, 600, 630, 660, 720, 765, 780, 840};
@@ -72,7 +78,6 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     private PhoneLocationService phoneLocationService;
     private boolean phoneLocationBound;
     private boolean phoneLocationStarting;
-    private boolean settingContinuousSwitch;
     private int selectedTab;
 
     private TextView connectionStatus;
@@ -82,42 +87,112 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     private TextView deviceStatus;
     private TextView deviceLocation;
     private TextView storageStatus;
+    private TextView gnssSourceStatus;
+    private TextView phoneSourceStatus;
+    private TextView manualSourceStatus;
+    private TextView activeSourceBadge;
     private TextView locationStatus;
     private TextView coordinates;
     private TextView accuracy;
     private TextView message;
-    private EditText deviceIp;
     private EditText cameraName;
     private EditText cameraMac;
     private EditText stationSsid;
     private EditText stationPassword;
     private Spinner timezone;
     private Spinner dstOffset;
-    private EditText locationTtl;
-    private EditText gpsAge;
-    private Spinner fixedPriority;
-    private Spinner fixedDelete;
-    private Spinner gnssIdle;
-    private Spinner trackIdle;
+    private Switch gnssIdle;
+    private Switch trackIdle;
+    private Switch trackEnabled;
+    private Switch phonePushEnabled;
+    private Switch manualEnabled;
+    private Switch apFallbackSwitch;
     private Spinner bluetoothMode;
     private EditText bluetoothBoot;
     private EditText bluetoothPeriod;
     private EditText bluetoothWindow;
     private Spinner wifiIdle;
     private EditText trackInterval;
+    private EditText phoneInterval;
     private EditText manualLatitude;
     private EditText manualLongitude;
-    private Switch continuousLocation;
+    private LinearLayout sourceOrderRows;
+    private final List<String> locationOrder = new ArrayList<>(java.util.Arrays.asList("gnss", "phone", "manual"));
+    private final Map<String, CheckBox> sourceChecks = new LinkedHashMap<>();
+    private boolean sourceGnss = true;
+    private boolean sourcePhone = true;
+    private boolean sourceManual = true;
+    private boolean trackingEnabled = true;
+    private boolean phonePush = true;
+    private boolean manualLocationEnabled = true;
+    private boolean phoneContinuous;
+    private boolean apFallback;
+    private boolean updatingConfigControls;
+    private int phoneLocationIntervalSeconds = 5;
+    private boolean startupLocationRequested;
+    private boolean configEditable;
+    private boolean pendingHotspotWorkflow;
+    private boolean deviceHotspotVerified;
+    private Runnable afterHotspotConnected;
+    private android.net.Network currentWifiNetwork;
+    private android.net.Network verifiedHotspotNetwork;
+    private android.net.ConnectivityManager connectivityManager;
+    private final android.net.ConnectivityManager.NetworkCallback wifiNetworkCallback =
+            new android.net.ConnectivityManager.NetworkCallback() {
+                @Override public void onAvailable(android.net.Network network) {
+                    runOnUiThread(() -> {
+                        currentWifiNetwork = network;
+                        wifiClient.setNetwork(network);
+                        if (verifiedHotspotNetwork != null && !verifiedHotspotNetwork.equals(network)) {
+                            verifiedHotspotNetwork = null;
+                            deviceHotspotVerified = false;
+                            if (phoneLocationService != null) {
+                                phoneLocationService.setBleConnected(bleReady && bleLocationAvailable);
+                            }
+                        }
+                        if ((pendingHotspotWorkflow || apFallback) && !deviceHotspotVerified) {
+                            verifyDeviceHotspot();
+                        }
+                    });
+                }
+
+                @Override public void onLost(android.net.Network network) {
+                    runOnUiThread(() -> {
+                        if (network.equals(currentWifiNetwork)) {
+                            currentWifiNetwork = null;
+                            wifiClient.setNetwork(null);
+                            checkCurrentWifi();
+                        }
+                        if (network.equals(verifiedHotspotNetwork)) {
+                            verifiedHotspotNetwork = null;
+                            deviceHotspotVerified = false;
+                            if (phoneLocationService != null) {
+                                phoneLocationService.setBleConnected(bleReady && bleLocationAvailable);
+                            }
+                        }
+                    });
+                }
+            };
+    private final Runnable configPoll = new Runnable() {
+        @Override public void run() {
+            if (!bleReady) return;
+            if (bleConfigAvailable && !configEditable) readConfigOverBle();
+            bleManager.readTelemetry(MainActivity.this::applyTelemetry);
+            main.postDelayed(this, 30_000L);
+        }
+    };
     private LinearLayout tabContent;
     private final List<View> tabPages = new ArrayList<>();
     private final List<Button> tabButtons = new ArrayList<>();
     private Button connectBleButton;
     private Button connectWifiButton;
-    private Button readConfigButton;
-    private Button saveConfigButton;
-    private Button getLocationButton;
-    private Button writeLocationButton;
-    private Button clearLocationButton;
+    private Button saveLocationButton;
+    private Button saveConnectionButton;
+    private Button editLocationButton;
+    private Button editConnectionButton;
+    private Button usePhoneLocationButton;
+    private Button saveManualButton;
+    private Button clearManualButton;
     private Runnable bleReconnect;
 
     @Override
@@ -125,28 +200,41 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         super.onCreate(savedInstanceState);
         getWindow().setStatusBarColor(0xFF14231D);
         getWindow().setNavigationBarColor(0xFF14231D);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) getWindow().setDecorFitsSystemWindows(false);
         locationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
         wifiClient = new WifiClient();
         bleManager = new BleManager(this, this);
         buildUi();
-        deviceIp.setText(getPreferences(MODE_PRIVATE).getString("device_ip", "10.254.254.1"));
-        phoneLocationStarting = getPreferences(MODE_PRIVATE).getBoolean("continuous_location", false);
-        settingContinuousSwitch = true;
-        continuousLocation.setChecked(phoneLocationStarting);
-        settingContinuousSwitch = false;
-        if (phoneLocationStarting) startPhoneLocationService();
+        connectivityManager = (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+        if (connectivityManager != null) {
+            android.net.NetworkRequest request = new android.net.NetworkRequest.Builder()
+                    .addTransportType(android.net.NetworkCapabilities.TRANSPORT_WIFI).build();
+            connectivityManager.registerNetworkCallback(request, wifiNetworkCallback);
+        }
+        phoneLocationStarting = false;
+        phonePush = true;
+        phoneContinuous = true;
+        apFallback = getPreferences(MODE_PRIVATE).getBoolean("ap_fallback", false);
+        manualLocationEnabled = true;
+        setConfigEditable(false);
+        requestLocationPermissionsThenLocate();
         checkCurrentWifi();
         refreshControls();
     }
 
     @Override
     protected void onDestroy() {
+        main.removeCallbacks(configPoll);
         stopLocationRequest();
         if (bleManager != null && !phoneLocationStarting) {
             bleManager.close();
         }
         if (wifiClient != null) {
             wifiClient.close();
+        }
+        if (connectivityManager != null) {
+            try { connectivityManager.unregisterNetworkCallback(wifiNetworkCallback); }
+            catch (IllegalArgumentException ignored) { }
         }
         if (phoneLocationBound) {
             unbindService(phoneLocationConnection);
@@ -159,10 +247,11 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     protected void onResume() {
         super.onResume();
         checkCurrentWifi();
-        if (deviceIp != null) {
-            refreshDeviceStatus();
-            refreshStorageStatus();
-            refreshPairedDevices();
+        updateLocalPhoneStatus();
+        if (pendingHotspotWorkflow && wifiClientHasNetwork()) {
+            main.postDelayed(this::verifyDeviceHotspot, 700L);
+        } else if (apFallback && wifiClientHasNetwork() && !deviceHotspotVerified) {
+            main.postDelayed(this::verifyDeviceHotspot, 700L);
         }
     }
 
@@ -171,6 +260,16 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(0xFFF5F7F5);
         root.setPadding(dp(16), dp(12), dp(16), dp(6));
+        root.setOnApplyWindowInsetsListener((view, insets) -> {
+            int top = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                    ? insets.getInsets(android.view.WindowInsets.Type.systemBars()).top
+                    : insets.getSystemWindowInsetTop();
+            int bottom = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                    ? insets.getInsets(android.view.WindowInsets.Type.systemBars()).bottom
+                    : insets.getSystemWindowInsetBottom();
+            view.setPadding(dp(16), dp(12) + top, dp(16), dp(6) + bottom);
+            return insets;
+        });
         LinearLayout heading = row(root);
         TextView brand = text("FrameNav", 24, 0xFF14231D, true);
         heading.addView(brand, new LinearLayout.LayoutParams(0, dp(36), 1f));
@@ -209,7 +308,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         root.addView(nav, matchWrap());
 
         LinearLayout statusPage = newPage();
-        LinearLayout connectionCard = card(statusPage, "设备状态");
+        LinearLayout connectionCard = card(statusPage, "连接信息");
         connectionStatus = text("未连接", 14, 0xFF68756D, false);
         connectionCard.addView(connectionStatus, matchWrap());
         wifiStatus = text("设备 IP 通道未连接", 13, 0xFF68756D, false);
@@ -224,104 +323,87 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             setMessage("BLE 已断开。", false);
         });
         connectionButtons.addView(disconnect, weighted());
-        deviceStatus = text("设备定位：—", 14, 0xFF14231D, true);
-        deviceStatus.setPadding(0, dp(8), 0, 0);
-        connectionCard.addView(deviceStatus, matchWrap());
-        deviceLocation = text("来源、坐标与时间：—", 13, 0xFF68756D, false);
-        connectionCard.addView(deviceLocation, matchWrap());
-        storageStatus = text("轨迹存储：—", 13, 0xFF68756D, false);
-        storageStatus.setPadding(0, dp(4), 0, 0);
-        connectionCard.addView(storageStatus, matchWrap());
-        LinearLayout locationCard = card(statusPage, "手机定位");
-        locationStatus = text("尚未获取", 14, 0xFF68756D, false);
-        locationCard.addView(locationStatus, matchWrap());
-        coordinates = text("—", 21, 0xFF14231D, true);
-        coordinates.setPadding(0, dp(9), 0, dp(2));
-        locationCard.addView(coordinates, matchWrap());
-        accuracy = text("精度 —", 13, 0xFF68756D, false);
-        accuracy.setPadding(0, 0, 0, dp(10));
-        locationCard.addView(accuracy, matchWrap());
-        LinearLayout locationButtons = row(locationCard);
-        getLocationButton = button("获取手机位置", 0xFF28704A);
-        getLocationButton.setOnClickListener(view -> requestLocationPermissionsThenLocate());
-        locationButtons.addView(getLocationButton, weighted());
-        writeLocationButton = button("写入设备", 0xFF14231D);
-        writeLocationButton.setOnClickListener(view -> writeLocation());
-        locationButtons.addView(writeLocationButton, weighted());
-        clearLocationButton = button("清除固定位置", 0xFF53625A);
-        clearLocationButton.setOnClickListener(view -> clearLocation());
-        locationCard.addView(clearLocationButton, matchWrap());
+        LinearLayout locationCard = card(statusPage, "定位信息");
+        LinearLayout activeRow = row(locationCard);
+        activeSourceBadge = text("当前使用：—", 12, 0xFFFFFFFF, true);
+        activeSourceBadge.setPadding(dp(8), dp(5), dp(8), dp(5));
+        activeSourceBadge.setBackgroundColor(0xFF28704A);
+        activeRow.addView(activeSourceBadge, matchWrap());
+        deviceStatus = text("设备定位：—", 13, 0xFF68756D, false);
+        locationCard.addView(deviceStatus, matchWrap());
+        gnssSourceStatus = text("GNSS 定位：—", 13, 0xFF53625A, false);
+        gnssSourceStatus.setPadding(0, dp(8), 0, dp(2));
+        locationCard.addView(gnssSourceStatus, matchWrap());
+        phoneSourceStatus = text("手机定位：—", 13, 0xFF53625A, false);
+        phoneSourceStatus.setPadding(0, dp(8), 0, dp(2));
+        locationCard.addView(phoneSourceStatus, matchWrap());
+        manualSourceStatus = text("手动设置：—", 13, 0xFF53625A, false);
+        manualSourceStatus.setPadding(0, dp(8), 0, dp(2));
+        locationCard.addView(manualSourceStatus, matchWrap());
+        deviceLocation = text("—", 12, 0xFF68756D, false);
+        locationCard.addView(deviceLocation, matchWrap());
+        locationStatus = text("手机位置尚未获取", 12, 0xFF68756D, false);
+        coordinates = text("—", 12, 0xFF68756D, false);
+        accuracy = text("精度 —", 12, 0xFF68756D, false);
+        storageStatus = text("轨迹存储：—", 13, 0xFF53625A, false);
+        LinearLayout storageCard = card(statusPage, "存储轨迹");
+        storageCard.addView(storageStatus, matchWrap());
         addPage(statusPage);
 
         LinearLayout connectionPage = newPage();
         LinearLayout ipCard = card(connectionPage, "设备 IP 连接");
-        deviceIp = addField(ipCard, "设备地址", "10.254.254.1", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        TextView deviceAddress = text("固定地址  " + DEVICE_ADDRESS, 14, 0xFF14231D, true);
+        ipCard.addView(deviceAddress, matchWrap());
         connectWifiButton = button("打开系统 Wi-Fi 设置", 0xFF28704A);
         connectWifiButton.setOnClickListener(view -> openWifiSettings());
         ipCard.addView(connectWifiButton, matchWrap());
         TextView wifiHint = text("连接设备热点 FrameNav-MAC 后六位，再返回应用。热点密码固定为 framenav。设置读取和保存使用 HTTP IP 直连。", 13, 0xFF68756D, false);
         wifiHint.setPadding(0, dp(6), 0, 0);
         ipCard.addView(wifiHint, matchWrap());
-        LinearLayout configActions = row(ipCard);
-        readConfigButton = button("读取配置", 0xFF53625A);
-        readConfigButton.setOnClickListener(view -> readConfig());
-        configActions.addView(readConfigButton, weighted());
-        saveConfigButton = button("保存配置", 0xFF28704A);
-        saveConfigButton.setOnClickListener(view -> saveConfig());
-        configActions.addView(saveConfigButton, weighted());
+        Button wakeWifi = button("通过蓝牙唤醒设备热点", 0xFF53625A);
+        wakeWifi.setOnClickListener(view -> wakeDeviceWifi());
+        ipCard.addView(wakeWifi, matchWrap());
+        editConnectionButton = button("编辑连接配置", 0xFF53625A);
+        editConnectionButton.setOnClickListener(v -> setConfigEditable(true));
+        ipCard.addView(editConnectionButton, matchWrap());
         Button pairCamera = button("打开相机配对窗口", 0xFF53625A);
         pairCamera.setOnClickListener(v -> startCameraPairing());
         ipCard.addView(pairCamera, matchWrap());
         LinearLayout bondsCard = card(connectionPage, "已配对设备");
         pairedDevices = text("尚未读取", 13, 0xFF68756D, false);
         bondsCard.addView(pairedDevices, matchWrap());
+        TextView pairedPhonesHeading = text("管理手机", 14, 0xFF14231D, true);
+        pairedPhonesHeading.setPadding(0, dp(8), 0, dp(3));
+        bondsCard.addView(pairedPhonesHeading, matchWrap());
+        TextView pairedPhone = text("本机 · " + Build.MODEL + "（BLE 状态见当前状态）", 13, 0xFF53625A, false);
+        bondsCard.addView(pairedPhone, matchWrap());
+        Button managePhoneBond = button("在系统蓝牙设置中管理手机配对", 0xFF53625A);
+        managePhoneBond.setOnClickListener(v -> startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS)));
+        bondsCard.addView(managePhoneBond, matchWrap());
+        TextView pairedCamerasHeading = text("推送相机", 14, 0xFF14231D, true);
+        pairedCamerasHeading.setPadding(0, dp(12), 0, dp(3));
+        bondsCard.addView(pairedCamerasHeading, matchWrap());
         pairedDeviceRows = new LinearLayout(this);
         pairedDeviceRows.setOrientation(LinearLayout.VERTICAL);
         bondsCard.addView(pairedDeviceRows, matchWrap());
-        Button refreshBonds = button("刷新设备列表", 0xFF53625A);
-        refreshBonds.setOnClickListener(v -> refreshPairedDevices());
+        Button refreshBonds = button("连接热点查看相机", 0xFF53625A);
+        refreshBonds.setOnClickListener(v -> wakeDeviceWifi());
         bondsCard.addView(refreshBonds, matchWrap());
         addPage(connectionPage);
 
         LinearLayout locationPage = newPage();
-        LinearLayout phoneCard = card(locationPage, "手机定位");
-        continuousLocation = new Switch(this);
-        continuousLocation.setText("持续获取并通过 BLE 推送");
-        continuousLocation.setTextColor(0xFF14231D);
-        continuousLocation.setTextSize(14);
-        phoneCard.addView(continuousLocation, matchWrap());
-        continuousLocation.setOnCheckedChangeListener((button, checked) -> setContinuousLocation(checked));
-        manualLatitude = addField(phoneCard, "固定位置纬度", "-90 至 90", InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_SIGNED | InputType.TYPE_NUMBER_FLAG_DECIMAL);
-        manualLongitude = addField(phoneCard, "固定位置经度", "-180 至 180", InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_SIGNED | InputType.TYPE_NUMBER_FLAG_DECIMAL);
-        Button saveManual = button("保存固定坐标到设备", 0xFF28704A);
-        saveManual.setOnClickListener(v -> saveManualLocation());
-        phoneCard.addView(saveManual, matchWrap());
-        TextView locationNote = text("持续定位需要通知权限、手机定位权限和 BLE 连接。停止后通知栏服务会退出。", 12, 0xFF68756D, false);
-        locationNote.setPadding(0, dp(7), 0, 0);
-        phoneCard.addView(locationNote, matchWrap());
-        addPage(locationPage);
-
-        LinearLayout advancedPage = newPage();
-        LinearLayout cameraCard = card(advancedPage, "相机与网络");
-        cameraName = addField(cameraCard, "相机名称前缀", "留空自动选择", InputType.TYPE_CLASS_TEXT);
-        cameraMac = addField(cameraCard, "相机地址前缀", "选填", InputType.TYPE_CLASS_TEXT);
-        stationSsid = addField(cameraCard, "设备连接的 Wi-Fi 名称", "仅支持 2.4 GHz", InputType.TYPE_CLASS_TEXT);
-        Button scanNetworks = button("扫描附近 Wi-Fi", 0xFF53625A);
-        scanNetworks.setOnClickListener(v -> scanWifiNetworks());
-        cameraCard.addView(scanNetworks, matchWrap());
-        stationPassword = addField(cameraCard, "Wi-Fi 密码", "留空保持不变", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        wifiIdle = addChoice(cameraCard, "无人使用时关闭设备 Wi-Fi", new String[]{"5 分钟", "15 分钟"});
-        LinearLayout locationConfigCard = card(advancedPage, "定位与轨迹");
-        locationTtl = addField(locationConfigCard, "固定位置有效期（小时）", "1 至 720", InputType.TYPE_CLASS_NUMBER);
-        fixedPriority = addChoice(locationConfigCard, "GPS 定位优先级", new String[]{"有 GPS 时优先使用 GPS", "固定位置过期前优先使用固定位置"});
-        fixedDelete = addChoice(locationConfigCard, "GPS 稳定后的固定位置处理", new String[]{
-                "稳定 1 分钟后删除", "稳定 5 分钟后删除", "偏离超过 100 米后删除",
-                "稳定 1 分钟且偏离后删除", "稳定 5 分钟且偏离后删除", "过期前不删除"});
-        gpsAge = addField(locationConfigCard, "卫星位置最大年龄（秒）", "0 至 86400", InputType.TYPE_CLASS_NUMBER);
-        gnssIdle = addChoice(locationConfigCard, "相机和手机都未连接时搜星", new String[]{"关闭", "开启"});
-        trackIdle = addChoice(locationConfigCard, "相机和手机都未连接时记录位置", new String[]{"关闭", "开启"});
-        trackInterval = addField(locationConfigCard, "轨迹记录间隔（秒）", "1 至 3600", InputType.TYPE_CLASS_NUMBER);
-        timezone = addChoice(locationConfigCard, "照片时区", new String[]{
+        LinearLayout commonCard = card(locationPage, "通用");
+        sourceOrderRows = new LinearLayout(this);
+        sourceOrderRows.setOrientation(LinearLayout.VERTICAL);
+        commonCard.addView(text("定位来源和优先级 · 拖动排序", 12, 0xFF53625A, false), matchWrap());
+        commonCard.addView(sourceOrderRows, matchWrap());
+        rebuildSourceRows();
+        trackEnabled = addSwitch(commonCard, "开启轨迹记录", true, null);
+        trackIdle = addSwitch(commonCard, "未连接相机时也记录轨迹", false, null);
+        trackInterval = addField(commonCard, "轨迹记录频率（秒）", "15", InputType.TYPE_CLASS_NUMBER);
+        trackInterval.setText("15");
+        LinearLayout timeCard = card(locationPage, "照片时间");
+        timezone = addChoice(timeCard, "照片时区", new String[]{
                 "UTC−12:00 国际日期变更线西", "UTC−11:00 萨摩亚", "UTC−10:00 夏威夷",
                 "UTC−09:30 马克萨斯群岛", "UTC−09:00 阿拉斯加", "UTC−08:00 太平洋时间",
                 "UTC−07:00 山地时间", "UTC−06:00 中部时间", "UTC−05:00 东部时间",
@@ -334,12 +416,75 @@ public final class MainActivity extends Activity implements BleManager.Listener 
                 "UTC+09:00 东京 / 首尔", "UTC+09:30 阿德莱德", "UTC+10:00 悉尼",
                 "UTC+10:30 豪勋爵岛", "UTC+11:00 所罗门群岛", "UTC+12:00 奥克兰 / 斐济",
                 "UTC+12:45 查塔姆群岛", "UTC+13:00 汤加", "UTC+14:00 莱恩群岛"});
-        dstOffset = addChoice(locationConfigCard, "夏令时", new String[]{"关闭", "增加 30 分钟", "增加 1 小时", "增加 2 小时"});
-        LinearLayout bleCard = card(advancedPage, "蓝牙省电");
+        dstOffset = addChoice(timeCard, "夏时令", new String[]{"关闭", "增加 30 分钟", "增加 1 小时", "增加 2 小时"});
+        LinearLayout gnssCard = card(locationPage, "GNSS 定位");
+        gnssIdle = addSwitch(gnssCard, "未连接任何设备时也持续搜星", false, null);
+        LinearLayout phoneCard = card(locationPage, "手机定位");
+        phonePushEnabled = addSwitch(phoneCard, "通过蓝牙持续推送手机定位", true,
+                checked -> { phonePush = checked; updateLocationService(); });
+        phoneInterval = addField(phoneCard, "手机定位获取频率（秒）", "5", InputType.TYPE_CLASS_NUMBER);
+        phoneInterval.setText("5");
+        apFallbackSwitch = addSwitch(phoneCard, "BLE 不可用时使用设备 AP 回退", false,
+                checked -> {
+                    apFallback = checked;
+                    getPreferences(MODE_PRIVATE).edit().putBoolean("ap_fallback", checked).apply();
+                    if (phoneLocationService != null) phoneLocationService.setBleConnected(bleReady && bleLocationAvailable);
+                    if (checked) {
+                        if (wifiClientHasNetwork()) verifyDeviceHotspot();
+                        else wakeDeviceWifi();
+                    }
+                });
+        apFallbackSwitch.setChecked(apFallback);
+        LinearLayout manualCard = card(locationPage, "手动设置经纬度（兜底位置）");
+        LinearLayout coordinateRow = row(manualCard);
+        LinearLayout longitudeColumn = new LinearLayout(this);
+        longitudeColumn.setOrientation(LinearLayout.VERTICAL);
+        coordinateRow.addView(longitudeColumn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        LinearLayout latitudeColumn = new LinearLayout(this);
+        latitudeColumn.setOrientation(LinearLayout.VERTICAL);
+        coordinateRow.addView(latitudeColumn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        manualLongitude = addField(longitudeColumn, "经度", "-180 至 180", InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_SIGNED | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        manualLatitude = addField(latitudeColumn, "纬度", "-90 至 90", InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_SIGNED | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        usePhoneLocationButton = button("使用手机定位填入", 0xFF53625A);
+        usePhoneLocationButton.setOnClickListener(v -> fillManualFromPhone());
+        manualCard.addView(usePhoneLocationButton, matchWrap());
+        manualEnabled = addSwitch(manualCard, "使用真实定位持续更新", true,
+                checked -> { manualLocationEnabled = checked; phoneContinuous = checked; updateLocationService(); });
+        saveManualButton = button("保存手动位置", 0xFF28704A);
+        saveManualButton.setOnClickListener(v -> saveManualLocation());
+        manualCard.addView(saveManualButton, matchWrap());
+        clearManualButton = button("清除手动位置", 0xFF8B3D36);
+        clearManualButton.setOnClickListener(v -> clearManualLocation());
+        manualCard.addView(clearManualButton, matchWrap());
+        saveLocationButton = button("保存定位配置", 0xFF28704A);
+        saveLocationButton.setOnClickListener(v -> saveConfig());
+        commonCard.addView(saveLocationButton, matchWrap());
+        editLocationButton = button("编辑定位配置", 0xFF53625A);
+        editLocationButton.setOnClickListener(v -> setConfigEditable(true));
+        commonCard.addView(editLocationButton, matchWrap());
+        TextView locationNote = text("手机位置自动获取；持续采集与蓝牙推送分别控制。保存设备配置需要连接 FrameNav 热点。", 12, 0xFF68756D, false);
+        locationNote.setPadding(0, dp(7), 0, 0);
+        manualCard.addView(locationNote, matchWrap());
+        addPage(locationPage);
+
+        LinearLayout advancedPage = newPage();
+        LinearLayout cameraCard = card(connectionPage, "相机与网络");
+        cameraName = addField(cameraCard, "相机名称前缀", "留空自动选择", InputType.TYPE_CLASS_TEXT);
+        cameraMac = addField(cameraCard, "相机地址前缀", "选填", InputType.TYPE_CLASS_TEXT);
+        stationSsid = addField(cameraCard, "设备连接的 Wi-Fi 名称", "仅支持 2.4 GHz", InputType.TYPE_CLASS_TEXT);
+        Button scanNetworks = button("扫描附近 Wi-Fi", 0xFF53625A);
+        scanNetworks.setOnClickListener(v -> scanWifiNetworks());
+        cameraCard.addView(scanNetworks, matchWrap());
+        stationPassword = addField(cameraCard, "Wi-Fi 密码", "留空保持不变", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        wifiIdle = addChoice(cameraCard, "无人使用时关闭设备 Wi-Fi", new String[]{"5 分钟", "15 分钟"});
+        LinearLayout bleCard = card(connectionPage, "蓝牙省电");
         bluetoothMode = addChoice(bleCard, "设备连接模式", new String[]{"省电", "平衡", "自定义"});
         bluetoothBoot = addField(bleCard, "开机后查找设备（秒）", "0 至 300", InputType.TYPE_CLASS_NUMBER);
         bluetoothPeriod = addField(bleCard, "再次查找间隔（秒）", "1 至 10.24", InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
         bluetoothWindow = addField(bleCard, "每次查找时长（毫秒）", "20 至 1000", InputType.TYPE_CLASS_NUMBER);
+        bluetoothBoot.setText("30");
+        bluetoothPeriod.setText("3.0");
+        bluetoothWindow.setText("100");
         bluetoothMode.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
             @Override public void onItemSelected(android.widget.AdapterView<?> parent, View view, int position, long id) {
                 boolean custom = position == 2;
@@ -348,9 +493,12 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             @Override public void onNothingSelected(android.widget.AdapterView<?> parent) { }
         });
         addPage(advancedPage);
+        saveConnectionButton = button("保存连接配置", 0xFF28704A);
+        saveConnectionButton.setOnClickListener(v -> saveConfig());
+        connectionPage.addView(saveConnectionButton, matchWrap());
         showTab(0);
-        deviceIp.setText(getPreferences(MODE_PRIVATE).getString("device_ip", "10.254.254.1"));
         setContentView(root);
+        storageStatus.setText("等待 BLE 设备遥测");
     }
 
     private LinearLayout newPage() {
@@ -393,6 +541,102 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         spinner.setAdapter(adapter);
         parent.addView(spinner, matchWrap());
         return spinner;
+    }
+
+    private interface SwitchListener { void onChanged(boolean checked); }
+
+    private Switch addSwitch(LinearLayout parent, String label, boolean initial, SwitchListener listener) {
+        Switch control = new Switch(this);
+        control.setText(label);
+        control.setTextColor(0xFF14231D);
+        control.setTextSize(14);
+        control.setChecked(initial);
+        parent.addView(control, matchWrap());
+        if (listener != null) control.setOnCheckedChangeListener((button, checked) -> {
+            if (!updatingConfigControls) listener.onChanged(checked);
+        });
+        return control;
+    }
+
+    private void rebuildSourceRows() {
+        if (sourceOrderRows == null) return;
+        sourceOrderRows.removeAllViews();
+        sourceChecks.clear();
+        String[] ids = {"gnss", "phone", "manual"};
+        String[] labels = {"GNSS 定位", "手机定位", "手动设置经纬度"};
+        for (String id : locationOrder) {
+            int index = java.util.Arrays.asList(ids).indexOf(id);
+            if (index < 0) continue;
+            LinearLayout line = new LinearLayout(this);
+            line.setGravity(Gravity.CENTER_VERTICAL);
+            line.setTag(id);
+            TextView drag = text("↕", 20, 0xFF53625A, true);
+            drag.setGravity(Gravity.CENTER);
+            drag.setOnTouchListener((view, event) -> {
+                if (event.getAction() == android.view.MotionEvent.ACTION_DOWN) {
+                    View.DragShadowBuilder shadow = new View.DragShadowBuilder(line);
+                    line.startDragAndDrop(ClipData.newPlainText("source", id), shadow, line, 0);
+                    return true;
+                }
+                return false;
+            });
+            line.addView(drag, new LinearLayout.LayoutParams(dp(38), dp(48)));
+            CheckBox check = new CheckBox(this);
+            check.setText((locationOrder.indexOf(id) + 1) + ".  " + labels[index]);
+            check.setTextColor(0xFF14231D);
+            check.setTextSize(14);
+            check.setChecked("gnss".equals(id) ? sourceGnss : "phone".equals(id) ? sourcePhone : sourceManual);
+            sourceChecks.put(id, check);
+            line.addView(check, new LinearLayout.LayoutParams(0, dp(48), 1f));
+            check.setOnCheckedChangeListener((button, checked) -> {
+                if (updatingConfigControls) return;
+                if ("gnss".equals(id)) sourceGnss = checked;
+                else if ("phone".equals(id)) sourcePhone = checked;
+                else sourceManual = checked;
+            });
+            line.setOnDragListener((view, event) -> {
+                if (event.getAction() == DragEvent.ACTION_DROP) {
+                    String from = String.valueOf(event.getLocalState());
+                    String to = String.valueOf(view.getTag());
+                    int fromIndex = locationOrder.indexOf(from);
+                    int toIndex = locationOrder.indexOf(to);
+                    if (fromIndex >= 0 && toIndex >= 0) {
+                        Collections.swap(locationOrder, fromIndex, toIndex);
+                        rebuildSourceRows();
+                    }
+                    return true;
+                }
+                return true;
+            });
+            sourceOrderRows.addView(line, matchWrap());
+        }
+    }
+
+    private void setConfigEditable(boolean editable) {
+        configEditable = editable;
+        for (EditText field : new EditText[]{cameraName, cameraMac, stationSsid, stationPassword,
+                trackInterval, phoneInterval, manualLatitude, manualLongitude,
+                bluetoothBoot, bluetoothPeriod, bluetoothWindow}) {
+            if (field != null) field.setEnabled(editable);
+        }
+        for (Spinner field : new Spinner[]{timezone, dstOffset, wifiIdle, bluetoothMode}) {
+            if (field != null) field.setEnabled(editable);
+        }
+        for (Switch field : new Switch[]{trackEnabled, trackIdle, gnssIdle, phonePushEnabled, manualEnabled}) {
+            if (field != null) field.setEnabled(editable);
+        }
+        for (CheckBox field : sourceChecks.values()) field.setEnabled(editable);
+        if (saveConnectionButton != null) saveConnectionButton.setVisibility(editable ? View.VISIBLE : View.GONE);
+        if (saveLocationButton != null) saveLocationButton.setVisibility(editable ? View.VISIBLE : View.GONE);
+        if (editConnectionButton != null) editConnectionButton.setVisibility(editable ? View.GONE : View.VISIBLE);
+        if (editLocationButton != null) editLocationButton.setVisibility(editable ? View.GONE : View.VISIBLE);
+        if (usePhoneLocationButton != null) usePhoneLocationButton.setEnabled(editable);
+        if (saveManualButton != null) saveManualButton.setVisibility(editable ? View.VISIBLE : View.GONE);
+        if (clearManualButton != null) clearManualButton.setVisibility(editable ? View.VISIBLE : View.GONE);
+        if (editable) {
+            setMessage("配置已进入编辑状态。保存前请连接设备热点。", false);
+            wakeDeviceWifi();
+        }
     }
 
     private LinearLayout card(LinearLayout parent, String title) {
@@ -547,9 +791,6 @@ public final class MainActivity extends Activity implements BleManager.Listener 
                 startPhoneLocationService();
             } else {
                 phoneLocationStarting = false;
-                settingContinuousSwitch = true;
-                continuousLocation.setChecked(false);
-                settingContinuousSwitch = false;
                 setMessage("持续定位需要手机定位权限和通知权限。", true);
             }
         }
@@ -559,9 +800,62 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         startActivity(new Intent(Settings.ACTION_WIFI_SETTINGS));
     }
 
+    private void wakeDeviceWifi() {
+        pendingHotspotWorkflow = true;
+        if (!bleReady) {
+            setMessage("先连接 BLE，再唤醒设备热点。", false);
+            requestBlePermissionsThenConnect();
+            return;
+        }
+        bleManager.requestWifiWake(new BleManager.Callback() {
+            @Override public void onSuccess() {
+                setMessage("设备热点已唤醒，请连接 FrameNav 热点。", false);
+                openWifiSettings();
+            }
+            @Override public void onError(String error) { setMessage(error, true); }
+        });
+    }
+
+    private boolean wifiClientHasNetwork() {
+        android.net.ConnectivityManager manager = (android.net.ConnectivityManager)
+                getSystemService(CONNECTIVITY_SERVICE);
+        if (manager == null) return false;
+        for (android.net.Network network : manager.getAllNetworks()) {
+            android.net.NetworkCapabilities caps = manager.getNetworkCapabilities(network);
+            if (caps != null && caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) return true;
+        }
+        return false;
+    }
+
+    private void verifyDeviceHotspot() {
+        wifiClient.getConfigurationPage(DEVICE_ADDRESS, new WifiClient.Callback() {
+            @Override public void onSuccess(String ignored) {
+                pendingHotspotWorkflow = false;
+                deviceHotspotVerified = true;
+                verifiedHotspotNetwork = currentWifiNetwork;
+                refreshPairedDevices();
+                refreshStorageStatus();
+                if (phoneLocationService != null) phoneLocationService.setBleConnected(bleReady && bleLocationAvailable);
+                setMessage("已连接 FrameNav 设备热点。", false);
+                Runnable action = afterHotspotConnected;
+                afterHotspotConnected = null;
+                if (action != null) main.post(action);
+            }
+            @Override public void onError(String error, Throwable cause) {
+                deviceHotspotVerified = false;
+                if (phoneLocationService != null) phoneLocationService.setBleConnected(bleReady && bleLocationAvailable);
+                setMessage("当前 Wi-Fi 还不是 FrameNav 热点，请连接 FrameNav-MAC 后六位。", false);
+            }
+        });
+    }
+
     private void startCameraPairing() {
-        rememberDeviceIp();
-        wifiClient.startCameraPairing(deviceIp.getText().toString(), new WifiClient.Callback() {
+        if (!deviceHotspotVerified) {
+            afterHotspotConnected = this::startCameraPairing;
+            wakeDeviceWifi();
+            return;
+        }
+        wifiClient.startCameraPairing(DEVICE_ADDRESS, new WifiClient.Callback() {
             @Override public void onSuccess(String response) {
                 setMessage("设备已进入相机配对窗口（90 秒）。", false);
             }
@@ -572,7 +866,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     }
 
     private void refreshPairedDevices() {
-        wifiClient.getPairedDevices(deviceIp.getText().toString(), new WifiClient.Callback() {
+        wifiClient.getPairedDevices(DEVICE_ADDRESS, new WifiClient.Callback() {
             @Override public void onSuccess(String response) {
                 try {
                     JSONArray bonds = new JSONObject(response).optJSONArray("bonds");
@@ -597,7 +891,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
                                 .setMessage("确定移除 " + name + "？")
                                 .setNegativeButton("取消", null)
                                 .setPositiveButton("移除", (dialog, which) -> wifiClient.deletePairedDevice(
-                                        deviceIp.getText().toString(), token, type, new WifiClient.Callback() {
+                                        DEVICE_ADDRESS, token, type, new WifiClient.Callback() {
                                             @Override public void onSuccess(String ignored) { refreshPairedDevices(); }
                                             @Override public void onError(String error, Throwable cause) { setMessage(error, true); }
                                         })).show());
@@ -615,9 +909,8 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     }
 
     private void scanWifiNetworks() {
-        rememberDeviceIp();
         setMessage("正在请求设备扫描 Wi-Fi…", false);
-        wifiClient.startWifiScan(deviceIp.getText().toString(), new WifiClient.Callback() {
+        wifiClient.startWifiScan(DEVICE_ADDRESS, new WifiClient.Callback() {
             @Override public void onSuccess(String response) { pollWifiNetworks(0); }
             @Override public void onError(String error, Throwable cause) {
                 setMessage(error + "。请确认设备 IP 通道可用。", true);
@@ -630,7 +923,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             setMessage("Wi-Fi 扫描等待超时，请重试。", true);
             return;
         }
-        main.postDelayed(() -> wifiClient.getWifiScan(deviceIp.getText().toString(), new WifiClient.Callback() {
+        main.postDelayed(() -> wifiClient.getWifiScan(DEVICE_ADDRESS, new WifiClient.Callback() {
             @Override public void onSuccess(String response) {
                 try {
                     JSONObject result = new JSONObject(response);
@@ -687,10 +980,21 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             }
             if (wifi != null) {
                 wifiClient.setNetwork(wifi);
+                currentWifiNetwork = wifi;
+                if (verifiedHotspotNetwork != null && !verifiedHotspotNetwork.equals(wifi)) {
+                    verifiedHotspotNetwork = null;
+                    deviceHotspotVerified = false;
+                    if (phoneLocationService != null) {
+                        phoneLocationService.setBleConnected(bleReady && bleLocationAvailable);
+                    }
+                }
                 wifiStatus.setText("手机已连接 Wi-Fi · HTTP IP 可用");
                 refreshControls();
             } else {
                 wifiClient.setNetwork(null);
+                currentWifiNetwork = null;
+                verifiedHotspotNetwork = null;
+                deviceHotspotVerified = false;
                 wifiStatus.setText("设备 IP 通道未连接");
             }
         } catch (Exception ignored) {
@@ -712,32 +1016,45 @@ public final class MainActivity extends Activity implements BleManager.Listener 
                 @Override
                 public void onServiceState(String state, boolean error) {
                     setMessage(state, error);
-                    if (state.contains("已停止") || state.contains("未启动")) {
-                        phoneLocationStarting = false;
-                        getPreferences(MODE_PRIVATE).edit().putBoolean("continuous_location", false).apply();
-                        settingContinuousSwitch = true;
-                        continuousLocation.setChecked(false);
-                        settingContinuousSwitch = false;
-                    }
+                    if (state.contains("已停止") || state.contains("未启动")) phoneLocationStarting = false;
                 }
             });
             phoneLocationService.setLocationWriter(new PhoneLocationService.LocationWriter() {
                 @Override
                 public boolean isReady() {
+                    return (bleReady && bleLocationAvailable) || (apFallback && deviceHotspotVerified);
+                }
+
+                @Override
+                public boolean isBleReady() {
                     return bleReady && bleLocationAvailable;
                 }
 
                 @Override
                 public void write(Location location, PhoneLocationService.ResultCallback callback) {
-                    bleManager.writeLocation(location, new BleManager.Callback() {
-                        @Override
-                        public void onSuccess() { callback.onResult(true, ""); }
-                        @Override
-                        public void onError(String error) { callback.onResult(false, error); }
-                    });
+                    if (bleReady && bleLocationAvailable) {
+                        bleManager.writeLocation(location, new BleManager.Callback() {
+                            @Override public void onSuccess() { callback.onResult(true, ""); }
+                            @Override public void onError(String error) {
+                                if (apFallback && deviceHotspotVerified) {
+                                    postLiveLocationOverWifi(location, callback);
+                                } else {
+                                    callback.onResult(false, error);
+                                }
+                            }
+                        });
+                        return;
+                    }
+                    if (!apFallback || !deviceHotspotVerified) {
+                        callback.onResult(false, "BLE 未连接且 AP 回退未启用");
+                        return;
+                    }
+                    postLiveLocationOverWifi(location, callback);
                 }
             });
             phoneLocationService.setBleConnected(bleReady && bleLocationAvailable);
+            phoneLocationService.configure(phoneContinuous || phonePush, phoneContinuous || phonePush,
+                    phonePush, phoneLocationIntervalSeconds);
         }
 
         @Override
@@ -747,11 +1064,29 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         }
     };
 
+    private void postLiveLocationOverWifi(Location location,
+                                          PhoneLocationService.ResultCallback callback) {
+        if (!apFallback || !deviceHotspotVerified) {
+            callback.onResult(false, "设备 AP 回退未启用或热点未验证");
+            return;
+        }
+        long timestamp = location.getTime() > 0 ? location.getTime() : System.currentTimeMillis();
+        double accuracy = location.hasAccuracy() ? location.getAccuracy() : 0;
+        wifiClient.postLiveLocation(DEVICE_ADDRESS, location.getLatitude(), location.getLongitude(),
+                accuracy, timestamp, System.currentTimeMillis(), new WifiClient.Callback() {
+                    @Override public void onSuccess(String ignored) { callback.onResult(true, ""); }
+                    @Override public void onError(String error, Throwable cause) { callback.onResult(false, error); }
+                });
+    }
+
     private void setContinuousLocation(boolean enabled) {
-        if (settingContinuousSwitch) return;
-        if (!enabled) {
+        phoneContinuous = enabled;
+        updateLocationService();
+    }
+
+    private void updateLocationService() {
+        if (!phoneContinuous && !phonePush) {
             phoneLocationStarting = false;
-            getPreferences(MODE_PRIVATE).edit().putBoolean("continuous_location", false).apply();
             stopPhoneLocationService();
             return;
         }
@@ -771,25 +1106,21 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             return;
         }
         if (!bleReady || !bleLocationAvailable) {
-            getPreferences(MODE_PRIVATE).edit().putBoolean("continuous_location", true).apply();
             requestBlePermissionsThenConnect();
-            setMessage("正在连接 BLE，连接成功后开始持续定位。", false);
-            return;
         }
         startPhoneLocationService();
     }
 
     private void startPhoneLocationService() {
-        if (!bleReady || !bleLocationAvailable) {
-            phoneLocationStarting = true;
-            if (bleReconnect == null) requestBlePermissionsThenConnect();
-            return;
-        }
         Intent intent = new Intent(this, PhoneLocationService.class).setAction(PhoneLocationService.ACTION_START);
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent);
             else startService(intent);
             phoneLocationBound = bindService(intent, phoneLocationConnection, Context.BIND_AUTO_CREATE);
+            if (phoneLocationBound && phoneLocationService != null) {
+                phoneLocationService.configure(phoneContinuous || phonePush, phoneContinuous || phonePush,
+                        phonePush, phoneLocationIntervalSeconds);
+            }
             phoneLocationStarting = true;
             getPreferences(MODE_PRIVATE).edit().putBoolean("continuous_location", true).apply();
             setMessage("持续定位服务已启动。", false);
@@ -823,7 +1154,6 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         locationBusy = true;
         bestLocation = cached;
         locationStatus.setText("正在通过 Android 定位服务获取…");
-        getLocationButton.setEnabled(false);
         locationTimeout = () -> finishLocationRequest();
         main.postDelayed(locationTimeout, LOCATION_TIMEOUT_MS);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -955,7 +1285,6 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         }
         locationBusy = false;
         stopLocationRequest();
-        getLocationButton.setEnabled(true);
         if (bestLocation != null) {
             currentLocation = new Location(bestLocation);
             showLocation(currentLocation, "已获取手机位置");
@@ -963,6 +1292,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         } else {
             locationStatus.setText("没有获取到位置");
             setMessage("未获取到手机位置。请确认系统定位已开启并允许精确位置。", true);
+            if (phoneContinuous || phonePush) updateLocationService();
         }
     }
 
@@ -1002,127 +1332,167 @@ public final class MainActivity extends Activity implements BleManager.Listener 
                 location.getLatitude(), location.getLongitude()));
         accuracy.setText("精度 " + (location.hasAccuracy() ? Math.round(location.getAccuracy()) + " m" : "未知"));
         currentLocation = new Location(location);
+        updateLocalPhoneStatus();
         refreshControls();
-    }
-
-    private void writeLocation() {
-        if (currentLocation == null) {
-            setMessage("请先获取手机位置。", true);
-            return;
-        }
-        long age = System.currentTimeMillis() - currentLocation.getTime();
-        if (age < 0 || age > 60_000L) {
-            currentLocation = null;
-            refreshControls();
-            setMessage("位置数据已过期，请重新获取。", true);
-            return;
-        }
-        if (bleReady && bleLocationAvailable) {
-            setMessage("正在通过 BLE 写入 FrameNav…", false);
-            bleManager.writeLocation(currentLocation, new BleManager.Callback() {
-                @Override
-                public void onSuccess() {
-                    setMessage("手机位置已通过 BLE 写入设备。", false);
-                    refreshDeviceStatus();
-                }
-
-                @Override
-                public void onError(String error) {
-                    setMessage(error, true);
-                }
-            });
-            return;
-        }
-        writeLocationWifi();
-    }
-
-    private void writeLocationWifi() {
-        long timestamp = currentLocation.getTime() > 0 ? currentLocation.getTime() : System.currentTimeMillis();
-        double accuracyMeters = currentLocation.hasAccuracy() ? currentLocation.getAccuracy() : 0;
-        setMessage("正在通过 Wi-Fi REST 写入位置…", false);
-        wifiClient.postLocation(deviceIp.getText().toString(), currentLocation.getLatitude(),
-                currentLocation.getLongitude(), accuracyMeters, timestamp,
-                System.currentTimeMillis(), new WifiClient.Callback() {
-                    @Override
-                    public void onSuccess(String response) {
-                        setMessage(response.trim().isEmpty() ? "手机位置已通过 Wi-Fi 写入设备。" : response.trim(), false);
-                        refreshDeviceStatus();
-                    }
-
-                    @Override
-                    public void onError(String error, Throwable cause) {
-                        setMessage(error + "。确认已连接设备热点并检查设备 IP。", true);
-                    }
-                });
-    }
-
-    private void clearLocation() {
-        rememberDeviceIp();
-        wifiClient.clearLocation(deviceIp.getText().toString(), new WifiClient.Callback() {
-                @Override
-                public void onSuccess(String response) {
-                    setMessage(response.trim().isEmpty() ? "设备中的手机位置已清除。" : response.trim(), false);
-                    refreshDeviceStatus();
-                }
-
-                @Override
-                public void onError(String error, Throwable cause) {
-                    setMessage(error + "。确认已连接设备热点并检查设备 IP。", true);
-                }
-            });
+        if (!startupLocationRequested) startupLocationRequested = true;
+        if ((phoneContinuous || phonePush) && !phoneLocationStarting) updateLocationService();
     }
 
     private void readConfig() {
-        readConfigButton.setEnabled(false);
-        rememberDeviceIp();
-        setMessage("正在通过设备 IP 读取配置…", false);
-        wifiClient.getConfigurationPage(deviceIp.getText().toString(), new WifiClient.Callback() {
-            @Override public void onSuccess(String jsonText) {
-                try {
-                    JSONObject json = new JSONObject(jsonText);
-                    Map<String, String> values = new LinkedHashMap<>();
-                    java.util.Iterator<String> keys = json.keys();
-                    while (keys.hasNext()) {
-                        String key = keys.next();
-                        Object value = json.opt(key);
-                        if (value != null && value != JSONObject.NULL) values.put(key, String.valueOf(value));
-                    }
-                    applyDeviceConfig(values);
-                    refreshDeviceStatus();
-                    refreshStorageStatus();
-                    setMessage("设备配置已读取。", false);
-                } catch (Exception error) {
-                    setMessage("设备配置响应无法解析。", true);
-                }
-                readConfigButton.setEnabled(true);
+        readConfigOverBle();
+    }
+
+    private void readConfigOverBle() {
+        if (!bleReady || !bleConfigAvailable || configEditable) return;
+        bleManager.readConfig(new BleManager.ConfigCallback() {
+            @Override public void onSuccess(Map<String, String> values) {
+                applyDeviceConfig(values);
+                setMessage("已通过 BLE 同步设备配置。", false);
             }
-            @Override public void onError(String error, Throwable cause) {
-                readConfigButton.setEnabled(true);
-                setMessage(error + "。请连接设备热点并确认 IP 地址。", true);
+            @Override public void onError(String error) {
+                if (configEditable) return;
+                setMessage("BLE 配置读取失败：" + error, true);
             }
         });
     }
 
+    private void applyTelemetry(JSONObject json) {
+        String active = json.optString("activeSource", json.optString("active_source", "none"));
+        String activeLabel = "gnss".equals(active) ? "GNSS 定位" : "phone".equals(active)
+                ? "手机定位" : "manual".equals(active) ? "手动设置" : "无有效来源";
+        activeSourceBadge.setText("当前使用：" + activeLabel);
+        deviceStatus.setText("设备状态：" + json.optString("status", "BLE 实时遥测"));
+        JSONObject gnss = json.optJSONObject("gnss");
+        JSONObject phone = json.optJSONObject("phone");
+        JSONObject manual = json.optJSONObject("manual");
+        gnssSourceStatus.setText("GNSS 定位  " + sourceCoordinates(gnss)
+                + "\n搜星 " + numberField(gnss, "satellitesVisible", "satellites_visible")
+                + " · 使用 " + numberField(gnss, "satellitesUsed", "satellites_used")
+                + " · " + stringField(gnss, "searchState", "search_state", "—"));
+        phoneSourceStatus.setText("手机定位  " + sourceCoordinates(phone)
+                + "\n精度 " + (phone != null && phone.has("accuracy") ? phone.optString("accuracy") + " m" : "—")
+                + " · 推送 " + (phonePush ? "已开启" : "已关闭")
+                + "\n获取时间 " + formatTimestamp(phone, "updatedAt", "updated_at")
+                + " · 剩余有效期 " + formatRemaining(phone, "remainingSeconds", "remaining_seconds"));
+        manualSourceStatus.setText("手动设置  " + sourceCoordinates(manual)
+                + "\n设置时间 " + formatTimestamp(manual, "updatedAt", "updated_at")
+                + " · 剩余有效期 " + formatRemaining(manual, "remainingSeconds", "remaining_seconds"));
+        tintSource(gnssSourceStatus, "gnss".equals(active));
+        tintSource(phoneSourceStatus, "phone".equals(active));
+        tintSource(manualSourceStatus, "manual".equals(active));
+        if (phone != null && phone.optBoolean("valid", false)) {
+            currentLocation = new Location("device");
+            currentLocation.setLatitude(phone.optDouble("latitude"));
+            currentLocation.setLongitude(phone.optDouble("longitude"));
+            currentLocation.setTime(System.currentTimeMillis());
+            if (phone.has("accuracy")) currentLocation.setAccuracy((float) phone.optDouble("accuracy"));
+        }
+        JSONObject storage = json.optJSONObject("storage");
+        if (storage != null) {
+            if (storage.optBoolean("available", false)) {
+                storageStatus.setText("轨迹 " + storage.optLong("record_count", 0)
+                        + " 条 · 已用 " + formatBytes(storage.optLong("used_bytes", 0))
+                        + " / " + formatBytes(storage.optLong("capacity_bytes", 0)));
+            } else storageStatus.setText("轨迹存储不可用");
+        }
+    }
+
+    private String sourceCoordinates(JSONObject source) {
+        if (source == null || !source.optBoolean("valid", false)) return "无有效定位";
+        return String.format(java.util.Locale.US, "%.6f, %.6f",
+                source.optDouble("latitude"), source.optDouble("longitude"));
+    }
+
+    private String numberField(JSONObject json, String camel, String snake) {
+        if (json == null) return "—";
+        return json.has(camel) ? Integer.toString(json.optInt(camel))
+                : json.has(snake) ? Integer.toString(json.optInt(snake)) : "—";
+    }
+
+    private String stringField(JSONObject json, String camel, String snake, String fallback) {
+        if (json == null) return fallback;
+        return json.optString(camel, json.optString(snake, fallback));
+    }
+
+    private String formatTimestamp(JSONObject json, String camel, String snake) {
+        if (json == null) return "—";
+        Object raw = json.has(camel) ? json.opt(camel) : json.opt(snake);
+        if (!(raw instanceof Number)) return raw == null || raw == JSONObject.NULL ? "—" : String.valueOf(raw);
+        long timestamp = ((Number) raw).longValue();
+        if (timestamp <= 0) return "—";
+        if (timestamp < 100_000_000_000L) timestamp *= 1000L;
+        return new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault())
+                .format(new java.util.Date(timestamp));
+    }
+
+    private String formatRemaining(JSONObject json, String camel, String snake) {
+        if (json == null) return "—";
+        long seconds = json.has(camel) ? json.optLong(camel, -1) : json.optLong(snake, -1);
+        if (seconds < 0) return "—";
+        if (seconds == 0) return "已过期";
+        if (seconds < 60) return seconds + " 秒";
+        if (seconds < 3600) return ((seconds + 59) / 60) + " 分钟";
+        return (seconds / 3600) + " 小时 " + ((seconds / 60) % 60) + " 分钟";
+    }
+
+    private void tintSource(TextView view, boolean active) {
+        view.setTextColor(active ? 0xFF28704A : 0xFF53625A);
+        view.setTypeface(Typeface.DEFAULT, active ? Typeface.BOLD : Typeface.NORMAL);
+    }
+
     private void applyDeviceConfig(Map<String, String> values) {
+        if (configEditable) return;
+        updatingConfigControls = true;
         setIfPresent(cameraName, values, "cam_name");
         setIfPresent(cameraMac, values, "cam_mac");
         setIfPresent(stationSsid, values, "wifi_ssid");
         selectValue(timezone, TIMEZONE_VALUES, values.get("tz"));
         selectValue(dstOffset, DST_VALUES, values.get("dst"));
-        setIfPresent(locationTtl, values, "phone_ttl_h");
-        setIfPresent(gpsAge, values, "max_gps_age");
-        selectSpinner(fixedPriority, values.get("fixed_prio"));
-        selectSpinner(fixedDelete, values.get("fixed_delete"));
-        selectSpinner(gnssIdle, values.get("gnss_idle"));
-        selectSpinner(trackIdle, values.get("track_idle"));
+        sourceGnss = configBoolean(values, "source_gnss", true);
+        sourcePhone = configBoolean(values, "source_phone", true);
+        sourceManual = configBoolean(values, "source_manual", true);
+        trackingEnabled = configBoolean(values, "track_enabled", true);
+        phonePush = configBoolean(values, "phone_push_enabled", true);
+        manualLocationEnabled = configBoolean(values, "manual_auto_update", true);
+        phoneContinuous = manualLocationEnabled;
+        gnssIdle.setChecked(configBoolean(values, "gnss_idle", false));
+        trackIdle.setChecked(configBoolean(values, "track_idle", false));
+        trackEnabled.setChecked(trackingEnabled);
+        phonePushEnabled.setChecked(phonePush);
+        manualEnabled.setChecked(manualLocationEnabled);
+        setIfPresent(manualLatitude, values, "manual_lat");
+        setIfPresent(manualLongitude, values, "manual_lon");
+        String order = values.get("source_order");
+        if (order != null) {
+            locationOrder.clear();
+            for (String part : order.split(",")) {
+                String id = part.trim().toLowerCase(java.util.Locale.ROOT);
+                if (("gnss".equals(id) || "phone".equals(id) || "manual".equals(id)) && !locationOrder.contains(id)) locationOrder.add(id);
+            }
+            for (String id : new String[]{"gnss", "phone", "manual"}) if (!locationOrder.contains(id)) locationOrder.add(id);
+            rebuildSourceRows();
+        }
         setIfPresent(trackInterval, values, "track_int_s");
+        setIfPresent(phoneInterval, values, "phone_interval_s");
+        phoneLocationIntervalSeconds = parseInt(phoneInterval, 5);
         selectSpinner(bluetoothMode, values.get("ble_mode"));
         setIfPresent(bluetoothBoot, values, "ble_boot");
         setIfPresent(bluetoothPeriod, values, "ble_period");
         setIfPresent(bluetoothWindow, values, "ble_window");
         selectSpinner(wifiIdle, "900".equals(values.get("wifi_idle_s")) ? "1" : "0");
+        for (String id : sourceChecks.keySet()) {
+            sourceChecks.get(id).setChecked("gnss".equals(id) ? sourceGnss : "phone".equals(id) ? sourcePhone : sourceManual);
+        }
         stationPassword.setText("");
         stationPassword.setHint("留空保持设备当前密码");
+        updatingConfigControls = false;
+        updateLocationService();
+    }
+
+    private static boolean configBoolean(Map<String, String> values, String key, boolean fallback) {
+        String value = values.get(key);
+        if (value == null) return fallback;
+        return "1".equals(value) || "true".equalsIgnoreCase(value) || "on".equalsIgnoreCase(value);
     }
 
     private void setIfPresent(EditText input, Map<String, String> values, String key) {
@@ -1141,12 +1511,16 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             put(values, "dst", Integer.toString(DST_VALUES[dstOffset.getSelectedItemPosition()]));
             put(values, "wifi_ssid", value(stationSsid));
             putIfNotEmpty(values, "wifi_pass", stationPassword);
-            put(values, "phone_ttl_h", range(locationTtl, "位置有效期", 1, 720));
-            put(values, "max_gps_age", range(gpsAge, "卫星位置最大年龄", 0, 86400));
-            put(values, "fixed_prio", Integer.toString(fixedPriority.getSelectedItemPosition()));
-            put(values, "fixed_delete", Integer.toString(fixedDelete.getSelectedItemPosition()));
-            put(values, "gnss_idle", Integer.toString(gnssIdle.getSelectedItemPosition()));
-            put(values, "track_idle", Integer.toString(trackIdle.getSelectedItemPosition()));
+            put(values, "source_order", join(locationOrder));
+            put(values, "source_gnss", sourceGnss ? "1" : "0");
+            put(values, "source_phone", sourcePhone ? "1" : "0");
+            put(values, "source_manual", sourceManual ? "1" : "0");
+            put(values, "track_enabled", trackEnabled.isChecked() ? "1" : "0");
+            put(values, "manual_auto_update", manualEnabled.isChecked() ? "1" : "0");
+            put(values, "phone_push_enabled", phonePushEnabled.isChecked() ? "1" : "0");
+            put(values, "phone_interval_s", range(phoneInterval, "手机定位获取频率", 1, 3600));
+            put(values, "gnss_idle", gnssIdle.isChecked() ? "1" : "0");
+            put(values, "track_idle", trackIdle.isChecked() ? "1" : "0");
             put(values, "track_int_s", range(trackInterval, "轨迹记录间隔", 1, 3600));
             put(values, "ble_mode", Integer.toString(bluetoothMode.getSelectedItemPosition()));
             put(values, "ble_boot", range(bluetoothBoot, "快速扫描秒数", 0, 300));
@@ -1157,28 +1531,46 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             setMessage(error.getMessage(), true);
             return;
         }
-        rememberDeviceIp();
-        setMessage("正在通过 HTTP IP 保存设备配置…", false);
-        saveConfigButton.setEnabled(false);
-        wifiClient.saveConfig(deviceIp.getText().toString(), values, new WifiClient.Callback() {
+        if (!deviceHotspotVerified) {
+            afterHotspotConnected = this::saveConfig;
+            setMessage("连接 FrameNav 设备热点后会继续保存配置。", false);
+            wakeDeviceWifi();
+            return;
+        }
+        setMessage("正在通过固定 IP 保存设备配置…", false);
+        if (saveConnectionButton != null) saveConnectionButton.setEnabled(false);
+        if (saveLocationButton != null) saveLocationButton.setEnabled(false);
+        wifiClient.saveConfig(DEVICE_ADDRESS, values, new WifiClient.Callback() {
             @Override
             public void onSuccess(String response) {
-                saveConfigButton.setEnabled(true);
+                if (saveConnectionButton != null) saveConnectionButton.setEnabled(true);
+                if (saveLocationButton != null) saveLocationButton.setEnabled(true);
                 setMessage("设备配置已保存。", false);
-                refreshDeviceStatus();
-                refreshStorageStatus();
+                configEditable = false;
+                setConfigEditable(false);
+                readConfigOverBle();
             }
 
             @Override
             public void onError(String error, Throwable cause) {
-                saveConfigButton.setEnabled(true);
-                setMessage(error + "。请连接设备热点并确认 IP 地址。", true);
+                if (saveConnectionButton != null) saveConnectionButton.setEnabled(true);
+                if (saveLocationButton != null) saveLocationButton.setEnabled(true);
+                setMessage(error + "。请连接 FrameNav 设备热点后重试。", true);
             }
         });
     }
 
     private static void put(Map<String, String> values, String key, String value) {
         values.put(key, value == null ? "" : value);
+    }
+
+    private static String join(List<String> values) {
+        StringBuilder result = new StringBuilder();
+        for (String value : values) {
+            if (result.length() > 0) result.append(',');
+            result.append(value);
+        }
+        return result.toString();
     }
 
     private void selectSpinner(Spinner spinner, String value) {
@@ -1195,28 +1587,8 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         } catch (NumberFormatException ignored) { }
     }
 
-    private void rememberDeviceIp() {
-        getPreferences(MODE_PRIVATE).edit().putString("device_ip", value(deviceIp)).apply();
-    }
-
     private void refreshStorageStatus() {
-        wifiClient.getStorage(deviceIp.getText().toString(), new WifiClient.Callback() {
-            @Override public void onSuccess(String response) {
-                try {
-                    JSONObject json = new JSONObject(response);
-                    if (!json.optBoolean("available", false)) {
-                        storageStatus.setText("轨迹存储：不可用");
-                        return;
-                    }
-                    storageStatus.setText("轨迹 " + json.optLong("record_count", 0)
-                            + " 条 · 已用 " + formatBytes(json.optLong("used_bytes", 0))
-                            + " / " + formatBytes(json.optLong("capacity_bytes", 0)));
-                } catch (Exception ignored) { storageStatus.setText("轨迹存储：读取失败"); }
-            }
-            @Override public void onError(String error, Throwable cause) {
-                storageStatus.setText("轨迹存储：读取失败");
-            }
-        });
+        refreshDeviceStatus();
     }
 
     private static String formatBytes(long bytes) {
@@ -1238,17 +1610,68 @@ public final class MainActivity extends Activity implements BleManager.Listener 
             setMessage("请输入有效的纬度和经度。", true);
             return;
         }
+        if (!deviceHotspotVerified) {
+            afterHotspotConnected = this::saveManualLocation;
+            wakeDeviceWifi();
+            return;
+        }
         long now = System.currentTimeMillis();
-        wifiClient.postLocation(deviceIp.getText().toString(), latitude, longitude, 0, now, now,
+        wifiClient.postManualLocation(DEVICE_ADDRESS, latitude, longitude, now, now,
                 new WifiClient.Callback() {
                     @Override public void onSuccess(String response) {
                         setMessage(response.trim().isEmpty() ? "固定位置已保存。" : response.trim(), false);
                         refreshDeviceStatus();
                     }
                     @Override public void onError(String error, Throwable cause) {
-                        setMessage(error + "。固定坐标需要通过设备 IP 保存。", true);
+                        setMessage(error + "。请连接 FrameNav 设备热点后重试。", true);
+                        openWifiSettings();
                     }
                 });
+    }
+
+    private void clearManualLocation() {
+        if (!deviceHotspotVerified) {
+            afterHotspotConnected = this::clearManualLocation;
+            wakeDeviceWifi();
+            return;
+        }
+        wifiClient.clearManualLocation(DEVICE_ADDRESS, new WifiClient.Callback() {
+            @Override public void onSuccess(String response) {
+                setMessage(response.trim().isEmpty() ? "手动兜底位置已清除。" : response.trim(), false);
+                refreshDeviceStatus();
+            }
+            @Override public void onError(String error, Throwable cause) {
+                setMessage(error + "。请连接 FrameNav 设备热点。", true);
+            }
+        });
+    }
+
+    private void fillManualFromPhone() {
+        if (currentLocation == null) {
+            setMessage("正在等待手机定位…", false);
+            requestLocationPermissionsThenLocate();
+            return;
+        }
+        manualLatitude.setText(String.format(java.util.Locale.US, "%.7f", currentLocation.getLatitude()));
+        manualLongitude.setText(String.format(java.util.Locale.US, "%.7f", currentLocation.getLongitude()));
+        setMessage("已填入当前手机位置，请保存手动位置。", false);
+    }
+
+    private void updateLocalPhoneStatus() {
+        if (phoneSourceStatus == null) return;
+        if (currentLocation == null) {
+            phoneSourceStatus.setText("手机定位  等待获取");
+            return;
+        }
+        String coordinates = String.format(java.util.Locale.US, "%.6f, %.6f",
+                currentLocation.getLatitude(), currentLocation.getLongitude());
+        String accuracyText = currentLocation.hasAccuracy()
+                ? Math.round(currentLocation.getAccuracy()) + " m" : "未知";
+        String timeText = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss",
+                java.util.Locale.getDefault()).format(new java.util.Date(currentLocation.getTime()));
+        phoneSourceStatus.setText("手机定位  " + coordinates + "\n精度 " + accuracyText
+                + " · 推送 " + (phonePush ? "已开启" : "已关闭")
+                + "\n获取时间 " + timeText + " · 设备有效期等待 BLE 遥测");
     }
 
     private String number(EditText field, String label, int min, int max) {
@@ -1304,40 +1727,12 @@ public final class MainActivity extends Activity implements BleManager.Listener 
     }
 
     private void refreshDeviceStatus() {
-        wifiClient.getStatus(deviceIp.getText().toString(), new WifiClient.Callback() {
-            @Override
-            public void onSuccess(String response) {
-                try {
-                    JSONObject json = new JSONObject(response);
-                    String status = json.optString("status", "未知");
-                    String phoneStatus = json.optString("phoneStatus", "");
-                    String source = json.optString("source", "—");
-                    String position = json.optString("coordinates", "—");
-                    String time = json.optString("time", "—");
-                    deviceStatus.setText("设备定位：" + status + (phoneStatus.isEmpty() ? "" : " · 固定位置 " + phoneStatus));
-                    deviceLocation.setText("来源：" + source + "\n坐标：" + position + "\n时间：" + time
-                            + "\n搜到卫星：" + json.optInt("satellitesVisible", 0)
-                            + " · 使用：" + json.optInt("satellites", 0)
-                            + " · GNSS：" + json.optString("gnss", "—"));
-                    if ("—".equals(position)) locationStatus.setText("设备位置：" + status);
-                } catch (Exception ignored) {
-                    // A successful write already confirms the primary action.
-                }
-            }
-
-            @Override
-            public void onError(String error, Throwable cause) {
-                // Status polling is supplementary; don't overwrite a successful write.
-            }
-        });
+        if (bleReady) bleManager.readTelemetry(this::applyTelemetry);
     }
 
     private void refreshControls() {
-        boolean canWrite = currentLocation != null;
-        writeLocationButton.setEnabled(canWrite);
-        clearLocationButton.setEnabled(true);
-        readConfigButton.setEnabled(true);
-        saveConfigButton.setEnabled(true);
+        if (saveConnectionButton != null) saveConnectionButton.setEnabled(true);
+        if (saveLocationButton != null) saveLocationButton.setEnabled(true);
         connectBleButton.setEnabled(!bleReady);
     }
 
@@ -1371,7 +1766,14 @@ public final class MainActivity extends Activity implements BleManager.Listener 
         if (locationAvailable) setMessage("BLE 定位已连接。配置读写通过设备 IP 完成。", false);
         else setMessage("BLE 已连接，但定位写入服务不可用。", true);
         if (phoneLocationService != null) phoneLocationService.setBleConnected(locationAvailable);
-        if (phoneLocationStarting && phoneLocationService == null) startPhoneLocationService();
+        if ((phoneContinuous || phonePush) && phoneLocationService == null) startPhoneLocationService();
+        if (bleConfigAvailable) readConfigOverBle();
+        if (bleReady) {
+            main.removeCallbacks(configPoll);
+            bleManager.readTelemetry(this::applyTelemetry);
+            main.postDelayed(configPoll, 30_000L);
+            if (pendingHotspotWorkflow) wakeDeviceWifi();
+        }
         refreshControls();
     }
 
@@ -1389,6 +1791,7 @@ public final class MainActivity extends Activity implements BleManager.Listener 
 
     @Override
     public void onBleDisconnected() {
+        main.removeCallbacks(configPoll);
         bleReady = false;
         bleLocationAvailable = false;
         bleConfigAvailable = false;

@@ -3,7 +3,12 @@
 
 #include "gps.h"
 
-typedef enum { LOCATION_NONE, LOCATION_GNSS, LOCATION_PHONE } location_source_t;
+typedef enum {
+  LOCATION_NONE,
+  LOCATION_GNSS,
+  LOCATION_PHONE,
+  LOCATION_MANUAL,
+} location_source_t;
 
 typedef struct {
   bool present;
@@ -14,6 +19,14 @@ typedef struct {
   uint32_t remaining_s;
 } phone_location_status_t;
 
+typedef struct {
+  bool present;
+  bool available;
+  double latitude, longitude, accuracy_m;
+  uint64_t captured_ms;
+  uint32_t remaining_s;
+} live_location_status_t;
+
 void location_service_init(app_config_t *cfg);
 bool location_service_get(gps_fix_t *fix);
 bool location_service_details(gps_fix_t *fix, location_source_t *source,
@@ -23,6 +36,14 @@ bool location_service_details(gps_fix_t *fix, location_source_t *source,
 bool location_service_set_phone(double latitude, double longitude,
                                  double accuracy_m, uint64_t captured_ms,
                                  uint64_t phone_now_ms);
+bool location_service_set_live_phone(double latitude, double longitude,
+                                     double accuracy_m, uint64_t captured_ms,
+                                     uint64_t phone_now_ms);
+bool location_service_set_manual(double latitude, double longitude,
+                                 uint64_t phone_now_ms);
+void location_service_manual_status(phone_location_status_t *out);
+void location_service_live_status(live_location_status_t *out);
+bool location_service_clear_manual(void);
 /* Refresh the persisted fixed-location clock with the phone's current time.
  * This lets the device account for time spent powered off without an RTC. */
 bool location_service_sync_phone_clock(uint64_t phone_now_ms);

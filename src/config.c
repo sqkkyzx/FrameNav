@@ -70,6 +70,29 @@ static void config_terminate_str(char *dst, size_t dst_len)
   }
 }
 
+static bool source_order_is_valid(const char *order)
+{
+  if (!order || !order[0]) return false;
+  char copy[sizeof(((app_config_t *)0)->source_order)];
+  config_set_str_default(copy, sizeof(copy), order);
+  bool seen_gnss = false, seen_phone = false, seen_manual = false;
+  char *cursor = copy;
+  unsigned count = 0;
+  while (*cursor)
+  {
+    char *end = strchr(cursor, ',');
+    if (end) *end = '\0';
+    if (strcmp(cursor, "gnss") == 0 && !seen_gnss) seen_gnss = true;
+    else if (strcmp(cursor, "phone") == 0 && !seen_phone) seen_phone = true;
+    else if (strcmp(cursor, "manual") == 0 && !seen_manual) seen_manual = true;
+    else return false;
+    ++count;
+    if (!end) break;
+    cursor = end + 1;
+  }
+  return count == 3 && seen_gnss && seen_phone && seen_manual;
+}
+
 void config_set_defaults(app_config_t *cfg)
 {
   memset(cfg, 0, sizeof(*cfg));
@@ -98,6 +121,15 @@ void config_set_defaults(app_config_t *cfg)
   cfg->gnss_without_camera = 0;
   cfg->record_without_camera = 0;
   cfg->track_interval_s = LOCATION_RECORD_INTERVAL_DEFAULT_S;
+  cfg->source_gnss_enabled = 1;
+  cfg->source_phone_enabled = 1;
+  cfg->source_manual_enabled = 1;
+  config_set_str_default(cfg->source_order, sizeof(cfg->source_order),
+                         "gnss,phone,manual");
+  cfg->track_enabled = 1;
+  cfg->phone_push_enabled = 1;
+  cfg->phone_interval_s = 5;
+  cfg->manual_auto_update = 1;
 #ifdef ALPHALOC_DEFAULT_CAMERA_NAME_PREFIX
   config_set_str_default(cfg->camera_name_prefix,
                          sizeof(cfg->camera_name_prefix),
@@ -256,6 +288,17 @@ void config_validate(app_config_t *cfg)
       cfg->track_interval_s > LOCATION_RECORD_INTERVAL_MAX_S) {
     cfg->track_interval_s = defaults.track_interval_s;
   }
+  if (cfg->source_gnss_enabled > 1) cfg->source_gnss_enabled = defaults.source_gnss_enabled;
+  if (cfg->source_phone_enabled > 1) cfg->source_phone_enabled = defaults.source_phone_enabled;
+  if (cfg->source_manual_enabled > 1) cfg->source_manual_enabled = defaults.source_manual_enabled;
+  if (cfg->track_enabled > 1) cfg->track_enabled = defaults.track_enabled;
+  if (cfg->phone_push_enabled > 1) cfg->phone_push_enabled = defaults.phone_push_enabled;
+  if (cfg->manual_auto_update > 1) cfg->manual_auto_update = defaults.manual_auto_update;
+  if (cfg->phone_interval_s < 1 || cfg->phone_interval_s > 3600)
+    cfg->phone_interval_s = defaults.phone_interval_s;
+  config_terminate_str(cfg->source_order, sizeof(cfg->source_order));
+  if (!source_order_is_valid(cfg->source_order))
+    config_set_str_default(cfg->source_order, sizeof(cfg->source_order), defaults.source_order);
 
 }
 
@@ -308,6 +351,14 @@ bool config_load(app_config_t *cfg)
   nvs_get_u8(nvs, "gnss_idle", &cfg->gnss_without_camera);
   nvs_get_u8(nvs, "track_idle", &cfg->record_without_camera);
   nvs_get_u32(nvs, "track_int_s", &cfg->track_interval_s);
+  nvs_get_u8(nvs, "src_gnss", &cfg->source_gnss_enabled);
+  nvs_get_u8(nvs, "src_phone", &cfg->source_phone_enabled);
+  nvs_get_u8(nvs, "src_manual", &cfg->source_manual_enabled);
+  nvs_get_u8(nvs, "track_on", &cfg->track_enabled);
+  nvs_get_u8(nvs, "phone_push", &cfg->phone_push_enabled);
+  nvs_get_u32(nvs, "phone_int", &cfg->phone_interval_s);
+  nvs_get_u8(nvs, "manual_auto", &cfg->manual_auto_update);
+  config_read_str(nvs, "src_order", cfg->source_order, sizeof(cfg->source_order));
   int16_t tz = cfg->tz_offset_min;
   int16_t dst = cfg->dst_offset_min;
   uint16_t old_tz = 0;
@@ -380,6 +431,14 @@ static bool config_save_unlocked(const app_config_t *cfg)
   if (err == ESP_OK) err = nvs_set_u8(nvs, "gnss_idle", cfg->gnss_without_camera);
   if (err == ESP_OK) err = nvs_set_u8(nvs, "track_idle", cfg->record_without_camera);
   if (err == ESP_OK) err = nvs_set_u32(nvs, "track_int_s", cfg->track_interval_s);
+  if (err == ESP_OK) err = nvs_set_u8(nvs, "src_gnss", cfg->source_gnss_enabled);
+  if (err == ESP_OK) err = nvs_set_u8(nvs, "src_phone", cfg->source_phone_enabled);
+  if (err == ESP_OK) err = nvs_set_u8(nvs, "src_manual", cfg->source_manual_enabled);
+  if (err == ESP_OK) err = nvs_set_str(nvs, "src_order", cfg->source_order);
+  if (err == ESP_OK) err = nvs_set_u8(nvs, "track_on", cfg->track_enabled);
+  if (err == ESP_OK) err = nvs_set_u8(nvs, "phone_push", cfg->phone_push_enabled);
+  if (err == ESP_OK) err = nvs_set_u32(nvs, "phone_int", cfg->phone_interval_s);
+  if (err == ESP_OK) err = nvs_set_u8(nvs, "manual_auto", cfg->manual_auto_update);
   if (err == ESP_OK) {
     err = nvs_commit(nvs);
   }

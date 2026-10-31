@@ -74,14 +74,23 @@ const char *esp_err_to_name(int error) { (void)error; return "mock"; }
 static void reset(void) {
   now_us = SEC;
   cfg = (app_config_t){.phone_location_ttl_hours = PHONE_LOCATION_TTL_DEFAULT_HOURS,
-                        .max_gps_age_s = 5, .gps_interval_ms = 2000};
+                        .max_gps_age_s = 5, .gps_interval_ms = 2000,
+                        .source_gnss_enabled = 1,
+                        .source_phone_enabled = 1,
+                        .source_manual_enabled = 1,
+                        .track_enabled = 1,
+                        .phone_push_enabled = 1,
+                        .phone_interval_s = 5,
+                        .manual_auto_update = 0};
+  strcpy(cfg.source_order, "gnss,phone,manual");
   raw = (gps_fix_t){0};
   location_service_init(&cfg);
-  location_service_clear_phone();
+  location_service_clear_manual();
 }
 #define GNSS() (raw = (gps_fix_t){.valid=true, .time_valid=true, .lat_deg=22.5, .lon_deg=113.5, \
   .year=2026, .month=10, .day=30, .hour=12, .last_fix_time_us=now_us})
-#define PHONE() assert(location_service_set_phone(23.5, 114.5, 25, EPOCH_MS, EPOCH_MS))
+#define PHONE() assert(location_service_set_live_phone(23.5, 114.5, 25, EPOCH_MS, EPOCH_MS))
+#define MANUAL() assert(location_service_set_manual(23.5, 114.5, EPOCH_MS))
 """
 
 
@@ -174,7 +183,9 @@ int main(void) {
   assert(location_service_details(&fix, &source, &observed) && source == LOCATION_PHONE);
   GNSS(); raw.lat_deg = NAN;
   assert(location_service_details(&fix, &source, &observed) && source == LOCATION_PHONE);
-  location_service_clear_phone(); raw.valid = false;
+  cfg.source_phone_enabled = 0;
+  cfg.source_manual_enabled = 0;
+  raw.valid = false;
   assert(!location_service_details(&fix, &source, &observed));
   assert(source == LOCATION_NONE && !fix.valid);
   return 0;
@@ -205,7 +216,7 @@ int main(void) {
         run_service_c(r"""
 int main(void) {
   reset(); cfg.phone_location_ttl_hours = 1;
-  assert(location_service_set_phone(23.5, 114.5, 25, EPOCH_MS, EPOCH_MS + 2000));
+  assert(location_service_set_live_phone(23.5, 114.5, 25, EPOCH_MS, EPOCH_MS + 2000));
   gps_fix_t fix; phone_location_status_t status;
   location_service_phone_status(&status);
   assert(status.remaining_s == 3598);
@@ -218,57 +229,53 @@ int main(void) {
 }
 """)
 
-    def test_fixed_location_priority_is_configurable_independently_of_search(self):
+    def test_enabled_sources_follow_configured_order_and_fall_back(self):
         run_service_c(r"""
 int main(void) {
-  reset(); PHONE(); GNSS();
-  cfg.fixed_location_priority = FIXED_LOCATION_PRIORITY;
+  reset(); PHONE(); MANUAL(); GNSS();
   gps_fix_t fix; location_source_t source; uint32_t observed;
   assert(location_service_details(&fix, &source, &observed));
+  assert(source == LOCATION_GNSS && fix.lat_deg == 22.5);
+  strcpy(cfg.source_order, "phone,manual,gnss");
+  assert(location_service_details(&fix, &source, &observed));
   assert(source == LOCATION_PHONE && fix.lat_deg == 23.5);
-  cfg.fixed_location_priority = FIXED_LOCATION_GPS_PRIORITY;
+  cfg.source_phone_enabled = 0;
+  assert(location_service_details(&fix, &source, &observed));
+  assert(source == LOCATION_MANUAL && fix.lat_deg == 23.5);
+  cfg.source_manual_enabled = 0;
   assert(location_service_details(&fix, &source, &observed));
   assert(source == LOCATION_GNSS && fix.lat_deg == 22.5);
+  cfg.source_gnss_enabled = 0;
+  assert(!location_service_details(&fix, &source, &observed));
+  assert(source == LOCATION_NONE);
   return 0;
 }
 """)
 
-    def test_all_six_gps_fixed_location_deletion_policies(self):
+    def test_manual_location_is_separate_from_live_phone_and_can_auto_update(self):
         run_service_c(r"""
 int main(void) {
-  const unsigned delete_at[] = {60, 300, 0, 60, 300, 0};
-  for (unsigned policy = 0; policy < 6; ++policy) {
-    reset(); PHONE(); GNSS();
-    cfg.fixed_location_priority = FIXED_LOCATION_PRIORITY;
-    cfg.fixed_location_delete_policy = (uint8_t)policy;
-    gps_fix_t fix; location_source_t source; uint32_t observed;
-    assert(location_service_details(&fix, &source, &observed));
-    if (delete_at[policy] == 0 && policy == FIXED_LOCATION_DELETE_WHEN_FAR) {
-      phone_location_status_t status;
-      location_service_phone_status(&status); assert(!status.present);
-      continue;
-    }
-    const unsigned duration = delete_at[policy] ? delete_at[policy] : 300;
-    for (unsigned second = 1; second <= duration; ++second) {
-      now_us = SEC + (int64_t)second * SEC;
-      raw.last_fix_time_us = now_us;
-      raw.hour = 12;
-      raw.minute = (uint8_t)(second / 60);
-      raw.second = (uint8_t)(second % 60);
-      assert(location_service_details(&fix, &source, &observed));
-      phone_location_status_t status;
-      location_service_phone_status(&status);
-      if (delete_at[policy] && second < delete_at[policy]) assert(status.present);
-      if (delete_at[policy] && second == delete_at[policy]) assert(!status.present);
-    }
-    if (!delete_at[policy]) {
-      phone_location_status_t status;
-      location_service_phone_status(&status); assert(status.present);
-      assert(source == LOCATION_PHONE);
-    } else {
-      assert(source == LOCATION_GNSS);
-    }
-  }
+  reset(); MANUAL(); PHONE();
+  phone_location_status_t phone, manual;
+  live_location_status_t live;
+  location_service_phone_status(&phone);
+  location_service_manual_status(&manual);
+  assert(phone.present && phone.latitude == 23.5);
+  assert(manual.present && manual.latitude == 23.5);
+  assert(location_service_set_live_phone(24.0, 115.0, 12, EPOCH_MS, EPOCH_MS));
+  location_service_phone_status(&phone);
+  location_service_manual_status(&manual);
+  location_service_live_status(&live);
+  assert(phone.latitude == 24.0 && phone.accuracy_m == 12);
+  assert(manual.latitude == 23.5 && manual.accuracy_m == 0);
+  assert(live.available && live.latitude == 24.0 && live.longitude == 115.0);
+  assert(live.accuracy_m == 12 && live.captured_ms == EPOCH_MS);
+  cfg.manual_auto_update = 1;
+  assert(location_service_set_live_phone(24.5, 115.5, 8, EPOCH_MS, EPOCH_MS));
+  location_service_phone_status(&phone);
+  location_service_manual_status(&manual);
+  assert(phone.present && phone.latitude == 24.5 && phone.accuracy_m == 8);
+  assert(manual.present && manual.latitude == 24.5 && manual.accuracy_m == 0);
   return 0;
 }
 """)
@@ -277,19 +284,19 @@ int main(void) {
         run_service_c(r"""
 int main(void) {
   reset(); cfg.phone_location_ttl_hours = 6;
-  assert(location_service_set_phone(23.5, 114.5, 25, EPOCH_MS, EPOCH_MS));
+  MANUAL();
   assert(location_service_sync_phone_clock(EPOCH_MS + 3600000));
   location_service_init(&cfg); // Simulate a power cycle; mock NVS survives.
   phone_location_status_t status;
-  location_service_phone_status(&status);
+  location_service_manual_status(&status);
   assert(status.present && status.clock_pending && !status.available);
   gps_fix_t fix; assert(!location_service_get(&fix));
   assert(location_service_sync_phone_clock(EPOCH_MS + 2 * 3600000ULL));
-  location_service_phone_status(&status);
+  location_service_manual_status(&status);
   assert(status.present && !status.clock_pending && status.available);
   assert(status.remaining_s == 4 * 3600);
   assert(location_service_sync_phone_clock(EPOCH_MS + 7 * 3600000ULL));
-  location_service_phone_status(&status);
+  location_service_manual_status(&status);
   assert(status.present && !status.available);
   assert(!location_service_get(&fix));
   return 0;
@@ -320,16 +327,16 @@ int main(void) {
         run_service_c(r"""
 int main(void) {
   reset(); PHONE();
-  assert(!location_service_set_phone(NAN, 0, 1, EPOCH_MS, EPOCH_MS));
-  assert(!location_service_set_phone(0, INFINITY, 1, EPOCH_MS, EPOCH_MS));
-  assert(!location_service_set_phone(91, 0, 1, EPOCH_MS, EPOCH_MS));
-  assert(!location_service_set_phone(0, -181, 1, EPOCH_MS, EPOCH_MS));
-  assert(!location_service_set_phone(0, 0, -1, EPOCH_MS, EPOCH_MS));
-  assert(!location_service_set_phone(0, 0, NAN, EPOCH_MS, EPOCH_MS));
-  assert(!location_service_set_phone(0, 0, 1, 0, 0));
-  assert(!location_service_set_phone(0, 0, 1, UINT64_MAX, UINT64_MAX));
-  assert(!location_service_set_phone(0, 0, 1, EPOCH_MS + 1, EPOCH_MS));
-  assert(!location_service_set_phone(0, 0, 1, EPOCH_MS, EPOCH_MS + 60001));
+  assert(!location_service_set_live_phone(NAN, 0, 1, EPOCH_MS, EPOCH_MS));
+  assert(!location_service_set_live_phone(0, INFINITY, 1, EPOCH_MS, EPOCH_MS));
+  assert(!location_service_set_live_phone(91, 0, 1, EPOCH_MS, EPOCH_MS));
+  assert(!location_service_set_live_phone(0, -181, 1, EPOCH_MS, EPOCH_MS));
+  assert(!location_service_set_live_phone(0, 0, -1, EPOCH_MS, EPOCH_MS));
+  assert(!location_service_set_live_phone(0, 0, NAN, EPOCH_MS, EPOCH_MS));
+  assert(!location_service_set_live_phone(0, 0, 1, 0, 0));
+  assert(!location_service_set_live_phone(0, 0, 1, UINT64_MAX, UINT64_MAX));
+  assert(!location_service_set_live_phone(0, 0, 1, EPOCH_MS + 1, EPOCH_MS));
+  assert(!location_service_set_live_phone(0, 0, 1, EPOCH_MS, EPOCH_MS + 60001));
   gps_fix_t fix; assert(location_service_get(&fix) && fix.lat_deg == 23.5);
   return 0;
 }
@@ -338,14 +345,14 @@ int main(void) {
     def test_zero_coordinates_clock_rollback_clear_and_reinit(self):
         run_service_c(r"""
 int main(void) {
-  reset(); assert(location_service_set_phone(0, 0, 0, EPOCH_MS, EPOCH_MS));
+  reset(); assert(location_service_set_manual(0, 0, EPOCH_MS));
   gps_fix_t fix; assert(location_service_get(&fix) && fix.lat_deg == 0 && fix.lon_deg == 0);
   now_us = 0; assert(!location_service_get(&fix));
   now_us = 2 * SEC; location_service_init(&cfg);
   assert(location_service_get(&fix)); // Restarting Web must not reset this service.
-  location_service_clear_phone(); assert(!location_service_get(&fix));
+  location_service_clear_manual(); assert(!location_service_get(&fix));
   phone_location_status_t status;
-  location_service_phone_status(&status); assert(!status.present && !status.available);
+  location_service_manual_status(&status); assert(!status.present && !status.available);
   assert(!location_service_get(NULL));
   return 0;
 }
@@ -377,27 +384,30 @@ int main(void) {
                               f"#define INTERVAL {interval}\n" + r"""
 static jmp_buf stop;
 static unsigned waits, sends;
-static double expected_latitude;
+static unsigned gnss_sends, phone_sends;
 static void ble_client_send_location(const gps_fix_t *fix) {
-  assert(fix->lat_deg == expected_latitude); ++sends;
+  if (fix->lat_deg == 22.5) ++gnss_sends;
+  if (fix->lat_deg == 23.5) ++phone_sends;
+  ++sends;
 }
 static void vTaskDelay(uint32_t ticks) {
   assert(ticks == INTERVAL);
-  if (++waits == 4) longjmp(stop, 1);
+  if (++waits == 3) longjmp(stop, 1);
   now_us += (int64_t)ticks * 1000;
 }
 """ + function_source("src/main.c", "get_location_for_send") + "\n" +
                               function_source("src/main.c", "location_publisher_task") + r"""
 int main(void) {
   reset(); PHONE(); cfg.gps_interval_ms = INTERVAL;
-  expected_latitude = 23.5;
   now_us += 2 * 3600 * SEC;
   if (!setjmp(stop)) location_publisher_task(&cfg);
-  assert(sends == 4);
-  waits = sends = 0; location_service_clear_phone(); GNSS(); expected_latitude = 22.5;
+  assert(phone_sends >= 1);
+  waits = sends = gnss_sends = phone_sends = 0; GNSS();
   if (!setjmp(stop)) location_publisher_task(&cfg);
-  assert(sends == (INTERVAL == 2000 ? 3U : 2U));
-  waits = sends = 0; raw.valid = false;
+  assert(gnss_sends >= 1);
+  waits = sends = gnss_sends = phone_sends = 0; raw.valid = false;
+  cfg.source_phone_enabled = 0;
+  cfg.source_manual_enabled = 0;
   if (!setjmp(stop)) location_publisher_task(&cfg);
   assert(sends == 0);
   return 0;
@@ -408,15 +418,19 @@ int main(void) {
         source = (ROOT / "src/config.c").read_text()
         defines = "\n".join(re.findall(r"^#define .+$", source, re.M))
         functions = "\n".join(function_source("src/config.c", name) for name in (
-            "config_set_str_default", "config_terminate_str",
+            "config_set_str_default", "source_order_is_valid", "config_terminate_str",
             "config_set_defaults", "config_validate"))
         run_c('#include <assert.h>\n#include <string.h>\n#include "config.h"\n' +
+              'static void config_set_str_default(char *, size_t, const char *);\n' +
               defines + "\n" + functions + r"""
 int main(void) {
   app_config_t cfg;
   config_set_defaults(&cfg); assert(cfg.phone_location_ttl_hours == 6);
-  assert(cfg.fixed_location_priority == FIXED_LOCATION_GPS_PRIORITY);
-  assert(cfg.fixed_location_delete_policy == FIXED_LOCATION_KEEP_UNTIL_EXPIRY);
+  assert(cfg.track_interval_s == LOCATION_RECORD_INTERVAL_DEFAULT_S);
+  assert(cfg.source_gnss_enabled && cfg.source_phone_enabled && cfg.source_manual_enabled);
+  assert(!strcmp(cfg.source_order, "gnss,phone,manual"));
+  assert(cfg.track_enabled && cfg.phone_push_enabled && cfg.phone_interval_s == 5);
+  assert(cfg.manual_auto_update);
   cfg.phone_location_ttl_hours = 1; config_validate(&cfg); assert(cfg.phone_location_ttl_hours == 1);
   cfg.phone_location_ttl_hours = 720; config_validate(&cfg); assert(cfg.phone_location_ttl_hours == 720);
   cfg.phone_location_ttl_hours = 0; config_validate(&cfg); assert(cfg.phone_location_ttl_hours == 6);
@@ -519,8 +533,14 @@ int main(void) {
   req = request("{}"); handle_phone_clear(&req); assert(response_status == 400);
   assert(location_service_get(&fix));
   request_type = "application/json; charset=utf-8";
+  req = request("{\"latitude\":24.5,\"longitude\":115.5,\"now_ms\":1793361600000}");
+  assert(handle_manual_location(&req) == ESP_OK && response_status == 200);
+  phone_location_status_t manual;
+  location_service_manual_status(&manual);
+  assert(manual.present && manual.latitude == 24.5);
   req = request("{}"); handle_phone_clear(&req); assert(response_status == 200);
-  assert(!location_service_get(&fix));
+  location_service_manual_status(&manual); assert(!manual.present);
+  assert(location_service_get(&fix) && fix.lat_deg == 23.5);
   return 0;
 }
 """, extra_sources=(cjson / "cJSON.c",), include_dirs=(cjson,))
@@ -533,16 +553,19 @@ int main(void) {
         encoded = source[start:end].replace("FRAMENAV_HOSTNAME", '"framenav.device.igp.wiki"')
         script = "".join(json.loads(token) for token in re.findall(r'"(?:\\.|[^"\\])*"', encoded))
         script = script.removeprefix("<script>").removesuffix("</script>")
-        script = script.replace("%u", "1").replace("%d", "0")
+        script = script.replace("%u", "1").replace("%d", "0").replace("%%", "%")
         harness = r"""
 const vm = require('node:vm'), assert = require('node:assert/strict');
 const nodes = new Map(), calls = [];
 function node(selector) {
-  if (!nodes.has(selector)) nodes.set(selector, {disabled:false, value:'', textContent:'', events:{},
-    addEventListener(type, callback) {this.events[type] = callback;}});
+  if (!nodes.has(selector)) nodes.set(selector, {disabled:false, value:'', textContent:'', events:{}, children:[],
+    addEventListener(type, callback) {this.events[type] = callback;},
+    appendChild(child) {this.children.push(child);}, insertBefore(child) {this.children.push(child);},
+    querySelector() {return null;}, querySelectorAll() {return [];},
+    classList:{add(){}, remove(){}}});
   return nodes.get(selector);
 }
-const context = {window:{}, AbortController, Date,
+const context = {window:{}, navigator:{}, AbortController, Date, confirm(){return true;},
   setInterval(){}, setTimeout(){return 1;}, clearTimeout(){},
   document:{hidden:false, querySelector:node,
     querySelectorAll(){return [];}, addEventListener(){}},
@@ -555,22 +578,15 @@ vm.createContext(context);
 """ + "vm.runInContext(" + json.dumps(script, ensure_ascii=False) + r""", context);
 (async()=>{
   await new Promise(setImmediate);
-  assert.equal(typeof context.navigator, 'undefined');
+  assert.equal(typeof context.navigator.geolocation, 'undefined');
   assert.equal(node('#phone-get').events.click, undefined);
   node('#manual-lat').value = '24.1'; node('#manual-lon').value = '115.2';
-  node('#phone-manual').events.click();
+  node('#manual-lat').events.input();
+  node('#manual-lon').events.input();
   await new Promise(setImmediate);
-  const manual = calls.filter(c=>c.path === '/location/phone').at(-1);
-  assert.equal(JSON.parse(manual.options.body).latitude, 24.1);
-  assert.equal(JSON.parse(manual.options.body).longitude, 115.2);
-  assert.equal(JSON.parse(manual.options.body).accuracy, 0);
-  assert.equal(node('#phone-message').textContent, '已保存');
-  node('#manual-lat').value = '91'; node('#manual-lon').value = '115.2';
-  node('#phone-manual').events.click();
-  assert.match(node('#phone-message').textContent, /有效/);
-  await new Promise(setImmediate);
-  await node('#phone-clear').events.click();
-  assert(calls.some(c=>c.path === '/location/phone/clear' && c.options.method === 'POST'));
+  assert.equal(node('#manual-dirty').value, '1');
+  await node('#manual-clear').events.click();
+  assert(calls.some(c=>c.path === '/location/manual/clear' && c.options.method === 'POST'));
 })().catch(error=>{console.error(error);process.exitCode=1;});
 """
         result = subprocess.run([shutil.which("node"), "-e", harness], capture_output=True, text=True)

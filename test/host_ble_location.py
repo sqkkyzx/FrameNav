@@ -32,7 +32,7 @@ class BleLocationChecks(unittest.TestCase):
 
 struct os_mbuf { size_t om_len; uint8_t data[32]; };
 struct ble_gatt_access_ctxt { int op; struct os_mbuf *om; };
-static bool accept_location = true, cleared;
+static bool accept_location = true, manual_cleared;
 static double saved_lat, saved_lon, saved_accuracy;
 static uint64_t saved_captured, saved_now;
 static int ble_hs_mbuf_to_flat(const struct os_mbuf *om, void *dst, uint16_t len,
@@ -42,13 +42,13 @@ static int ble_hs_mbuf_to_flat(const struct os_mbuf *om, void *dst, uint16_t len
   if (out_len) *out_len = len;
   return 0;
 }
-static bool location_service_set_phone(double lat, double lon, double accuracy,
-                                       uint64_t captured, uint64_t now) {
+static bool location_service_set_live_phone(double lat, double lon, double accuracy,
+                                           uint64_t captured, uint64_t now) {
   saved_lat = lat; saved_lon = lon; saved_accuracy = accuracy;
   saved_captured = captured; saved_now = now;
   return accept_location;
 }
-static void location_service_clear_phone(void) { cleared = true; }
+static bool location_service_clear_manual(void) { manual_cleared = true; return true; }
 """ + handlers + r"""
 static void put_le32(uint8_t *p, uint32_t value) {
   for (unsigned i = 0; i < 4; ++i) p[i] = (uint8_t)(value >> (8 * i));
@@ -81,7 +81,7 @@ int main(void) {
 
   mbuf.data[0] = 1;
   mbuf.om_len = LOCATION_CLEAR_LEN;
-  assert(location_access_cb(1, 3, &ctx, (void *)1) == 0 && cleared);
+  assert(location_access_cb(1, 3, &ctx, (void *)1) == 0 && manual_cleared);
   mbuf.data[0] = 2;
   assert(location_access_cb(1, 3, &ctx, (void *)1) ==
          BLE_ATT_ERR_VALUE_NOT_ALLOWED);
