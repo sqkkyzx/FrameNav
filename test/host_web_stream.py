@@ -25,6 +25,7 @@ class WebStreamChecks(unittest.TestCase):
 #include <string.h>
 #include <time.h>
 #include "ble_client.h"
+#include "location_service.h"
 
 #define ALPHALOC_BATTERY_MONITOR 0
 #define ESP_OK 0
@@ -74,6 +75,14 @@ bool gps_get_status(gps_status_t *out) {
   *out = (gps_status_t){.has_lock=true, .satellites=12,
                         .constellations=GPS_CONSTELLATION_GPS,
                         .satellites_visible=12}; return true;
+}
+void location_service_manual_status(phone_location_status_t *out) {
+  *out = (phone_location_status_t){
+      .present = true, .available = true, .latitude = 31.2,
+      .longitude = 121.5, .remaining_s = 3600};
+}
+void location_service_live_status(live_location_status_t *out) {
+  *out = (live_location_status_t){0};
 }
 bool ble_client_is_connected(void) { return true; }
 bool ble_client_is_bonded(void) { return true; }
@@ -134,7 +143,6 @@ int main(void) {
   httpd_req_t req = {0};
   memset(cfg.camera_name_prefix, '"', sizeof(cfg.camera_name_prefix) - 1);
   memset(cfg.camera_mac_prefix, '&', sizeof(cfg.camera_mac_prefix) - 1);
-  memset(cfg.wifi_ssid, '"', sizeof(cfg.wifi_ssid) - 1);
   cfg.bluetooth_power_mode = BLUETOOTH_POWER_CUSTOM;
   cfg.wifi_idle_timeout_s = WIFI_IDLE_TIMEOUT_LONG_S;
   cfg.phone_location_ttl_hours = PHONE_LOCATION_TTL_MAX_HOURS;
@@ -143,8 +151,8 @@ int main(void) {
   for (int i = 0; i < 20; ++i) {
     reset_response();
     assert(handle_root(&req) == ESP_OK);
-    assert(!errors && !rejected && completed == 1 && chunks > 1);
-    assert(live_bytes == 0 && peak_bytes <= 12288);
+    assert(!errors && !rejected && completed == 2 && chunks > 1);
+    assert(live_bytes == 0 && peak_bytes <= 16384);
     assert(!strstr(response, "固件版本"));
     assert(!strstr(response, "轨迹数据"));
     assert(!strstr(response, "10.254.254.1"));
@@ -155,9 +163,11 @@ int main(void) {
     assert(strstr(response, "存储占用："));
     assert(!strstr(response, "ap_ssid"));
     assert(strstr(response, "搜到卫星："));
-    assert(strstr(response, "loc-running-gnss-dot"));
-    assert(strstr(response, "loc-running-gnss\">"));
-    assert(strstr(response, "相机和手机都未连接时搜星"));
+    assert(strstr(response, "loc-gnss-visible"));
+    assert(strstr(response, "loc-gnss-search"));
+    assert(strstr(response, "GNSS 定位"));
+    assert(strstr(response, "手机定位"));
+    assert(strstr(response, "手动设置经纬度"));
     assert(strstr(response, "name=\"track_int_s\""));
     assert(strstr(response, "border-radius:50%"));
     assert(response_used > 8000);

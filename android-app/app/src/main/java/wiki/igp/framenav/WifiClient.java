@@ -124,22 +124,9 @@ public final class WifiClient {
         run("GET", normalizeBaseUrl(baseUrl) + "/storage", null, null, callback);
     }
 
-    public void startWifiScan(String baseUrl, Callback callback) {
-        run("POST", normalizeBaseUrl(baseUrl) + "/wifi/scan/start", "",
-                "application/x-www-form-urlencoded", callback);
-    }
-
-    public void getWifiScan(String baseUrl, Callback callback) {
-        run("GET", normalizeBaseUrl(baseUrl) + "/wifi/scan", null, null, callback);
-    }
-
     public void startCameraPairing(String baseUrl, Callback callback) {
         run("POST", normalizeBaseUrl(baseUrl) + "/pair/start", "",
                 "application/x-www-form-urlencoded", callback);
-    }
-
-    public void getPairedDevices(String baseUrl, Callback callback) {
-        run("GET", normalizeBaseUrl(baseUrl) + "/bonds", null, null, callback);
     }
 
     public void deletePairedDevice(String baseUrl, String token, String type, Callback callback) {

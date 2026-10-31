@@ -91,8 +91,6 @@ typedef struct
   uint32_t custom_ble_boot_fast_search_s;
   uint32_t custom_ble_scan_period_ms;
   uint32_t custom_ble_scan_window_ms;
-  char wifi_ssid[CONFIG_STR_MAX_32];
-  char wifi_pass[CONFIG_STR_MAX_64];
   uint32_t wifi_idle_timeout_s;
   uint32_t phone_location_ttl_hours;
   uint8_t fixed_location_priority;

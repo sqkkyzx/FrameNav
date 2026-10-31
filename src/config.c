@@ -147,19 +147,6 @@ void config_set_defaults(app_config_t *cfg)
   cfg->camera_mac_prefix[0] = '\0';
 #endif
 
-#ifdef ALPHALOC_DEFAULT_WIFI_SSID
-  config_set_str_default(cfg->wifi_ssid, sizeof(cfg->wifi_ssid),
-                         ALPHALOC_DEFAULT_WIFI_SSID);
-#else
-  config_set_str_default(cfg->wifi_ssid, sizeof(cfg->wifi_ssid), "");
-#endif
-
-#ifdef ALPHALOC_DEFAULT_WIFI_PASS
-  config_set_str_default(cfg->wifi_pass, sizeof(cfg->wifi_pass),
-                         ALPHALOC_DEFAULT_WIFI_PASS);
-#else
-  config_set_str_default(cfg->wifi_pass, sizeof(cfg->wifi_pass), "");
-#endif
 }
 
 void config_validate(app_config_t *cfg)
@@ -265,8 +252,6 @@ void config_validate(app_config_t *cfg)
   config_terminate_str(cfg->camera_name_prefix,
                        sizeof(cfg->camera_name_prefix));
   config_terminate_str(cfg->camera_mac_prefix, sizeof(cfg->camera_mac_prefix));
-  config_terminate_str(cfg->wifi_ssid, sizeof(cfg->wifi_ssid));
-  config_terminate_str(cfg->wifi_pass, sizeof(cfg->wifi_pass));
   if (cfg->phone_location_ttl_hours < 1 ||
       cfg->phone_location_ttl_hours > PHONE_LOCATION_TTL_MAX_HOURS)
   {
@@ -320,7 +305,9 @@ bool config_load(app_config_t *cfg)
   config_ensure_mutex();
 
   nvs_handle_t nvs;
-  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs);
+  // Open read/write once so legacy external-router credentials can be removed
+  // during migration. The device now exposes only its fixed local AP.
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
   if (err != ESP_OK)
   {
     ESP_LOGW(TAG, "NVS open failed, using defaults: %s", esp_err_to_name(err));
@@ -384,8 +371,21 @@ bool config_load(app_config_t *cfg)
                   sizeof(cfg->camera_name_prefix));
   config_read_str(nvs, "cam_mac", cfg->camera_mac_prefix,
                   sizeof(cfg->camera_mac_prefix));
-  config_read_str(nvs, "wifi_ssid", cfg->wifi_ssid, sizeof(cfg->wifi_ssid));
-  config_read_str(nvs, "wifi_pass", cfg->wifi_pass, sizeof(cfg->wifi_pass));
+
+  bool legacy_credentials_removed = false;
+  if (nvs_erase_key(nvs, "wifi_ssid") == ESP_OK) {
+    legacy_credentials_removed = true;
+  }
+  if (nvs_erase_key(nvs, "wifi_pass") == ESP_OK) {
+    legacy_credentials_removed = true;
+  }
+  if (legacy_credentials_removed) {
+    esp_err_t commit_err = nvs_commit(nvs);
+    if (commit_err != ESP_OK) {
+      ESP_LOGW(TAG, "Failed to remove legacy external Wi-Fi credentials: %s",
+               esp_err_to_name(commit_err));
+    }
+  }
 
   nvs_close(nvs);
   config_validate(cfg);
@@ -423,8 +423,6 @@ static bool config_save_unlocked(const app_config_t *cfg)
   if (err == ESP_OK) err = nvs_set_i16(nvs, "dst_off", cfg->dst_offset_min);
   if (err == ESP_OK) err = nvs_set_str(nvs, "cam_name", cfg->camera_name_prefix);
   if (err == ESP_OK) err = nvs_set_str(nvs, "cam_mac", cfg->camera_mac_prefix);
-  if (err == ESP_OK) err = nvs_set_str(nvs, "wifi_ssid", cfg->wifi_ssid);
-  if (err == ESP_OK) err = nvs_set_str(nvs, "wifi_pass", cfg->wifi_pass);
   if (err == ESP_OK) err = nvs_set_u32(nvs, "phone_ttl_h", cfg->phone_location_ttl_hours);
   if (err == ESP_OK) err = nvs_set_u8(nvs, "fixed_prio", cfg->fixed_location_priority);
   if (err == ESP_OK) err = nvs_set_u8(nvs, "fixed_delete", cfg->fixed_location_delete_policy);

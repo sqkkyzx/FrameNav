@@ -31,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import org.json.JSONObject;
+import org.json.JSONArray;
 
 /**
  * BLE transport for FrameNav. All GATT operations are serialized because
@@ -71,6 +72,7 @@ public final class BleManager {
     public static final UUID WIFI_WAKE = uuid("11007ea1");
     public static final UUID SETTINGS = uuid("12007ea1");
     public static final UUID TELEMETRY = uuid("13007ea1");
+    public static final UUID BONDS = uuid("14007ea1");
     private static final LinkedHashMap<String, UUID> CONFIG_CHARACTERISTICS = new LinkedHashMap<>();
 
     static {
@@ -78,8 +80,6 @@ public final class BleManager {
         CONFIG_CHARACTERISTICS.put("camera_mac", uuid("03007ea1"));
         CONFIG_CHARACTERISTICS.put("tz", uuid("04007ea1"));
         CONFIG_CHARACTERISTICS.put("dst", uuid("05007ea1"));
-        CONFIG_CHARACTERISTICS.put("wifi_ssid", uuid("07007ea1"));
-        CONFIG_CHARACTERISTICS.put("wifi_pass", uuid("08007ea1"));
         CONFIG_CHARACTERISTICS.put("max_gps_age", uuid("0b007ea1"));
         CONFIG_CHARACTERISTICS.put("gps_lock", uuid("0c007ea1"));
         CONFIG_CHARACTERISTICS.put("gps_sats", uuid("0d007ea1"));
@@ -203,15 +203,7 @@ public final class BleManager {
                     }
                     try {
                         JSONObject json = new JSONObject(new String(value, StandardCharsets.UTF_8));
-                        Map<String, String> values = new LinkedHashMap<>();
-                        java.util.Iterator<String> keys = json.keys();
-                        while (keys.hasNext()) {
-                            String key = keys.next();
-                            Object item = json.opt(key);
-                            if (item != null && item != JSONObject.NULL) {
-                                values.put(key, String.valueOf(item));
-                            }
-                        }
+                        Map<String, String> values = parseConfigJson(json);
                         callback.onSuccess(values);
                     } catch (Exception parseError) {
                         callback.onError("BLE 配置数据无法解析");
@@ -222,13 +214,54 @@ public final class BleManager {
             final List<Map.Entry<String, UUID>> entries = new ArrayList<>(CONFIG_CHARACTERISTICS.entrySet());
             final Map<String, String> values = new LinkedHashMap<>();
             List<Map.Entry<String, UUID>> readableEntries = new ArrayList<>();
-            for (Map.Entry<String, UUID> entry : entries) {
-                if (!"wifi_pass".equals(entry.getKey())) {
-                    readableEntries.add(entry);
-                }
-            }
+            readableEntries.addAll(entries);
             readConfigAt(readableEntries, 0, values, callback);
         });
+    }
+
+    private static Map<String, String> parseConfigJson(JSONObject json) {
+        Map<String, String> values = new LinkedHashMap<>();
+        JSONArray camera = json.optJSONArray("c");
+        JSONArray location = json.optJSONArray("l");
+        if (camera != null || location != null) {
+            putArrayValue(values, camera, 0, "cam_name");
+            putArrayValue(values, camera, 1, "cam_mac");
+            putArrayValue(values, camera, 2, "tz");
+            putArrayValue(values, camera, 3, "dst");
+            putArrayValue(values, camera, 4, "wifi_idle_s");
+            putArrayValue(values, camera, 5, "ble_mode");
+            putArrayValue(values, camera, 6, "ble_boot");
+            putArrayValue(values, camera, 7, "ble_period");
+            putArrayValue(values, camera, 8, "ble_window");
+            putArrayValue(values, location, 0, "source_order");
+            putArrayValue(values, location, 1, "source_gnss");
+            putArrayValue(values, location, 2, "source_phone");
+            putArrayValue(values, location, 3, "source_manual");
+            putArrayValue(values, location, 4, "track_enabled");
+            putArrayValue(values, location, 5, "gnss_idle");
+            putArrayValue(values, location, 6, "track_idle");
+            putArrayValue(values, location, 7, "track_int_s");
+            putArrayValue(values, location, 8, "phone_push_enabled");
+            putArrayValue(values, location, 9, "phone_interval_s");
+            putArrayValue(values, location, 10, "manual_auto_update");
+            putArrayValue(values, location, 11, "manual_lat");
+            putArrayValue(values, location, 12, "manual_lon");
+            return values;
+        }
+        java.util.Iterator<String> keys = json.keys();
+        while (keys.hasNext()) {
+            String key = keys.next();
+            Object item = json.opt(key);
+            if (item != null && item != JSONObject.NULL) values.put(key, String.valueOf(item));
+        }
+        return values;
+    }
+
+    private static void putArrayValue(Map<String, String> values, JSONArray array,
+                                      int index, String key) {
+        if (array == null || index >= array.length()) return;
+        Object item = array.opt(index);
+        values.put(key, item == null || item == JSONObject.NULL ? "" : String.valueOf(item));
     }
 
     public void requestWifiWake(Callback callback) {
@@ -248,16 +281,62 @@ public final class BleManager {
         void onError(String message);
     }
 
-    public interface TelemetryCallback { void onSuccess(JSONObject value); }
+    public interface TelemetryCallback {
+        void onSuccess(JSONObject value);
+
+        default void onError(String message) { }
+    }
+
+    public interface BondsCallback {
+        void onSuccess(JSONArray value);
+
+        void onError(String message);
+    }
 
     public void readTelemetry(TelemetryCallback callback) {
         main.post(() -> {
             BluetoothGattCharacteristic telemetry = characteristics.get(TELEMETRY);
-            if (!ready || telemetry == null) return;
+            if (!ready || telemetry == null) {
+                callback.onError("设备 BLE 遥测服务不可用");
+                return;
+            }
             enqueueRead(telemetry, (success, value, error) -> {
-                if (!success) return;
-                try { callback.onSuccess(new JSONObject(new String(value, StandardCharsets.UTF_8))); }
-                catch (Exception ignored) { }
+                if (!success) {
+                    callback.onError("读取设备遥测失败：" + error);
+                    return;
+                }
+                try {
+                    callback.onSuccess(new JSONObject(new String(value, StandardCharsets.UTF_8)));
+                } catch (Exception parseError) {
+                    callback.onError("设备 BLE 遥测数据无法解析");
+                }
+            });
+        });
+    }
+
+    public void readBonds(BondsCallback callback) {
+        main.post(() -> {
+            BluetoothGattCharacteristic bonds = characteristics.get(BONDS);
+            if (!ready || bonds == null) {
+                callback.onError("设备 BLE 配对设备服务不可用");
+                return;
+            }
+            enqueueRead(bonds, (success, value, error) -> {
+                if (!success) {
+                    callback.onError("读取已配对设备失败：" + error);
+                    return;
+                }
+                try {
+                    JSONArray items = new JSONObject(new String(value, StandardCharsets.UTF_8))
+                            .optJSONArray("bonds");
+                    if (items == null) {
+                        callback.onError("BLE 配对设备数据缺少 bonds 列表");
+                    } else {
+                        callback.onSuccess(items);
+                    }
+                } catch (Exception parseError) {
+                    callback.onError("BLE 配对设备数据无法解析");
+                }
             });
         });
     }

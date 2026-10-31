@@ -18,9 +18,8 @@ endorsed by, or sponsored by Sony Group Corporation.
 Wi-Fi 在设备上电后启动；按页面设置在 5 或 15 分钟无人使用后关闭。关闭后重新上电，或重新接入
 USB 数据主机，均可再次启动 Wi-Fi。
 
-设备热点和外部 Wi-Fi 共用约 16.5 dBm 的最大发射功率，约为默认 20 dBm 的一半线性功率。
-优化手机浏览器打开配置页和保存设置时的响应。配对设备显示名称和 MAC；外部 Wi-Fi 仅支持 2.4G，
-通过扫描结果选取网络；手动经纬度和省电模式选项并排显示。
+设备热点使用约 16.5 dBm 的最大发射功率，约为默认 20 dBm 的一半线性功率。
+优化手机浏览器打开配置页和保存设置时的响应。配对设备显示名称和 MAC；手动经纬度和省电模式选项并排显示。
 
 设备配置页使用本地 HTTP IP 直连，限制连接数并回收空闲连接，避免手机联网探测占满连接后网页超时。
 配置页分块发送，避免并发访问时出现 `No memory`。
@@ -58,9 +57,8 @@ Wi-Fi 配置入口在设备上电后启动，不读取 USB 供电或 VBUS 状态
 正式访问地址是 **http://10.254.254.1/**。
 热点名称固定为 `FrameNav-` 加 AP MAC 后六位，密码固定为 `framenav`，不可在页面修改。
 
-设备上电后立即提供设备热点，同时连接网页中保存的外部 Wi-Fi；连接失败时降低
-后台重试频率，避免持续扫频干扰手机访问热点。附近网络列表只在用户点击“扫描网络”时扫描；
-如果保存了外部 Wi-Fi，设备仍会在开机或重连时自动查找该网络。未配置外部 Wi-Fi 时不会后台扫描。
+设备上电后立即提供固定设备热点。设备不加入外部路由器，也不会扫描或保存外部 Wi-Fi 凭据，
+避免持续扫频干扰手机访问热点。
 如果没有设备关联或近期网页活动，Wi-Fi 按网页设置在 5 或 15 分钟后关闭；关闭后重新给设备上电，
 或让 USB 数据主机重新接入，才能再次开启。
 BLE 保留控制器 modem sleep 和搜索省电策略；页面运行状态显示接收机报告的卫星数。
@@ -228,15 +226,13 @@ To enable this, set the build flag (`ALPHALOC_WIFI_WEB=1` in `platformio.ini`).
 
 #### Build-Time Defaults (Optional)
 
-If you want to keep WiFi credentials and camera filters out of git, place them in `platformio.secrets.ini` and keep the file ignored. The build merges these flags into every environment via `platformio.ini`.
+If you want to keep camera filters out of git, place them in `platformio.secrets.ini` and keep the file ignored. The build merges these flags into every environment via `platformio.ini`.
 
-Example `platformio.secrets.ini` with all supported defaults:
+Example `platformio.secrets.ini` with supported camera defaults:
 
 ```ini
 [secrets]
 build_flags =
-  -DALPHALOC_DEFAULT_WIFI_SSID="\"MyWifi\""
-  -DALPHALOC_DEFAULT_WIFI_PASS="\"MyPass\""
   -DALPHALOC_DEFAULT_CAMERA_NAME_PREFIX="\"SonyA7\""
   -DALPHALOC_DEFAULT_CAMERA_MAC_PREFIX="\"AA:BB:CC\""
 ```

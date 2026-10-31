@@ -30,7 +30,6 @@
 
 #define FRAMENAV_HTTP_MAX_CLIENTS 2
 #define FRAMENAV_WEB_RESERVED_SOCKETS 8
-#define FRAMENAV_WIFI_SCAN_MAX_RESULTS 32U
 #define FRAMENAV_HTTP_MAX_REQ_HDR_LEN 2048U
 // ESP-IDF uses quarter-dBm units. 66 maps to 16.5 dBm, approximately half
 // the linear transmit power of the usual 20 dBm default.
@@ -110,153 +109,22 @@ static esp_err_t handle_favicon(httpd_req_t *req) {
 }
 
 static app_config_t *s_cfg;
-static esp_netif_t *s_netif = NULL;
-static esp_netif_t *s_netif_sta = NULL;
 static esp_netif_t *s_netif_ap = NULL;
 static volatile bool s_started;
 static bool s_wifi_handlers_registered = false;
-static bool s_ip_handlers_registered = false;
 static bool s_netif_initialized = false;
 static bool s_default_event_loop_ready = false;
-static int64_t s_sta_start_us = 0;
 static bool s_ap_active = false;
-static bool s_sta_has_ip = false;
-static bool s_sta_configured = false;
-
-typedef enum {
-  WIFI_SCAN_IDLE = 0,
-  WIFI_SCAN_RUNNING,
-  WIFI_SCAN_READING,
-  WIFI_SCAN_READY,
-  WIFI_SCAN_FAILED,
-} wifi_scan_state_t;
-
-typedef struct {
-  char ssid[33];
-  int8_t rssi;
-  bool secure;
-} wifi_scan_result_t;
-
-static wifi_scan_state_t s_wifi_scan_state = WIFI_SCAN_IDLE;
-static uint16_t s_wifi_scan_result_count;
-static wifi_scan_result_t s_wifi_scan_results[FRAMENAV_WIFI_SCAN_MAX_RESULTS];
-
-static esp_err_t handle_wifi_scan_start(httpd_req_t *req) {
-  web_activity();
-  portENTER_CRITICAL(&s_radio_lock);
-  bool available = s_started && !s_radio_owned &&
-                   s_wifi_scan_state != WIFI_SCAN_RUNNING &&
-                   s_wifi_scan_state != WIFI_SCAN_READING;
-  if (available) {
-    s_wifi_scan_state = WIFI_SCAN_RUNNING;
-    s_wifi_scan_result_count = 0;
-  }
-  portEXIT_CRITICAL(&s_radio_lock);
-  if (!available) {
-    httpd_resp_set_status(req, "409 Conflict");
-    return httpd_resp_sendstr(req, "设备正忙，请稍后重试。");
-  }
-
-  wifi_scan_config_t scan_cfg = {0};
-  scan_cfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
-  scan_cfg.show_hidden = false;
-  scan_cfg.scan_time.active.min = 60;
-  scan_cfg.scan_time.active.max = 120;
-  if (esp_wifi_scan_start(&scan_cfg, false) != ESP_OK) {
-    portENTER_CRITICAL(&s_radio_lock);
-    s_wifi_scan_state = WIFI_SCAN_FAILED;
-    portEXIT_CRITICAL(&s_radio_lock);
-    httpd_resp_set_status(req, "503 Service Unavailable");
-    return httpd_resp_sendstr(req, "扫描失败，请稍后重试。");
-  }
-  httpd_resp_set_status(req, "202 Accepted");
-  httpd_resp_set_type(req, "application/json; charset=utf-8");
-  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-  return httpd_resp_sendstr(req, "{\"scanning\":true}");
-}
-
-static esp_err_t handle_wifi_scan(httpd_req_t *req) {
-  web_activity();
-  wifi_scan_state_t state;
-  uint16_t count = 0;
-  wifi_scan_result_t results[FRAMENAV_WIFI_SCAN_MAX_RESULTS] = {0};
-  portENTER_CRITICAL(&s_radio_lock);
-  state = s_wifi_scan_state;
-  if (state == WIFI_SCAN_READY) {
-    count = s_wifi_scan_result_count;
-    if (count > FRAMENAV_WIFI_SCAN_MAX_RESULTS) {
-      count = FRAMENAV_WIFI_SCAN_MAX_RESULTS;
-    }
-    memcpy(results, s_wifi_scan_results, sizeof(results));
-  }
-  portEXIT_CRITICAL(&s_radio_lock);
-
-  if (state == WIFI_SCAN_RUNNING || state == WIFI_SCAN_READING) {
-    httpd_resp_set_type(req, "application/json; charset=utf-8");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    return httpd_resp_sendstr(req, "{\"scanning\":true}");
-  }
-  if (state == WIFI_SCAN_IDLE) {
-    httpd_resp_set_status(req, "409 Conflict");
-    return httpd_resp_sendstr(req, "请先开始扫描。");
-  }
-  if (state == WIFI_SCAN_FAILED) {
-    httpd_resp_set_status(req, "503 Service Unavailable");
-    return httpd_resp_sendstr(req, "扫描失败，请重试。");
-  }
-
-  cJSON *root = cJSON_CreateObject();
-  cJSON *items = root ? cJSON_AddArrayToObject(root, "networks") : NULL;
-  if (!root || !items) {
-    cJSON_Delete(root);
-    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                               "暂时无法读取网络列表");
-  }
-  for (uint16_t i = 0; i < count; ++i) {
-    cJSON *network = cJSON_CreateObject();
-    if (!network || !cJSON_AddStringToObject(network, "ssid", results[i].ssid) ||
-        !cJSON_AddNumberToObject(network, "rssi", results[i].rssi) ||
-        !cJSON_AddBoolToObject(network, "secure", results[i].secure)) {
-      cJSON_Delete(network);
-      cJSON_Delete(root);
-      return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                                 "暂时无法读取网络列表");
-    }
-    cJSON_AddItemToArray(items, network);
-  }
-  char *json = cJSON_PrintUnformatted(root);
-  cJSON_Delete(root);
-  if (!json) {
-    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                               "暂时无法读取网络列表");
-  }
-  httpd_resp_set_type(req, "application/json; charset=utf-8");
-  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-  esp_err_t response = httpd_resp_sendstr(req, json);
-  free(json);
-  return response;
-}
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data);
 static bool start_softap(void);
 
-#ifndef ALPHALOC_WIFI_STA_FALLBACK_TIMEOUT_MS
-#define ALPHALOC_WIFI_STA_FALLBACK_TIMEOUT_MS 15000
-#endif
-
-#ifndef ALPHALOC_WIFI_RECONNECT_BACKOFF_MS
-#define ALPHALOC_WIFI_RECONNECT_BACKOFF_MS 1500
-#endif
-
 #define ALPHALOC_AP_URL "http://10.254.254.1/"
 #define FRAMENAV_PAIRING_WINDOW_S 90U
 #define ALPHALOC_WIFI_ACTIVITY_HOLD_US 30000000LL
 
-static esp_timer_handle_t s_reconnect_timer = NULL;
-static esp_timer_handle_t s_fallback_timer = NULL;
 static captive_dns_handle_t s_captive_dns = NULL;
-static uint8_t s_sta_retry_count = 0;
 
 static void configure_wifi_tx_power(void) {
   int8_t before = 0;
@@ -336,71 +204,23 @@ static void wifi_cleanup_resources(void) {
     httpd_stop(s_server);
     s_server = NULL;
   }
-  if (s_reconnect_timer) {
-    esp_timer_stop(s_reconnect_timer);
-    esp_timer_delete(s_reconnect_timer);
-    s_reconnect_timer = NULL;
-  }
-  if (s_fallback_timer) {
-    esp_timer_stop(s_fallback_timer);
-    esp_timer_delete(s_fallback_timer);
-    s_fallback_timer = NULL;
-  }
   if (s_wifi_handlers_registered) {
     esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                  &wifi_event_handler);
     s_wifi_handlers_registered = false;
   }
-  if (s_ip_handlers_registered) {
-    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                 &wifi_event_handler);
-    s_ip_handlers_registered = false;
-  }
   (void)esp_wifi_stop();
   (void)esp_wifi_deinit();
-  if (s_netif_sta) {
-    esp_netif_destroy(s_netif_sta);
-    s_netif_sta = NULL;
-  }
   if (s_netif_ap) {
     esp_netif_destroy(s_netif_ap);
     s_netif_ap = NULL;
   }
-  s_netif = NULL;
   // esp-netif is process-global and cannot be deinitialized. Keep the default
   // event loop too, so a later USB reconnect can start WiFi again safely.
   s_ap_active = false;
-  s_sta_has_ip = false;
-  s_sta_configured = false;
-  s_sta_retry_count = 0;
-  s_sta_start_us = 0;
-  portENTER_CRITICAL(&s_radio_lock);
-  s_wifi_scan_state = WIFI_SCAN_IDLE;
-  s_wifi_scan_result_count = 0;
-  portEXIT_CRITICAL(&s_radio_lock);
   portENTER_CRITICAL(&s_activity_lock);
   s_activity_us = 0;
   portEXIT_CRITICAL(&s_activity_lock);
-}
-
-static void wifi_reconnect_cb(void *arg) {
-  (void)arg;
-  if (s_started && s_sta_configured && !s_sta_has_ip) {
-    esp_err_t err = esp_wifi_connect();
-    if (err != ESP_OK) {
-      ESP_LOGW(TAG, "WiFi reconnect start failed: %s", esp_err_to_name(err));
-    }
-  }
-}
-
-static void wifi_fallback_cb(void *arg) {
-  (void)arg;
-  if (s_started && !s_ap_active && !s_sta_has_ip) {
-    ESP_LOGW(TAG, "STA unavailable after 15s; starting AP fallback");
-    if (!start_softap()) {
-      ESP_LOGE(TAG, "AP fallback failed; web remains unavailable until retry");
-    }
-  }
 }
 
 static bool start_softap(void) {
@@ -432,9 +252,7 @@ static bool start_softap(void) {
   wifi_cfg.ap.ssid_hidden = 0;
   wifi_cfg.ap.beacon_interval = 100;
 
-  // Keep the configured STA alive while the fallback AP is available. This
-  // lets the device both offer local setup access and reach the Internet.
-  err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+  err = esp_wifi_set_mode(WIFI_MODE_AP);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to switch to AP mode: %s", esp_err_to_name(err));
     return false;
@@ -459,16 +277,6 @@ static bool start_softap(void) {
     }
   }
   s_ap_active = true;
-  s_sta_has_ip = false;
-  if (s_reconnect_timer) (void)esp_timer_stop(s_reconnect_timer);
-  if (s_fallback_timer) (void)esp_timer_stop(s_fallback_timer);
-  if (s_started && s_sta_configured) {
-    err = esp_wifi_connect();
-    if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
-      ESP_LOGW(TAG, "STA reconnect while AP fallback is active failed: %s",
-               esp_err_to_name(err));
-    }
-  }
   ESP_LOGI(TAG, "AP configured: ssid=%s captive=%s", wifi_cfg.ap.ssid,
            ALPHALOC_AP_URL);
   return true;
@@ -479,91 +287,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
   if (!s_started) {
     return;
   }
-  if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-    const ip_event_got_ip_t *got_ip = (const ip_event_got_ip_t *)event_data;
-    s_sta_has_ip = true;
-    if (s_fallback_timer) (void)esp_timer_stop(s_fallback_timer);
-    if (got_ip) {
-      ESP_LOGI(TAG, "WiFi STA address: http://" IPSTR "/; canonical=%s",
-               IP2STR(&got_ip->ip_info.ip), ALPHALOC_AP_URL);
-    }
-    return;
-  }
   if (event_base != WIFI_EVENT) {
-    return;
-  }
-
-  if (event_id == WIFI_EVENT_SCAN_DONE) {
-    portENTER_CRITICAL(&s_radio_lock);
-    bool consume_scan = s_wifi_scan_state == WIFI_SCAN_RUNNING;
-    if (consume_scan) s_wifi_scan_state = WIFI_SCAN_READING;
-    portEXIT_CRITICAL(&s_radio_lock);
-    if (!consume_scan) return;
-
-    uint16_t count = 0;
-    wifi_ap_record_t *records = NULL;
-    // This callback runs on ESP-IDF's small system-event task stack. Keep the
-    // bounded result buffer on the heap so AP start events cannot overflow it.
-    wifi_scan_result_t *results = calloc(FRAMENAV_WIFI_SCAN_MAX_RESULTS,
-                                         sizeof(*results));
-    if (!results) {
-      (void)esp_wifi_clear_ap_list();
-    }
-    uint16_t result_count = 0;
-    const wifi_event_sta_scan_done_t *done =
-        (const wifi_event_sta_scan_done_t *)event_data;
-    bool ok = results && (!done || done->status == 0) &&
-              esp_wifi_scan_get_ap_num(&count) == ESP_OK;
-    if (ok && count > 0) {
-      uint16_t capacity = count > FRAMENAV_WIFI_SCAN_MAX_RESULTS
-                              ? FRAMENAV_WIFI_SCAN_MAX_RESULTS : count;
-      records = calloc(capacity, sizeof(*records));
-      if (!records) {
-        ok = false;
-      } else {
-        count = capacity;
-        if (esp_wifi_scan_get_ap_records(&count, records) != ESP_OK) {
-          ok = false;
-        }
-      }
-    } else if (ok) {
-      (void)esp_wifi_clear_ap_list();
-    }
-    if (!ok) (void)esp_wifi_clear_ap_list();
-    if (ok) {
-      for (uint16_t i = 0; i < count && result_count < FRAMENAV_WIFI_SCAN_MAX_RESULTS;
-           ++i) {
-        char ssid[33] = {0};
-        memcpy(ssid, records[i].ssid, sizeof(ssid) - 1U);
-        if (!ssid[0]) continue;
-        bool duplicate = false;
-        for (uint16_t j = 0; j < result_count; ++j) {
-          if (strcmp(results[j].ssid, ssid) == 0) {
-            duplicate = true;
-            break;
-          }
-        }
-        if (duplicate) continue;
-        snprintf(results[result_count].ssid, sizeof(results[result_count].ssid),
-                 "%s", ssid);
-        results[result_count].rssi = records[i].rssi;
-        results[result_count].secure = records[i].authmode != WIFI_AUTH_OPEN;
-        ++result_count;
-      }
-    }
-    free(records);
-
-    portENTER_CRITICAL(&s_radio_lock);
-    if (ok) {
-      memcpy(s_wifi_scan_results, results, sizeof(s_wifi_scan_results));
-      s_wifi_scan_result_count = result_count;
-      s_wifi_scan_state = WIFI_SCAN_READY;
-    } else {
-      s_wifi_scan_result_count = 0;
-      s_wifi_scan_state = WIFI_SCAN_FAILED;
-    }
-    portEXIT_CRITICAL(&s_radio_lock);
-    free(results);
     return;
   }
 
@@ -589,69 +313,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     return;
   }
 
-  if (event_id == WIFI_EVENT_STA_CONNECTED) {
-    s_sta_retry_count = 0;
-    ESP_LOGI(TAG, "WiFi STA connected");
-    return;
-  }
-
-  if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
-    s_sta_has_ip = false;
-    const wifi_event_sta_disconnected_t *disc =
-        (const wifi_event_sta_disconnected_t *)event_data;
-    unsigned reason = disc ? (unsigned)disc->reason : 0;
-    int64_t elapsed_ms = 0;
-    if (s_sta_start_us > 0) {
-      elapsed_ms = (esp_timer_get_time() - s_sta_start_us) / 1000;
-    }
-
-    ESP_LOGW(TAG, "WiFi disconnected, reason=%u", reason);
-    if (elapsed_ms >= ALPHALOC_WIFI_STA_FALLBACK_TIMEOUT_MS && !s_ap_active) {
-      ESP_LOGW(TAG, "STA connect timed out, falling back to AP");
-      start_softap();
-      return;
-    }
-
-    if (s_reconnect_timer && s_sta_configured) {
-      uint64_t delay_us =
-          s_ap_active ? 30000000ULL
-                      : (uint64_t)ALPHALOC_WIFI_RECONNECT_BACKOFF_MS * 1000ULL;
-      if (s_sta_retry_count < 4) s_sta_retry_count++;
-      delay_us *= s_sta_retry_count;
-      ESP_LOGI(TAG, "Next external WiFi attempt in %us",
-               (unsigned)(delay_us / 1000000ULL));
-      esp_timer_stop(s_reconnect_timer);
-      esp_timer_start_once(s_reconnect_timer, delay_us);
-    }
-  }
-}
-
-static void wifi_apply_sta_config(const app_config_t *cfg) {
-  if (!cfg || !s_started || !s_netif_sta) return;
-  s_sta_configured = cfg->wifi_ssid[0] != '\0';
-  if (s_reconnect_timer) (void)esp_timer_stop(s_reconnect_timer);
-  wifi_config_t sta = {0};
-  strncpy((char *)sta.sta.ssid, cfg->wifi_ssid, sizeof(sta.sta.ssid) - 1);
-  strncpy((char *)sta.sta.password, cfg->wifi_pass,
-          sizeof(sta.sta.password) - 1);
-  (void)esp_wifi_disconnect();
-  s_sta_has_ip = false;
-  if (!s_sta_configured) return;
-  esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &sta);
-  if (err != ESP_OK) {
-    ESP_LOGW(TAG, "Updated STA credentials were rejected: %s",
-             esp_err_to_name(err));
-    return;
-  }
-  s_sta_has_ip = false;
-  s_sta_start_us = esp_timer_get_time();
-  if (cfg->wifi_ssid[0] != '\0') {
-    err = esp_wifi_connect();
-    if (err != ESP_OK) {
-      ESP_LOGW(TAG, "Updated STA connect start failed: %s",
-               esp_err_to_name(err));
-    }
-  }
 }
 
 static bool parse_i16_range(const char *value, int16_t min, int16_t max,
@@ -881,7 +542,6 @@ static cJSON *build_config_json(void) {
   do { if (!cJSON_AddNumberToObject(root, name, value)) goto no_memory; } while (0)
   ADD_CONFIG_STRING("cam_name", cfg.camera_name_prefix);
   ADD_CONFIG_STRING("cam_mac", cfg.camera_mac_prefix);
-  ADD_CONFIG_STRING("wifi_ssid", cfg.wifi_ssid);
   ADD_CONFIG_NUMBER("tz", cfg.tz_offset_min);
   ADD_CONFIG_NUMBER("dst", cfg.dst_offset_min);
   ADD_CONFIG_NUMBER("source_gnss", cfg.source_gnss_enabled);
@@ -924,6 +584,66 @@ char *wifi_web_get_config_json(void) {
   return json;
 }
 
+static double compact_coord(double value);
+
+static cJSON *build_ble_config_json(void) {
+  app_config_t cfg;
+  if (!s_cfg || !config_get_snapshot(s_cfg, &cfg)) return NULL;
+  phone_location_status_t manual = {0};
+  location_service_manual_status(&manual);
+  cJSON *root = cJSON_CreateObject();
+  cJSON *camera = cJSON_CreateArray();
+  cJSON *location = cJSON_CreateArray();
+  if (!root || !camera || !location) {
+    cJSON_Delete(root); cJSON_Delete(camera); cJSON_Delete(location);
+    return NULL;
+  }
+  cJSON_AddItemToObject(root, "c", camera);
+  cJSON_AddItemToArray(camera, cJSON_CreateString(cfg.camera_name_prefix));
+  cJSON_AddItemToArray(camera, cJSON_CreateString(cfg.camera_mac_prefix));
+  cJSON_AddItemToArray(camera, cJSON_CreateNumber(cfg.tz_offset_min));
+  cJSON_AddItemToArray(camera, cJSON_CreateNumber(cfg.dst_offset_min));
+  cJSON_AddItemToArray(camera, cJSON_CreateNumber(cfg.wifi_idle_timeout_s));
+  cJSON_AddItemToArray(camera, cJSON_CreateNumber(cfg.bluetooth_power_mode));
+  cJSON_AddItemToArray(camera, cJSON_CreateNumber(cfg.custom_ble_boot_fast_search_s));
+  cJSON_AddItemToArray(camera, cJSON_CreateNumber(
+      (double)cfg.custom_ble_scan_period_ms / 1000.0));
+  cJSON_AddItemToArray(camera, cJSON_CreateNumber(cfg.custom_ble_scan_window_ms));
+
+  cJSON_AddItemToArray(location, cJSON_CreateString(cfg.source_order));
+  cJSON_AddItemToArray(location, cJSON_CreateNumber(cfg.source_gnss_enabled));
+  cJSON_AddItemToArray(location, cJSON_CreateNumber(cfg.source_phone_enabled));
+  cJSON_AddItemToArray(location, cJSON_CreateNumber(cfg.source_manual_enabled));
+  cJSON_AddItemToArray(location, cJSON_CreateNumber(cfg.track_enabled));
+  cJSON_AddItemToArray(location, cJSON_CreateNumber(cfg.gnss_without_camera));
+  cJSON_AddItemToArray(location, cJSON_CreateNumber(cfg.record_without_camera));
+  cJSON_AddItemToArray(location, cJSON_CreateNumber(cfg.track_interval_s));
+  cJSON_AddItemToArray(location, cJSON_CreateNumber(cfg.phone_push_enabled));
+  cJSON_AddItemToArray(location, cJSON_CreateNumber(cfg.phone_interval_s));
+  cJSON_AddItemToArray(location, cJSON_CreateNumber(cfg.manual_auto_update));
+  if (manual.present) {
+    cJSON_AddItemToArray(location, cJSON_CreateNumber(compact_coord(manual.latitude)));
+    cJSON_AddItemToArray(location, cJSON_CreateNumber(compact_coord(manual.longitude)));
+  } else {
+    cJSON_AddItemToArray(location, cJSON_CreateNull());
+    cJSON_AddItemToArray(location, cJSON_CreateNull());
+  }
+  cJSON_AddItemToObject(root, "l", location);
+  return root;
+}
+
+char *wifi_web_get_ble_config_json(void) {
+  cJSON *root = build_ble_config_json();
+  if (!root) return NULL;
+  char *json = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  if (!json || strlen(json) > 220U) {
+    free(json);
+    return NULL;
+  }
+  return json;
+}
+
 static esp_err_t handle_config(httpd_req_t *req) {
   web_activity();
   return send_json(req, build_config_json());
@@ -946,21 +666,13 @@ static esp_err_t handle_storage(httpd_req_t *req) {
   return send_json(req, root);
 }
 
-static esp_err_t handle_bonds(httpd_req_t *req) {
-  web_activity();
+static cJSON *build_bonds_json(void) {
   ble_client_bond_t bonds[BLE_CLIENT_MAX_BONDS] = {0};
   int count = ble_client_get_bonds(bonds, BLE_CLIENT_MAX_BONDS);
-  if (count < 0) {
-    httpd_resp_set_status(req, "503 Service Unavailable");
-    return httpd_resp_sendstr(req, "暂时无法读取已配对设备。");
-  }
+  if (count < 0) return NULL;
   cJSON *root = cJSON_CreateObject();
   cJSON *items = root ? cJSON_AddArrayToObject(root, "bonds") : NULL;
-  if (!root || !items) {
-    cJSON_Delete(root);
-    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                               "暂时无法读取已配对设备");
-  }
+  if (!root || !items) { cJSON_Delete(root); return NULL; }
   for (int i = 0; i < count && i < BLE_CLIENT_MAX_BONDS; ++i) {
     char mac[18];
     char token[13];
@@ -978,12 +690,27 @@ static esp_err_t handle_bonds(httpd_req_t *req) {
         !cJSON_AddStringToObject(item, "token", token) ||
         !cJSON_AddNumberToObject(item, "type", bonds[i].addr_type) ||
         !cJSON_AddBoolToObject(item, "connected", bonds[i].connected)) {
-      cJSON_Delete(item);
-      cJSON_Delete(root);
-      return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                                 "暂时无法读取已配对设备");
+      cJSON_Delete(item); cJSON_Delete(root); return NULL;
     }
     cJSON_AddItemToArray(items, item);
+  }
+  return root;
+}
+
+char *wifi_web_get_bonds_json(void) {
+  cJSON *root = build_bonds_json();
+  if (!root) return NULL;
+  char *json = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  return json;
+}
+
+static esp_err_t handle_bonds(httpd_req_t *req) {
+  web_activity();
+  cJSON *root = build_bonds_json();
+  if (!root) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return httpd_resp_sendstr(req, "暂时无法读取已配对设备。");
   }
   return send_json(req, root);
 }
@@ -1071,6 +798,118 @@ char *wifi_web_get_location_json(void) {
   return json;
 }
 
+static double compact_coord(double value) {
+  return round(value * 1000000.0) / 1000000.0;
+}
+
+static cJSON *build_ble_telemetry_json(void) {
+  app_config_t cfg;
+  if (!s_cfg || !config_get_snapshot(s_cfg, &cfg)) return NULL;
+  gps_fix_t gnss = {0};
+  gps_status_t gps_status = {0};
+  (void)gps_get_latest(&gnss);
+  (void)gps_get_status(&gps_status);
+  live_location_status_t phone = {0};
+  phone_location_status_t manual = {0};
+  location_service_live_status(&phone);
+  location_service_manual_status(&manual);
+  track_store_status_t storage = {0};
+  (void)track_store_get_status(&storage);
+
+  bool gnss_present = gnss.valid && isfinite(gnss.lat_deg) &&
+      isfinite(gnss.lon_deg) && fabs(gnss.lat_deg) <= 90.0 &&
+      fabs(gnss.lon_deg) <= 180.0;
+  int64_t now_us = esp_timer_get_time();
+  bool gnss_valid = gnss_present && gnss.time_valid &&
+      now_us >= gnss.last_fix_time_us &&
+      now_us - gnss.last_fix_time_us <= 5000000LL;
+  location_source_t source = LOCATION_NONE;
+  gps_fix_t selected = {0};
+  uint32_t selected_observed = 0;
+  (void)location_service_details(&selected, &source, &selected_observed);
+  (void)selected;
+  (void)selected_observed;
+
+  const char *active = source == LOCATION_GNSS ? "g" :
+                       source == LOCATION_PHONE ? "p" :
+                       source == LOCATION_MANUAL ? "m" : "n";
+  int search_code = gps_status.search_state == GPS_SEARCH_ACTIVE ? 1 :
+                    gps_status.search_state == GPS_SEARCH_PAUSED ? 2 :
+                    gps_status.search_state == GPS_SEARCH_WAKING ? 3 :
+                    gps_status.has_lock ? 4 : 0;
+
+  cJSON *root = cJSON_CreateObject();
+  cJSON *g = cJSON_CreateArray();
+  cJSON *p = cJSON_CreateArray();
+  cJSON *m = cJSON_CreateArray();
+  cJSON *s = cJSON_CreateArray();
+  if (!root || !g || !p || !m || !s ||
+      !cJSON_AddStringToObject(root, "a", active)) {
+    cJSON_Delete(root); cJSON_Delete(g); cJSON_Delete(p);
+    cJSON_Delete(m); cJSON_Delete(s); return NULL;
+  }
+  cJSON_AddItemToArray(g, cJSON_CreateBool(gnss_present));
+  cJSON_AddItemToArray(g, cJSON_CreateBool(gnss_valid));
+  if (gnss_present) {
+    cJSON_AddItemToArray(g, cJSON_CreateNumber(compact_coord(gnss.lat_deg)));
+    cJSON_AddItemToArray(g, cJSON_CreateNumber(compact_coord(gnss.lon_deg)));
+  } else {
+    cJSON_AddItemToArray(g, cJSON_CreateNull());
+    cJSON_AddItemToArray(g, cJSON_CreateNull());
+  }
+  cJSON_AddItemToArray(g, cJSON_CreateNumber(gps_status.satellites_visible));
+  cJSON_AddItemToArray(g, cJSON_CreateNumber(gps_status.satellites));
+  cJSON_AddItemToArray(g, cJSON_CreateNumber(search_code));
+
+  cJSON_AddItemToArray(p, cJSON_CreateBool(phone.present));
+  cJSON_AddItemToArray(p, cJSON_CreateBool(phone.available));
+  if (phone.present) {
+    cJSON_AddItemToArray(p, cJSON_CreateNumber(compact_coord(phone.latitude)));
+    cJSON_AddItemToArray(p, cJSON_CreateNumber(compact_coord(phone.longitude)));
+  } else {
+    cJSON_AddItemToArray(p, cJSON_CreateNull());
+    cJSON_AddItemToArray(p, cJSON_CreateNull());
+  }
+  cJSON_AddItemToArray(p, cJSON_CreateNumber(phone.present ? round(phone.accuracy_m) : 0));
+  cJSON_AddItemToArray(p, cJSON_CreateBool(cfg.phone_push_enabled != 0));
+  cJSON_AddItemToArray(p, cJSON_CreateNumber(phone.captured_ms));
+  cJSON_AddItemToArray(p, cJSON_CreateNumber(phone.remaining_s));
+
+  cJSON_AddItemToArray(m, cJSON_CreateBool(manual.present));
+  cJSON_AddItemToArray(m, cJSON_CreateBool(manual.available));
+  if (manual.present) {
+    cJSON_AddItemToArray(m, cJSON_CreateNumber(compact_coord(manual.latitude)));
+    cJSON_AddItemToArray(m, cJSON_CreateNumber(compact_coord(manual.longitude)));
+  } else {
+    cJSON_AddItemToArray(m, cJSON_CreateNull());
+    cJSON_AddItemToArray(m, cJSON_CreateNull());
+  }
+  cJSON_AddItemToArray(m, cJSON_CreateNumber((double)manual.captured_utc * 1000.0));
+  cJSON_AddItemToArray(m, cJSON_CreateNumber(manual.remaining_s));
+
+  cJSON_AddItemToArray(s, cJSON_CreateBool(storage.available));
+  cJSON_AddItemToArray(s, cJSON_CreateNumber(storage.record_count));
+  cJSON_AddItemToArray(s, cJSON_CreateNumber(storage.used_bytes));
+  cJSON_AddItemToArray(s, cJSON_CreateNumber(storage.capacity_bytes));
+  cJSON_AddItemToObject(root, "g", g);
+  cJSON_AddItemToObject(root, "p", p);
+  cJSON_AddItemToObject(root, "m", m);
+  cJSON_AddItemToObject(root, "s", s);
+  return root;
+}
+
+char *wifi_web_get_ble_telemetry_json(void) {
+  cJSON *root = build_ble_telemetry_json();
+  if (!root) return NULL;
+  char *json = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  if (!json || strlen(json) > 220U) {
+    free(json);
+    return NULL;
+  }
+  return json;
+}
+
 static esp_err_t handle_location(httpd_req_t *req) {
   web_activity();
   return send_json(req, build_location_json());
@@ -1081,10 +920,8 @@ static void wifi_page_state(char *dot_class, size_t dot_len, char *state,
   if (!dot_class || !state || dot_len == 0 || state_len == 0) {
     return;
   }
-  const char *dot = s_sta_has_ip ? "dot-green" :
-                    (s_ap_active ? "dot-blue" : "dot-yellow");
-  const char *text = s_sta_has_ip ? "已连外部网络" :
-                     (s_ap_active ? "热点已开启" : "正在连接");
+  const char *dot = s_ap_active ? "dot-blue" : "dot-yellow";
+  const char *text = s_ap_active ? "热点已开启" : "正在启动";
   snprintf(dot_class, dot_len, "%s", dot);
   snprintf(state, state_len, "%s", text);
 }
@@ -1136,10 +973,8 @@ static esp_err_t handle_root(httpd_req_t *req) {
              (double)bat.percent);
   }
 #endif
-  char wifi_ssid[CONFIG_STR_MAX_32 * 6];
   phone_location_status_t manual = {0};
   location_service_manual_status(&manual);
-  html_escape_attr(wifi_ssid, sizeof(wifi_ssid), cfg.wifi_ssid);
   track_store_status_t storage = {0};
   bool storage_available = track_store_get_status(&storage);
   char storage_count[24] = "不可用";
@@ -1263,7 +1098,6 @@ static esp_err_t handle_root(httpd_req_t *req) {
       ".danger{background:#bd3e3e}.secondary{background:#34463b}.bond{display:flex;justify-content:space-between;gap:10px;"
       "align-items:center;padding:11px 0;border-top:1px solid #e6ece8}.bond small{display:block;margin-top:3px}"
       ".inline{margin:0;flex-shrink:0}.bond>div{min-width:0;overflow-wrap:anywhere}.inline input{display:none}.hint{font-size:12px;line-height:1.55}.grid{display:grid;grid-template-columns:1fr 1fr;gap:11px}.no-camera-settings{grid-template-columns:repeat(3,minmax(0,1fr))}"
-      ".wifi-picker{display:flex;align-items:center;gap:8px}.wifi-picker select{flex:1;min-width:0}.wifi-picker button{flex-shrink:0}"
       ".manual-location{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;gap:8px;align-items:end}.manual-location>div{min-width:0}.manual-location .field{margin:0 0 5px}.manual-location button{padding:10px 4px;font-size:12px}"
       ".modes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.mode{display:flex;gap:8px;border:1px solid #d4ddd7;"
       "border-radius:8px;padding:10px;font-size:12px}.mode input{margin-top:2px}.mode strong{display:block;font-size:13px;margin-bottom:3px}"
@@ -1305,11 +1139,7 @@ static esp_err_t handle_root(httpd_req_t *req) {
       req, page, page_len,
       "%s<form method=\"POST\" action=\"/pair/start\">"
       "<button class=\"secondary\" type=\"submit\">添加设备</button></form>"
-      "<details><summary>Wi‑Fi</summary>"
-      "<label class=\"field\">网络名称</label><div class=\"wifi-picker\"><select class=\"text\" form=\"settings\" name=\"wifi_ssid\" id=\"wifi-ssid\"><option value=\"%s\" selected>%s</option></select><button class=\"secondary\" id=\"wifi-scan\" type=\"button\">扫描网络</button></div>"
-      "<p class=\"hint\">仅支持 2.4G Wi‑Fi</p><p class=\"hint\" id=\"wifi-scan-message\" role=\"status\"></p>"
-      "<label class=\"field\">网络密码</label><input class=\"text\" form=\"settings\" type=\"password\" name=\"wifi_pass\" placeholder=\"不修改请留空\">"
-      "</details><details><summary>热点运行时间</summary><label class=\"field\">无人使用时关闭热点</label><select class=\"text\" form=\"settings\" name=\"wifi_idle_s\">"
+      "<details><summary>热点运行时间</summary><label class=\"field\">无人使用时关闭热点</label><select class=\"text\" form=\"settings\" name=\"wifi_idle_s\">"
       "<option value=\"300\" %s>5 分钟</option><option value=\"900\" %s>15 分钟</option></select>"
       "</details><details><summary>蓝牙省电</summary><div class=\"modes\">"
       "<label class=\"mode\"><input form=\"settings\" type=\"radio\" name=\"ble_mode\" value=\"0\"><span><strong>省电</strong></span></label>"
@@ -1318,8 +1148,7 @@ static esp_err_t handle_root(httpd_req_t *req) {
       "<details id=\"ble-advanced\"><summary>高级设置</summary><label class=\"field\">开机后查找设备</label><div class=\"unit\"><input class=\"text ble-custom\" form=\"settings\" type=\"number\" name=\"ble_boot\" value=\"%u\" min=\"0\" max=\"300\"><span>秒</span></div>"
       "<div class=\"grid\"><div><label class=\"field\">再次查找间隔</label><div class=\"unit\"><input class=\"text ble-custom\" form=\"settings\" type=\"number\" name=\"ble_period\" value=\"%.2f\" min=\"1\" max=\"10.24\" step=\"0.01\"><span>秒</span></div></div>"
       "<div><label class=\"field\">每次查找时长</label><div class=\"unit\"><input class=\"text ble-custom\" form=\"settings\" type=\"number\" name=\"ble_window\" value=\"%u\" min=\"20\" max=\"1000\"><span>毫秒</span></div></div></div></details></details></section>",
-      pairing_notice, wifi_ssid,
-      cfg.wifi_ssid[0] != '\0' ? wifi_ssid : "请选择网络",
+      pairing_notice,
       cfg.wifi_idle_timeout_s == WIFI_IDLE_TIMEOUT_DEFAULT_S ? "selected" : "",
       cfg.wifi_idle_timeout_s == WIFI_IDLE_TIMEOUT_LONG_S ? "selected" : "",
       (unsigned)bluetooth_policy.boot_fast_search_s,
@@ -1409,19 +1238,6 @@ static esp_err_t handle_root(httpd_req_t *req) {
       "let touchRow=null;sourceList.addEventListener('pointerdown',e=>{if(!e.target.closest('.source-grip'))return;touchRow=e.target.closest('.source-row');touchRow.classList.add('dragging');});"
       "sourceList.addEventListener('pointermove',e=>{if(!touchRow)return;const rows=[...sourceList.querySelectorAll('.source-row')].filter(x=>x!==touchRow);const target=rows.find(x=>e.clientY<x.getBoundingClientRect().top+x.getBoundingClientRect().height/2);sourceList.insertBefore(touchRow,target||null);});"
       "function finishTouchDrag(){if(touchRow)touchRow.classList.remove('dragging');touchRow=null;syncSourceOrder();}sourceList.addEventListener('pointerup',finishTouchDrag);sourceList.addEventListener('pointercancel',finishTouchDrag);"
-      "const wifiScan=q('#wifi-scan'),wifiList=q('#wifi-ssid'),wifiMessage=q('#wifi-scan-message');"
-      "async function scanWifi(){wifiScan.disabled=true;wifiMessage.textContent='正在扫描…';"
-      "try{const start=await fetch('/wifi/scan/start',{method:'POST',cache:'no-store'});if(!start.ok)throw Error();"
-      "let data;for(let i=0;i<40;i++){await new Promise(r=>setTimeout(r,250));"
-      "const r=await fetch('/wifi/scan',{cache:'no-store'});if(!r.ok)throw Error();data=await r.json();if(!data.scanning)break;}"
-      "if(!data||data.scanning)throw Error();const selected=wifiList.value;wifiList.replaceChildren();"
-      "const placeholder=document.createElement('option');placeholder.value='';placeholder.textContent='请选择网络';wifiList.appendChild(placeholder);"
-      "let found=false;data.networks.forEach(n=>{if(n.ssid===selected)found=true;const o=document.createElement('option');o.value=n.ssid;o.textContent=n.ssid+(n.secure?'（需要密码）':'（开放网络）');wifiList.appendChild(o);});"
-      "if(selected&&!found){const o=document.createElement('option');o.value=selected;o.textContent=selected+'（当前设置）';wifiList.appendChild(o);}"
-      "if(selected)wifiList.value=selected;"
-      "wifiMessage.textContent=data.networks.length?'请选择网络名称。':'没有找到网络，请重新扫描。';"
-      "}catch(e){wifiMessage.textContent='扫描失败，请重试。';}finally{wifiScan.disabled=false;}}"
-      "wifiScan.addEventListener('click',scanWifi);"
       "q('#manual-clear').addEventListener('click',async()=>{if(!confirm('清除手动兜底位置？'))return;manualMessage.textContent='正在清除…';"
       "try{const r=await fetch('/location/manual/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});if(!r.ok)throw Error();ml.value='';mn.value='';q('#manual-dirty').value='0';manualMessage.textContent='兜底位置已清除。';liveLocation();}catch(e){manualMessage.textContent='清除失败，请重试。';}});"
       "const bi=qa('.ble-custom');"
@@ -1467,8 +1283,6 @@ static esp_err_t handle_save(httpd_req_t *req) {
     next = *s_cfg;
     config_validate(&next);
   }
-  app_config_t previous = next;
-
   char value[CONFIG_STR_MAX_64];
   form_get(body, "cam_name", value, sizeof(value));
   if (strstr(body, "cam_name=") != NULL) {
@@ -1492,18 +1306,6 @@ static esp_err_t handle_save(httpd_req_t *req) {
   int16_t dst = 0;
   if (parse_i16_range(value, -1440, 1440, &dst)) {
     next.dst_offset_min = dst;
-  }
-
-  form_get(body, "wifi_ssid", value, sizeof(value));
-  if (strstr(body, "wifi_ssid=") != NULL) {
-    strncpy(next.wifi_ssid, value, sizeof(next.wifi_ssid) - 1);
-    next.wifi_ssid[sizeof(next.wifi_ssid) - 1] = '\0';
-  }
-
-  form_get(body, "wifi_pass", value, sizeof(value));
-  if (value[0] != '\0') {
-    strncpy(next.wifi_pass, value, sizeof(next.wifi_pass) - 1);
-    next.wifi_pass[sizeof(next.wifi_pass) - 1] = '\0';
   }
 
   uint32_t parsed = 0;
@@ -1627,10 +1429,6 @@ static esp_err_t handle_save(httpd_req_t *req) {
   if (!config_get_snapshot(s_cfg, &applied)) {
     applied = next;
     config_validate(&applied);
-  }
-  if (strcmp(previous.wifi_ssid, applied.wifi_ssid) != 0 ||
-      strcmp(previous.wifi_pass, applied.wifi_pass) != 0) {
-    wifi_apply_sta_config(&applied);
   }
 #if ALPHALOC_GNSS_STANDBY
   location_power_policy_t location_policy;
@@ -1828,11 +1626,6 @@ static esp_err_t register_web_routes(httpd_handle_t server) {
       .uri = "/activity", .method = HTTP_GET, .handler = handle_activity};
   httpd_uri_t favicon = {
       .uri = "/favicon.ico", .method = HTTP_GET, .handler = handle_favicon};
-  httpd_uri_t wifi_scan = {
-      .uri = "/wifi/scan", .method = HTTP_GET, .handler = handle_wifi_scan};
-  httpd_uri_t wifi_scan_start = {.uri = "/wifi/scan/start",
-                                 .method = HTTP_POST,
-                                 .handler = handle_wifi_scan_start};
   httpd_uri_t save = {
       .uri = "/save", .method = HTTP_POST, .handler = handle_save};
   httpd_uri_t pair_start = {
@@ -1853,8 +1646,6 @@ static esp_err_t register_web_routes(httpd_handle_t server) {
   if (err == ESP_OK) err = httpd_register_uri_handler(server, &manual_clear);
   if (err == ESP_OK) err = httpd_register_uri_handler(server, &activity);
   if (err == ESP_OK) err = httpd_register_uri_handler(server, &favicon);
-  if (err == ESP_OK) err = httpd_register_uri_handler(server, &wifi_scan);
-  if (err == ESP_OK) err = httpd_register_uri_handler(server, &wifi_scan_start);
   if (err == ESP_OK) err = httpd_register_uri_handler(server, &save);
   if (err == ESP_OK) err = httpd_register_uri_handler(server, &pair_start);
   if (err == ESP_OK) err = httpd_register_uri_handler(server, &bond_delete);
@@ -1897,23 +1688,6 @@ static bool wifi_web_start_unlocked(app_config_t *cfg) {
     return false;
   }
   s_wifi_handlers_registered = true;
-  err = esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                   &wifi_event_handler, NULL);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "IP event handler registration failed: %s",
-             esp_err_to_name(err));
-    wifi_cleanup_resources();
-    return false;
-  }
-  s_ip_handlers_registered = true;
-  s_netif_sta = esp_netif_create_default_wifi_sta();
-  if (!s_netif_sta) {
-    ESP_LOGE(TAG, "Failed to create STA network interface");
-    wifi_cleanup_resources();
-    return false;
-  }
-  s_netif = s_netif_sta;
-
   wifi_init_config_t cfg_init = WIFI_INIT_CONFIG_DEFAULT();
   err = esp_wifi_init(&cfg_init);
   if (err != ESP_OK) {
@@ -1922,58 +1696,14 @@ static bool wifi_web_start_unlocked(app_config_t *cfg) {
     return false;
   }
 
-  const esp_timer_create_args_t reconnect_timer_args = {
-      .callback = wifi_reconnect_cb,
-      .arg = NULL,
-      .dispatch_method = ESP_TIMER_TASK,
-      .name = "wifi_reconnect",
-      .skip_unhandled_events = true,
-  };
-  if (esp_timer_create(&reconnect_timer_args, &s_reconnect_timer) != ESP_OK) {
-    ESP_LOGW(TAG, "Failed to create WiFi reconnect timer");
-  }
-  const esp_timer_create_args_t fallback_timer_args = {
-      .callback = wifi_fallback_cb,
-      .arg = NULL,
-      .dispatch_method = ESP_TIMER_TASK,
-      .name = "wifi_fallback",
-      .skip_unhandled_events = true,
-  };
-  if (esp_timer_create(&fallback_timer_args, &s_fallback_timer) != ESP_OK) {
-    ESP_LOGW(TAG, "Failed to create AP fallback timer");
-  }
-
-  app_config_t cfg_snapshot;
-  if (!config_get_snapshot(s_cfg, &cfg_snapshot)) {
-    cfg_snapshot = *s_cfg;
-    config_validate(&cfg_snapshot);
-  }
-  s_sta_configured = cfg_snapshot.wifi_ssid[0] != '\0';
-  wifi_config_t wifi_cfg = {0};
-  strncpy((char *)wifi_cfg.sta.ssid, cfg_snapshot.wifi_ssid,
-          sizeof(wifi_cfg.sta.ssid) - 1);
-  strncpy((char *)wifi_cfg.sta.password, cfg_snapshot.wifi_pass,
-          sizeof(wifi_cfg.sta.password) - 1);
-  err = esp_wifi_set_mode(WIFI_MODE_APSTA);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to set WiFi AP+STA mode: %s", esp_err_to_name(err));
-    wifi_cleanup_resources();
-    return false;
-  }
-  err = s_sta_configured ? esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg) : ESP_OK;
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to configure WiFi STA: %s", esp_err_to_name(err));
-    s_sta_configured = false;
-  }
-  // Configure the AP while the radio is stopped. USB always exposes local
-  // setup immediately; a failed upstream association must not hide the AP.
+  // Configure the fixed device AP while the radio is stopped.
   if (!start_softap()) {
     wifi_cleanup_resources();
     return false;
   }
 
-  // Mark the lifecycle active before starting the radio so early connect/IP
-  // events cannot be lost. Any later error goes through cleanup and clears it.
+  // Mark the lifecycle active before starting the radio so early AP events
+  // cannot be lost. Any later error goes through cleanup and clears it.
   s_started = true;
   err = esp_wifi_start();
   if (err != ESP_OK) {
@@ -1986,14 +1716,6 @@ static bool wifi_web_start_unlocked(app_config_t *cfg) {
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "Failed to enable WiFi power save: %s", esp_err_to_name(err));
   }
-  s_sta_start_us = esp_timer_get_time();
-  if (s_sta_configured) {
-    err = esp_wifi_connect();
-    if (err != ESP_OK) {
-      ESP_LOGW(TAG, "WiFi connect start failed: %s", esp_err_to_name(err));
-    }
-  }
-
   httpd_config_t server_cfg = HTTPD_DEFAULT_CONFIG();
   server_cfg.uri_match_fn = httpd_uri_match_wildcard;
   server_cfg.max_req_hdr_len = FRAMENAV_HTTP_MAX_REQ_HDR_LEN;
@@ -2019,13 +1741,7 @@ static bool wifi_web_start_unlocked(app_config_t *cfg) {
     return false;
   }
 
-  if (!s_ap_active && !s_sta_has_ip && s_fallback_timer) {
-    (void)esp_timer_start_once(
-        s_fallback_timer,
-        (uint64_t)ALPHALOC_WIFI_STA_FALLBACK_TIMEOUT_MS * 1000ULL);
-  }
-  ESP_LOGI(TAG, "WiFi web started: AP available immediately; external WiFi=%s",
-           s_sta_configured ? "configured" : "not configured");
+  ESP_LOGI(TAG, "WiFi web started: fixed device AP available");
   return true;
 }
 
@@ -2057,10 +1773,7 @@ bool wifi_web_has_clients(void) {
     if (esp_wifi_ap_get_sta_list(&clients) != ESP_OK) return true;
     ap_client = clients.num > 0;
   }
-  // A STA having an upstream IP only proves that the device joined the
-  // configured router. Treat recent HTTP activity as the user connection;
-  // otherwise the router itself would keep Wi-Fi on forever. This also covers
-  // a phone using the external Wi-Fi path while the fallback AP is active.
+  // Recent HTTP activity keeps the AP alive while a phone uses the page.
   if (ap_client) return true;
   int64_t last = wifi_web_last_activity_us();
   int64_t now = esp_timer_get_time();

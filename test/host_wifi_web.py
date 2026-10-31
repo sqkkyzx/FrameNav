@@ -66,10 +66,10 @@ class WifiWebChecks(unittest.TestCase):
         source = (ROOT / "src/wifi_web.c").read_text()
         root = source.split("static esp_err_t handle_root", 1)[1].split(
             "static esp_err_t handle_save", 1)[0]
-        self.assertIn('type=\\"password\\"', root)
-        self.assertIn("不修改请留空", root)
         self.assertNotIn("cfg.wifi_pass", root)
         self.assertNotIn("cfg.ap_pass", root)
+        self.assertNotIn('name=\\"wifi_ssid\\"', root)
+        self.assertNotIn('name=\\"wifi_pass\\"', root)
 
     def test_chinese_brand_and_pairing_management(self):
         source = (ROOT / "src/wifi_web.c").read_text()
@@ -112,49 +112,58 @@ class WifiWebChecks(unittest.TestCase):
         self.assertIn(">5 分钟</option>", page)
         self.assertIn(">15 分钟</option>", page)
 
-    def test_wifi_name_is_a_scanned_select_without_manual_input(self):
+    def test_external_station_configuration_and_scanning_are_removed(self):
         source = (ROOT / "src/wifi_web.c").read_text()
+        config = (ROOT / "include/config.h").read_text()
+        persistence = (ROOT / "src/config.c").read_text()
+        ble = (ROOT / "src/ble_config_server.c").read_text()
         page = source.split("static esp_err_t handle_root", 1)[1].split(
             "static esp_err_t handle_save", 1
         )[0]
         routes = source.split("static esp_err_t register_web_routes", 1)[1].split(
             "#if FRAMENAV_EMBEDDED_TLS", 1
         )[0]
-        self.assertIn('<select class=\\"text\\" form=\\"settings\\" name=\\"wifi_ssid\\" id=\\"wifi-ssid\\">', page)
-        self.assertNotIn('<input class=\\"text\\" form=\\"settings\\" name=\\"wifi_ssid\\"', page)
-        self.assertNotIn("datalist", page)
-        self.assertIn("仅支持 2.4G Wi‑Fi", page)
-        self.assertIn("wifiList=q('#wifi-ssid')", page)
-        self.assertIn("扫描网络", page)
-        self.assertNotIn("设备热点", page)
-        self.assertNotIn('name=\\"ap_ssid\\"', page)
-        self.assertNotIn('name=\\"ap_pass\\"', page)
-        self.assertIn("/wifi/scan/start", routes)
-        self.assertIn("/wifi/scan", routes)
-        self.assertIn("esp_wifi_scan_start", source)
-        self.assertIn("WIFI_SCAN_MAX_RESULTS", source)
-        self.assertIn("secure", source)
-        scan_action = page.split("async function scanWifi()", 1)[1].split(
-            "function phoneBusy", 1
-        )[0]
-        self.assertIn("fetch('/wifi/scan/start'", scan_action)
-        self.assertIn("wifiScan.addEventListener('click',scanWifi)", page)
-        self.assertIn("if(selected&&!found)", page)
-        self.assertEqual(source.count("esp_wifi_scan_start("), 1)
+        self.assertNotIn("wifi_ssid", config)
+        self.assertNotIn("wifi_pass", config)
+        self.assertNotIn('nvs_set_str(nvs, "wifi_ssid"', persistence)
+        self.assertNotIn('nvs_set_str(nvs, "wifi_pass"', persistence)
+        self.assertNotIn("FIELD_WIFI_SSID", ble)
+        self.assertNotIn("FIELD_WIFI_PASS", ble)
+        for marker in ("wifi_ssid", "wifi_pass", "wifi/scan", "wifi-scan",
+                       "esp_wifi_scan_start", "WIFI_MODE_APSTA",
+                       "esp_netif_create_default_wifi_sta", "esp_wifi_connect"):
+            self.assertNotIn(marker, source)
+        self.assertNotIn('name=\\"wifi_ssid\\"', page)
+        self.assertNotIn('name=\\"wifi_pass\\"', page)
+        self.assertNotIn("扫描网络", page)
+        self.assertNotIn("/wifi/scan", routes)
+        self.assertIn("WIFI_MODE_AP", function_source("src/wifi_web.c", "start_softap"))
 
-    def test_scan_event_handler_does_not_put_result_table_on_event_task_stack(self):
-        handler = function_source("src/wifi_web.c", "wifi_event_handler")
-        scan_handler = handler.split("if (event_id == WIFI_EVENT_SCAN_DONE)", 1)[1].split(
-            "if (event_id == WIFI_EVENT_AP_START)", 1
-        )[0]
-        self.assertIn("wifi_scan_result_t *results = calloc", scan_handler)
-        self.assertNotIn(
-            "wifi_scan_result_t results[FRAMENAV_WIFI_SCAN_MAX_RESULTS]",
-            scan_handler,
-        )
-        self.assertIn("free(results)", scan_handler)
+    def test_ble_config_uuids_match_android_and_expose_compact_bonds(self):
+        source = (ROOT / "src/ble_config_server.c").read_text()
+        web = (ROOT / "src/wifi_web.c").read_text()
+        self.assertIn("BLE_UUID128_INIT(0xA1, 0x7E, 0x00, 0x01", source)
+        self.assertIn("BLE_UUID128_INIT(0xA1, 0x7E, 0x00, 0x13", source)
+        self.assertIn("BLE_UUID128_INIT(0xA1, 0x7E, 0x00, 0x14", source)
+        self.assertIn("FIELD_BONDS_JSON", source)
+        self.assertIn("wifi_web_get_bonds_json()", source)
+        self.assertIn("wifi_web_get_ble_config_json()", source)
+        self.assertIn('cJSON_AddItemToObject(root, "c", camera)', web)
+        self.assertIn('cJSON_AddItemToObject(root, "l", location)', web)
+        self.assertIn("strlen(json) > 220U", web)
+        self.assertNotIn("FIELD_WIFI_SSID", source)
+        self.assertNotIn("FIELD_WIFI_PASS", source)
+        self.assertIn("wifi_web_get_ble_telemetry_json()", source)
 
-    def test_wifi_start_limits_shared_ap_and_sta_transmit_power(self):
+    def test_ble_telemetry_has_a_mtu_sized_guard_and_keeps_verbose_http_shape(self):
+        source = (ROOT / "src/wifi_web.c").read_text()
+        self.assertIn('cJSON_AddStringToObject(root, "a", active)', source)
+        for key in ('"g"', '"p"', '"m"', '"s"'):
+            self.assertIn(key, source)
+        self.assertIn("strlen(json) > 220U", source)
+        self.assertIn("build_location_json()", source)
+
+    def test_wifi_start_limits_fixed_ap_transmit_power(self):
         source = (ROOT / "src/wifi_web.c").read_text()
         self.assertIn("FRAMENAV_WIFI_MAX_TX_POWER_QDBM 66", source)
         power = function_source("src/wifi_web.c", "configure_wifi_tx_power")
@@ -251,7 +260,7 @@ class WifiWebChecks(unittest.TestCase):
         self.assertIn('phone_push_enabled', save)
         self.assertIn('form_get(body, "phone_interval_s"', save)
 
-    def test_idle_clients_distinguishes_ap_associations_from_sta_uplink(self):
+    def test_idle_clients_keeps_only_ap_associations_and_recent_http_activity(self):
         clients = function_source("src/wifi_web.c", "wifi_web_has_clients")
         self.assertIn("s_ap_active", clients)
         self.assertIn("wifi_web_last_activity_us()", clients)
@@ -356,62 +365,24 @@ int main(void) {
         self.assertIn("wifi_web_is_started", source)
         self.assertIn("esp_wifi_deinit", cleanup)
 
-    def test_sta_ip_and_timed_ap_fallback_are_both_exposed(self):
+    def test_fixed_ap_is_started_without_sta_or_timed_fallback(self):
         source = (ROOT / "src/wifi_web.c").read_text()
         readme = (ROOT / "README.md").read_text()
         start = function_source("src/wifi_web.c", "wifi_web_start_unlocked")
         self.assertLess(start.index("if (!start_softap())"),
                         start.index("esp_wifi_start()"))
-        self.assertIn("IP_EVENT_STA_GOT_IP", source)
-        self.assertIn("wifi_fallback_cb", source)
-        self.assertIn("ALPHALOC_WIFI_STA_FALLBACK_TIMEOUT_MS", source)
         self.assertIn('#define ALPHALOC_AP_URL "http://10.254.254.1/"', source)
         self.assertNotIn("FRAMENAV_HOSTNAME", source)
-        self.assertIn("WIFI_MODE_APSTA", source)
-        self.assertIn("已连外部网络", source)
+        self.assertIn("WIFI_MODE_AP", source)
+        self.assertNotIn("WIFI_MODE_APSTA", source)
+        self.assertNotIn("IP_EVENT_STA_GOT_IP", source)
+        self.assertNotIn("wifi_fallback_cb", source)
+        self.assertNotIn("已连外部网络", source)
         self.assertNotIn("loc.igp.wiki", source)
         self.assertNotIn("192.168.4.1", source)
         self.assertIn("http://10.254.254.1/", readme)
         self.assertNotIn("loc.igp.wiki", readme)
         self.assertNotIn("192.168.4.1", readme)
-
-    def test_repeated_failed_sta_connections_keep_the_capped_backoff(self):
-        handler = function_source("src/wifi_web.c", "wifi_event_handler")
-        delay = handler.split(
-            "if (s_reconnect_timer && s_sta_configured) {", 1
-        )[1].split("esp_timer_stop", 1)[0]
-        run_c(
-            r'''
-#include <assert.h>
-#include <stdbool.h>
-#include <stdint.h>
-#define ALPHALOC_WIFI_RECONNECT_BACKOFF_MS 1500
-#define ESP_LOGI(...) ((void)0)
-static uint8_t s_sta_retry_count;
-static bool s_ap_active;
-static uint64_t next_delay(void) {
-'''
-            + delay
-            + r'''
-  return delay_us;
-}
-int main(void) {
-  for (int ap = 0; ap < 2; ++ap) {
-    s_ap_active = ap != 0;
-    s_sta_retry_count = 0;
-    uint64_t previous = 0;
-    uint64_t base = ap ? 30000000ULL : 1500000ULL;
-    for (int attempt = 0; attempt < 30; ++attempt) {
-      uint64_t delay = next_delay();
-      assert(delay >= previous && delay >= base && delay <= base * 4);
-      if (attempt >= 3) assert(delay == base * 4);
-      previous = delay;
-    }
-  }
-  return 0;
-}
-'''
-        )
 
     def test_captive_portal_dns_dhcp_and_http_redirect_lifecycle(self):
         source = (ROOT / "src/wifi_web.c").read_text()
@@ -445,7 +416,7 @@ int main(void) {
         self.assertIn('"/config"', routes)
         self.assertIn('"/storage"', routes)
         registered_routes = routes.count("httpd_register_uri_handler(server,")
-        self.assertGreaterEqual(registered_routes, 18)
+        self.assertGreaterEqual(registered_routes, 16)
         self.assertIn("server_cfg.max_uri_handlers = 24;", source)
         self.assertNotIn("ALPHALOC_AP_URL", page)
         self.assertNotIn("10.254.254.1", page)
@@ -473,16 +444,15 @@ int main(void) {
             configure.rindex("esp_netif_dhcps_start"),
         )
 
-    def test_empty_camera_filters_can_be_saved_but_blank_passwords_preserve(self):
+    def test_camera_filters_can_be_saved_without_network_credentials(self):
         source = (ROOT / "src/wifi_web.c").read_text()
         save = source.split("static esp_err_t handle_save", 1)[1].split(
             "bool wifi_web_start", 1)[0]
         self.assertIn('strstr(body, "cam_name=")', save)
         self.assertIn('strstr(body, "cam_mac=")', save)
-        self.assertIn('strstr(body, "wifi_ssid=")', save)
-        wifi_pass = save.split('form_get(body, "wifi_pass"')[1].split(
-            'form_get(body, "max_gps_age"')[0]
-        self.assertIn("if (value[0] != '\\0')", wifi_pass)
+        self.assertNotIn('form_get(body, "wifi_ssid"', save)
+        self.assertNotIn('form_get(body, "wifi_pass"', save)
+        self.assertNotIn("wifi_apply_sta_config", save)
         self.assertNotIn('form_get(body, "ap_ssid"', save)
         self.assertNotIn('form_get(body, "ap_pass"', save)
 
@@ -497,7 +467,7 @@ int main(void) {
 
         self.assertLess(page.index("连接配置"), page.index("定位配置"))
         for text in (
-            "已配对设备", "管理手机", "推送相机", "Wi‑Fi", "蓝牙省电",
+            "已配对设备", "管理手机", "推送相机", "热点运行时间", "蓝牙省电",
             "定位来源和优先级", "GNSS 定位", "手机定位", "手动设置经纬度",
             "轨迹记录开启", "在未连接相机时也记录轨迹", "轨迹记录频率",
             "照片时区", "夏时令", "手机定位获取频率", "使用真实定位持续更新",

@@ -12,10 +12,9 @@ The project uses Android Gradle Plugin 8.6.1, which requires Gradle 8.7 or newer
 
 - BLE discovery looks for the `FrameNav` name or the phone-location service UUID.
 - Location writes use the 28-byte little-endian location frame. The characteristic requires an encrypted BLE connection, so Android may show a pairing prompt on the first write.
-- Select the device hotspot in system Wi-Fi settings. Configuration and the Wi-Fi location fallback use direct HTTP requests to the configured device IP, defaulting to `10.254.254.1`.
-- Configuration is read from `GET /config` and saved through `POST /save` using the WebUI form field names. Empty `wifi_pass` is omitted so the saved network password remains unchanged. AP SSID and password are fixed by firmware and are not editable in the app.
-- Device status and track-store usage use `GET /location` and `GET /storage`. Saved camera pairings use `GET /bonds`; removal uses `POST /bond/delete`.
-- Continuous phone location runs as a foreground service, writes fresh fixes over BLE every 10 seconds, warns after 30 seconds without BLE, and stops after 2 minutes without a connection.
+- BLE service discovery silently reads configuration, compact telemetry, and paired-device information in the background. Configuration changes still use the fixed device AP at `10.254.254.1`; the AP SSID and password are fixed by firmware and are not editable in the app.
+- The device AP is only used for explicit configuration changes, manual-location changes, and the opt-in location fallback. BLE is the default location transport.
+- Continuous phone location runs as a foreground service and writes fresh fixes over BLE at the configured interval, warns after 30 seconds without BLE, and stops after 2 minutes without a connection.
 
 The Wi-Fi fallback uses the device's local `/location/clock`, `/location/phone`, `/location/phone/clear`, `/` and `/save` endpoints. It sends requests through the selected Wi-Fi `Network` so Android does not route local device traffic over mobile data.
 
